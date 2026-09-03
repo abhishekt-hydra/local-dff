@@ -9,17 +9,19 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@radix-ui/react-popover": "^1.1.23",
     "@radix-ui/react-scroll-area": "latest",
     "@radix-ui/react-slot": "latest",
     "@vitejs/plugin-react": "latest",
     "class-variance-authority": "latest",
     "clsx": "latest",
+    "cmdk": "^1.1.1",
     "lucide-react": "latest",
     "react": "latest",
     "react-arborist": "latest",
     "react-dom": "latest",
-    "shiki": "^4.4.3",
     "shadcn": "latest",
+    "shiki": "^4.4.3",
     "tailwind-merge": "latest",
     "tailwindcss": "latest",
     "tw-animate-css": "latest"

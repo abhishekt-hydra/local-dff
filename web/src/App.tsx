@@ -4,6 +4,8 @@ import {
   ChevronRight,
   ChevronDown,
   ChevronUp,
+  ChevronsUpDown,
+  Check,
   FileCode2,
   FileDiff,
   Folder,
@@ -23,6 +25,8 @@ import {
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
+import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from "@/components/ui/command"
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { cn } from "@/lib/utils"
 
 type PatchFile = { old_path: string | null; new_path: string | null; display_path: string; renderable: boolean }
@@ -81,6 +85,7 @@ export default function App() {
   const [prUrl, setPrUrl] = useState("")
   const [pulls, setPulls] = useState<PullRequest[]>([])
   const [prNumber, setPrNumber] = useState("")
+  const [prPickerOpen, setPrPickerOpen] = useState(false)
   const [chromeHidden, setChromeHidden] = useState(false)
   const [keyboardOverlay, setKeyboardOverlay] = useState(false)
   const [keyboardOverlayExpanded, setKeyboardOverlayExpanded] = useState(false)
@@ -97,6 +102,7 @@ export default function App() {
   const diffPanelRef = useRef<HTMLDivElement>(null)
   const diffFrameRef = useRef<HTMLIFrameElement>(null)
   const tree = useMemo(() => makeTree(session?.files ?? []), [session])
+  const selectedPull = useMemo(() => pulls.find((pull) => String(pull.number) === prNumber), [pulls, prNumber])
 
   useEffect(() => {
     if (!resizingSidebar) return
@@ -357,11 +363,30 @@ export default function App() {
               <Input data-testid="pr-url" value={prUrl} onChange={(event) => setPrUrl(event.target.value)} placeholder="https://github.com/owner/repo/pull/123" />
             </label>
             <Button data-testid="open-pr-url" variant="secondary" onClick={openPrUrl} disabled={loading}><Link className="size-4" /> Open PR</Button>
-            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Open PRs for repository
-              <select data-testid="pr-select" value={prNumber} onChange={(event) => setPrNumber(event.target.value)} disabled={!pulls.length || loading} className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50">
-                {pulls.length ? pulls.map((pull) => <option key={pull.number} value={pull.number}>#{pull.number} · {pull.title}</option>) : <option value="">List open PRs first</option>}
-              </select>
-            </label>
+            <div className="grid gap-1.5 text-xs font-medium text-muted-foreground">
+              <span id="pr-picker-label">Open PRs for repository</span>
+              <Popover open={prPickerOpen} onOpenChange={setPrPickerOpen}>
+                <PopoverTrigger asChild>
+                  <Button data-testid="pr-select" variant="outline" role="combobox" aria-labelledby="pr-picker-label" aria-expanded={prPickerOpen} disabled={!pulls.length || loading} className="h-9 w-full justify-between font-normal">
+                    <span className="truncate">{selectedPull ? `#${selectedPull.number} · ${selectedPull.title}` : "List open PRs first"}</span><ChevronsUpDown className="ml-2 size-4 shrink-0 opacity-50" />
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent align="start" className="w-[var(--radix-popover-trigger-width)]">
+                  <Command>
+                    <CommandInput placeholder="Search by PR number or title…" />
+                    <CommandList>
+                      <CommandEmpty>No matching pull request.</CommandEmpty>
+                      <CommandGroup heading={`${pulls.length} open pull requests`}>
+                        {pulls.map((pull) => <CommandItem key={pull.number} value={`${pull.number} ${pull.title} ${pull.author?.login ?? ""}`} onSelect={() => { setPrNumber(String(pull.number)); setPrPickerOpen(false) }}>
+                          <Check className={cn("mr-2 size-4", prNumber === String(pull.number) ? "opacity-100" : "opacity-0")} />
+                          <span className="min-w-0 truncate"><span className="font-medium">#{pull.number}</span> · {pull.title}</span>
+                        </CommandItem>)}
+                      </CommandGroup>
+                    </CommandList>
+                  </Command>
+                </PopoverContent>
+              </Popover>
+            </div>
             <div className="flex gap-2"><Button data-testid="list-prs" variant="outline" onClick={listPulls} disabled={loading}><GitPullRequest className="size-4" /> List</Button><Button data-testid="open-selected-pr" onClick={openPull} disabled={loading || !prNumber}><GitBranch className="size-4" /> Review</Button></div>
           </CardContent>
         </Card></>}

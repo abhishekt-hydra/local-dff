@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path as FsPath, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
 };
@@ -36,11 +36,16 @@ struct Args {
     /// Address to listen on.
     #[arg(long, default_value = "0.0.0.0:4317")]
     listen: SocketAddr,
+
+    /// Directory for SemanticDiff, GitHub repository, and pull-request caches.
+    #[arg(long, env = "LOCAL_DIFFE_CACHE_DIR", value_name = "DIR")]
+    cache_dir: Option<PathBuf>,
 }
 
 #[derive(Clone)]
 struct AppState {
     semanticdiff_bin: PathBuf,
+    cache_dir: PathBuf,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
 }
 
@@ -193,13 +198,15 @@ impl IntoResponse for ApiError {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    let semanticdiff_bin = extract_semanticdiff().unwrap_or_else(|error| {
+    let cache_dir = args.cache_dir.unwrap_or_else(default_cache_dir);
+    let semanticdiff_bin = extract_semanticdiff(&cache_dir).unwrap_or_else(|error| {
         eprintln!("Could not prepare embedded SemanticDiff: {error}");
         std::process::exit(2);
     });
 
     let state = AppState {
         semanticdiff_bin,
+        cache_dir,
         sessions: Arc::new(Mutex::new(HashMap::new())),
     };
     let app = Router::new()
@@ -265,11 +272,14 @@ fn content_type(path: &str) -> &'static str {
     }
 }
 
-fn extract_semanticdiff() -> Result<PathBuf, String> {
-    let directories = ProjectDirs::from("com", "hydradb", "local-diffe")
-        .ok_or_else(|| "could not determine a local cache directory".to_owned())?;
-    let runtime = directories
-        .cache_dir()
+fn default_cache_dir() -> PathBuf {
+    ProjectDirs::from("com", "hydradb", "local-diffe")
+        .map(|directories| directories.cache_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from(".local-diffe-cache"))
+}
+
+fn extract_semanticdiff(cache_dir: &FsPath) -> Result<PathBuf, String> {
+    let runtime = cache_dir
         .join("semanticdiff")
         .join(env!("LOCAL_DIFFE_VERSION"))
         .join("runtime");
@@ -398,10 +408,15 @@ async fn create_git_comparison(
 }
 
 async fn github_open_prs(
+    State(state): State<AppState>,
     Json(request): Json<GitHubPullsRequest>,
 ) -> Result<Json<Vec<PullRequestInfo>>, ApiError> {
     let repo = PathBuf::from(request.repo.trim());
     ensure_git_repo(&repo)?;
+    let github_repo = github_repo_for_local(&repo).await?;
+    if let Some(pulls) = read_pr_list_cache(&state.cache_dir, &github_repo) {
+        return Ok(Json(pulls));
+    }
     let pulls = gh_json::<Vec<PullRequestInfo>>(
         Some(&repo),
         &[
@@ -416,6 +431,7 @@ async fn github_open_prs(
         ],
     )
     .await?;
+    write_pr_list_cache(&state.cache_dir, &github_repo, &pulls)?;
     Ok(Json(pulls))
 }
 
@@ -443,7 +459,7 @@ async fn github_open_url(
     {
         selected_repo
     } else {
-        cached_github_repo(&reference.repo).await?
+        cached_github_repo(&state.cache_dir, &reference.repo).await?
     };
     start_github_pr_session(state, repo, reference.repo, reference.number).await
 }
@@ -455,19 +471,26 @@ async fn start_github_pr_session(
     number: u64,
 ) -> Result<Json<StartResponse>, ApiError> {
     let number_string = number.to_string();
-    let pull = gh_json::<PullRequestInfo>(
-        Some(&repo),
-        &[
-            "pr",
-            "view",
-            &number_string,
-            "--repo",
-            &github_repo,
-            "--json",
-            "number,title,url,state,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,author,updatedAt",
-        ],
-    )
-    .await?;
+    let pull = match read_pr_cache(&state.cache_dir, &github_repo, number) {
+        Some(pull) => pull,
+        None => {
+            let pull = gh_json::<PullRequestInfo>(
+                Some(&repo),
+                &[
+                    "pr",
+                    "view",
+                    &number_string,
+                    "--repo",
+                    &github_repo,
+                    "--json",
+                    "number,title,url,state,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,author,updatedAt",
+                ],
+            )
+            .await?;
+            write_pr_cache(&state.cache_dir, &github_repo, &pull)?;
+            pull
+        }
+    };
     fetch_github_pr(&repo, &pull).await?;
     let base = git_commit(&repo, &pull.base_ref_oid).await?;
     let head = git_commit(&repo, &format!("refs/local-diffe/pr/{}", pull.number)).await?;
@@ -556,10 +579,7 @@ async fn gh_json<T: serde::de::DeserializeOwned>(
     })
 }
 
-async fn gh_output(
-    repo: Option<&std::path::Path>,
-    args: &[&str],
-) -> Result<Vec<u8>, ApiError> {
+async fn gh_output(repo: Option<&std::path::Path>, args: &[&str]) -> Result<Vec<u8>, ApiError> {
     let mut command = Command::new("gh");
     command.args(args);
     if let Some(repo) = repo {
@@ -580,8 +600,8 @@ async fn gh_output(
 }
 
 async fn github_repo_for_local(repo: &PathBuf) -> Result<String, ApiError> {
-    let info = gh_json::<GitHubRepoInfo>(Some(repo), &["repo", "view", "--json", "nameWithOwner"])
-        .await?;
+    let info =
+        gh_json::<GitHubRepoInfo>(Some(repo), &["repo", "view", "--json", "nameWithOwner"]).await?;
     Ok(info.name_with_owner)
 }
 
@@ -595,7 +615,11 @@ fn parse_github_pr_url(url: &str) -> Result<GitHubPrReference, ApiError> {
                 "Enter a GitHub pull-request URL such as https://github.com/owner/repo/pull/123.",
             )
         })?;
-    let path = path.split(['?', '#']).next().unwrap_or(path).trim_end_matches('/');
+    let path = path
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(path)
+        .trim_end_matches('/');
     let pieces = path.split('/').collect::<Vec<_>>();
     let [owner, name, "pull", number] = pieces.as_slice() else {
         return Err(ApiError::bad_request(
@@ -603,13 +627,17 @@ fn parse_github_pr_url(url: &str) -> Result<GitHubPrReference, ApiError> {
         ));
     };
     if !is_github_slug_part(owner) || !is_github_slug_part(name) {
-        return Err(ApiError::bad_request("The GitHub owner or repository name is invalid."));
+        return Err(ApiError::bad_request(
+            "The GitHub owner or repository name is invalid.",
+        ));
     }
     let number = number
         .parse::<u64>()
         .ok()
         .filter(|number| *number > 0)
-        .ok_or_else(|| ApiError::bad_request("The pull-request number must be a positive integer."))?;
+        .ok_or_else(|| {
+            ApiError::bad_request("The pull-request number must be a positive integer.")
+        })?;
     Ok(GitHubPrReference {
         repo: format!("{owner}/{name}"),
         number,
@@ -624,7 +652,7 @@ fn is_github_slug_part(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
-async fn cached_github_repo(github_repo: &str) -> Result<PathBuf, ApiError> {
+async fn cached_github_repo(cache_dir: &FsPath, github_repo: &str) -> Result<PathBuf, ApiError> {
     let mut pieces = github_repo.split('/');
     let (Some(owner), Some(name), None) = (pieces.next(), pieces.next(), pieces.next()) else {
         return Err(ApiError::bad_request("Invalid GitHub repository name."));
@@ -632,10 +660,7 @@ async fn cached_github_repo(github_repo: &str) -> Result<PathBuf, ApiError> {
     if !is_github_slug_part(owner) || !is_github_slug_part(name) {
         return Err(ApiError::bad_request("Invalid GitHub repository name."));
     }
-    let directories = ProjectDirs::from("com", "hydradb", "local-diffe")
-        .ok_or_else(|| ApiError::internal("Could not determine Local Diffe's cache directory."))?;
-    let destination = directories
-        .cache_dir()
+    let destination = cache_dir
         .join("github-repos")
         .join(format!("{owner}--{name}"));
     if destination.join(".git").is_dir() {
@@ -650,14 +675,88 @@ async fn cached_github_repo(github_repo: &str) -> Result<PathBuf, ApiError> {
     let parent = destination
         .parent()
         .ok_or_else(|| ApiError::internal("Could not construct GitHub cache path."))?;
-    fs::create_dir_all(parent)
-        .map_err(|error| ApiError::internal(format!("Could not create GitHub cache directory: {error}")))?;
+    fs::create_dir_all(parent).map_err(|error| {
+        ApiError::internal(format!("Could not create GitHub cache directory: {error}"))
+    })?;
     let destination_string = destination.to_string_lossy().to_string();
     gh_output(None, &["repo", "clone", github_repo, &destination_string]).await?;
     if !destination.join(".git").is_dir() {
-        return Err(ApiError::internal("GitHub CLI completed but did not create the expected repository."));
+        return Err(ApiError::internal(
+            "GitHub CLI completed but did not create the expected repository.",
+        ));
     }
     Ok(destination)
+}
+
+fn github_pr_cache_dir(cache_dir: &FsPath, github_repo: &str) -> Result<PathBuf, ApiError> {
+    let mut pieces = github_repo.split('/');
+    let (Some(owner), Some(name), None) = (pieces.next(), pieces.next(), pieces.next()) else {
+        return Err(ApiError::bad_request("Invalid GitHub repository name."));
+    };
+    if !is_github_slug_part(owner) || !is_github_slug_part(name) {
+        return Err(ApiError::bad_request("Invalid GitHub repository name."));
+    }
+    Ok(cache_dir
+        .join("github-prs")
+        .join(format!("{owner}--{name}")))
+}
+
+fn read_pr_list_cache(cache_dir: &FsPath, github_repo: &str) -> Option<Vec<PullRequestInfo>> {
+    read_json_cache(
+        &github_pr_cache_dir(cache_dir, github_repo)
+            .ok()?
+            .join("open.json"),
+    )
+}
+
+fn write_pr_list_cache(
+    cache_dir: &FsPath,
+    github_repo: &str,
+    pulls: &[PullRequestInfo],
+) -> Result<(), ApiError> {
+    write_json_cache(
+        &github_pr_cache_dir(cache_dir, github_repo)?.join("open.json"),
+        pulls,
+    )
+}
+
+fn read_pr_cache(cache_dir: &FsPath, github_repo: &str, number: u64) -> Option<PullRequestInfo> {
+    read_json_cache(
+        &github_pr_cache_dir(cache_dir, github_repo)
+            .ok()?
+            .join(format!("{number}.json")),
+    )
+}
+
+fn write_pr_cache(
+    cache_dir: &FsPath,
+    github_repo: &str,
+    pull: &PullRequestInfo,
+) -> Result<(), ApiError> {
+    write_json_cache(
+        &github_pr_cache_dir(cache_dir, github_repo)?.join(format!("{}.json", pull.number)),
+        pull,
+    )
+}
+
+fn read_json_cache<T: serde::de::DeserializeOwned>(path: &FsPath) -> Option<T> {
+    serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
+fn write_json_cache<T: Serialize + ?Sized>(path: &FsPath, value: &T) -> Result<(), ApiError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| ApiError::internal("Could not construct cache path."))?;
+    fs::create_dir_all(parent).map_err(|error| {
+        ApiError::internal(format!("Could not create cache directory: {error}"))
+    })?;
+    let contents = serde_json::to_vec_pretty(value)
+        .map_err(|error| ApiError::internal(format!("Could not serialize cache entry: {error}")))?;
+    let temporary = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
+    fs::write(&temporary, contents)
+        .map_err(|error| ApiError::internal(format!("Could not write cache entry: {error}")))?;
+    fs::rename(&temporary, path)
+        .map_err(|error| ApiError::internal(format!("Could not finalize cache entry: {error}")))
 }
 
 async fn fetch_github_pr(repo: &PathBuf, pull: &PullRequestInfo) -> Result<(), ApiError> {

@@ -37,6 +37,29 @@ not a misleading whole-branch snapshot. Pasted links work for open, closed,
 and merged PRs; if the selected repository is different, Local Diffe clones a
 private cache copy under its application cache directory and reuses it later.
 
+## Cache directory
+
+By default, Local Diffe stores its data in the operating system's application
+cache directory. It keeps embedded SemanticDiff runtime files, cloned
+repositories, and GitHub PR JSON separately:
+
+```
+<cache-dir>/semanticdiff/
+<cache-dir>/github-repos/<owner>--<repo>/
+<cache-dir>/github-prs/<owner>--<repo>/open.json
+<cache-dir>/github-prs/<owner>--<repo>/<number>.json
+```
+
+The first request stores the open-PR list and each fetched PR; later requests
+reuse those files (invalid cache JSON is refetched). Choose a portable or
+project-specific location with either `--cache-dir` or `LOCAL_DIFFE_CACHE_DIR`:
+
+```bash
+cargo run -- --cache-dir /path/to/local-diffe-cache
+# or
+LOCAL_DIFFE_CACHE_DIR=/path/to/local-diffe-cache just run
+```
+
 For frontend iteration, run `cargo run` in one terminal and `npm run dev` from
 `web/` in another. Vite proxies the API and SemanticDiff routes to the Rust
 server.
