@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    fs,
     net::SocketAddr,
     path::PathBuf,
     process::Stdio,
@@ -7,49 +8,39 @@ use std::{
 };
 
 use axum::{
+    body::Body,
     extract::{DefaultBodyLimit, Path, State},
-    http::StatusCode,
+    http::{header, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use clap::Parser;
+use directories::ProjectDirs;
+use include_dir::{include_dir, Dir};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::{io::AsyncWriteExt, process::Command};
-use tower_http::services::ServeDir;
 use uuid::Uuid;
 
-const DEFAULT_SEMANTICDIFF_BIN: &str =
-    "/Users/abhishek/.cursor/extensions/semanticdiff.semanticdiff-0.10.0-darwin-arm64/bin/semanticdiff";
-const DEFAULT_SEMANTICDIFF_WEBVIEW: &str =
-    "/Users/abhishek/.cursor/extensions/semanticdiff.semanticdiff-0.10.0-darwin-arm64/out/webview";
+static WEB_ASSETS: Dir<'_> = include_dir!("$OUT_DIR/embedded/web");
+static SEMANTICDIFF_WEBVIEW: Dir<'_> = include_dir!("$OUT_DIR/embedded/semanticdiff-webview");
+static SEMANTICDIFF_RUNTIME: Dir<'_> = include_dir!("$OUT_DIR/embedded/semanticdiff-runtime");
 
 #[derive(Parser, Debug)]
-#[command(about = "A local viewer for Git patches using the installed SemanticDiff CLI")]
+#[command(
+    version = env!("LOCAL_DIFFE_VERSION"),
+    about = "A self-contained local viewer for Git patches using SemanticDiff"
+)]
 struct Args {
     /// Address to listen on.
     #[arg(long, default_value = "0.0.0.0:4317")]
     listen: SocketAddr,
-
-    /// Path to the SemanticDiff executable installed by Cursor.
-    #[arg(long, env = "SEMANTICDIFF_BIN", default_value = DEFAULT_SEMANTICDIFF_BIN)]
-    semanticdiff_bin: PathBuf,
-
-    /// Unmodified webview directory from the installed SemanticDiff extension.
-    #[arg(long, env = "SEMANTICDIFF_WEBVIEW", default_value = DEFAULT_SEMANTICDIFF_WEBVIEW)]
-    semanticdiff_webview: PathBuf,
-
-    /// React production build directory. Use `npm run build` in web/ before cargo run.
-    #[arg(long, default_value = "web/dist")]
-    web_dir: PathBuf,
 }
 
 #[derive(Clone)]
 struct AppState {
     semanticdiff_bin: PathBuf,
-    semanticdiff_webview: PathBuf,
-    web_dir: PathBuf,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
 }
 
@@ -145,40 +136,23 @@ impl IntoResponse for ApiError {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    if !args.semanticdiff_bin.is_file() {
-        eprintln!(
-            "SemanticDiff executable not found: {}",
-            args.semanticdiff_bin.display()
-        );
-        eprintln!("Install the SemanticDiff Cursor extension, or pass --semanticdiff-bin /path/to/semanticdiff");
+    let semanticdiff_bin = extract_semanticdiff().unwrap_or_else(|error| {
+        eprintln!("Could not prepare embedded SemanticDiff: {error}");
         std::process::exit(2);
-    }
-    if !args.semanticdiff_webview.join("index.html").is_file() {
-        eprintln!(
-            "SemanticDiff webview not found: {}",
-            args.semanticdiff_webview.display()
-        );
-        eprintln!("Pass --semanticdiff-webview /path/to/SemanticDiff/out/webview");
-        std::process::exit(2);
-    }
+    });
 
     let state = AppState {
-        semanticdiff_bin: args.semanticdiff_bin,
-        semanticdiff_webview: args.semanticdiff_webview.clone(),
-        web_dir: args.web_dir.clone(),
+        semanticdiff_bin,
         sessions: Arc::new(Mutex::new(HashMap::new())),
     };
     let app = Router::new()
         .route("/", get(index))
+        .route("/assets/{*path}", get(web_asset))
         .route("/api/patch", post(start_session))
         .route("/api/git-diff", post(start_git_diff))
         .route("/api/semantic/{id}/{index}", post(semantic_file))
         .route("/semanticdiff-view/{id}/{index}", get(semanticdiff_view))
-        .nest_service("/assets", ServeDir::new(args.web_dir.join("assets")))
-        .nest_service(
-            "/semanticdiff-assets",
-            ServeDir::new(args.semanticdiff_webview),
-        )
+        .route("/semanticdiff-assets/{*path}", get(semanticdiff_asset))
         .layer(DefaultBodyLimit::max(25 * 1024 * 1024))
         .with_state(state);
 
@@ -187,13 +161,97 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn index(State(state): State<AppState>) -> Html<String> {
-    let fallback = "<main style=\"font-family:system-ui;padding:2rem\"><h1>Local Diffe</h1><p>Build the React app first: <code>cd web && npm run build</code></p></main>";
-    Html(
-        tokio::fs::read_to_string(state.web_dir.join("index.html"))
-            .await
-            .unwrap_or_else(|_| fallback.to_owned()),
-    )
+async fn index() -> Html<&'static str> {
+    Html(asset_text(&WEB_ASSETS, "index.html").expect("embedded web index is missing"))
+}
+
+async fn web_asset(Path(path): Path<String>) -> Response {
+    embedded_asset(&WEB_ASSETS, &path)
+}
+
+async fn semanticdiff_asset(Path(path): Path<String>) -> Response {
+    embedded_asset(&SEMANTICDIFF_WEBVIEW, &path)
+}
+
+fn embedded_asset(directory: &'static Dir<'static>, path: &str) -> Response {
+    let Some(file) = directory.get_file(path) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mut response = Response::new(Body::from(file.contents()));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(content_type(path)),
+    );
+    response
+}
+
+fn asset_text(directory: &'static Dir<'static>, path: &str) -> Option<&'static str> {
+    std::str::from_utf8(directory.get_file(path)?.contents()).ok()
+}
+
+fn content_type(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or_default() {
+        "css" => "text/css; charset=utf-8",
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" | "map" => "application/json; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "wasm" => "application/wasm",
+        _ => "application/octet-stream",
+    }
+}
+
+fn extract_semanticdiff() -> Result<PathBuf, String> {
+    let directories = ProjectDirs::from("com", "hydradb", "local-diffe")
+        .ok_or_else(|| "could not determine a local cache directory".to_owned())?;
+    let runtime = directories
+        .cache_dir()
+        .join("semanticdiff")
+        .join(env!("LOCAL_DIFFE_VERSION"))
+        .join("runtime");
+    let destination = runtime.join("bin/semanticdiff");
+    if runtime.join(".complete").is_file() && destination.is_file() {
+        return Ok(destination);
+    }
+
+    let parent = runtime
+        .parent()
+        .ok_or_else(|| "could not construct SemanticDiff cache path".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create cache directory: {error}"))?;
+    let temporary = parent.join(format!(".runtime-{}.tmp", std::process::id()));
+    let _ = fs::remove_dir_all(&temporary);
+    materialize_embedded_dir(&SEMANTICDIFF_RUNTIME, &temporary)?;
+    fs::write(temporary.join(".complete"), env!("LOCAL_DIFFE_VERSION"))
+        .map_err(|error| format!("could not finalize embedded SemanticDiff: {error}"))?;
+    let _ = fs::remove_dir_all(&runtime);
+    fs::rename(&temporary, &runtime)
+        .map_err(|error| format!("could not activate embedded SemanticDiff: {error}"))?;
+    Ok(destination)
+}
+
+fn materialize_embedded_dir(
+    source: &'static Dir<'static>,
+    destination: &std::path::Path,
+) -> Result<(), String> {
+    source
+        .extract(destination)
+        .map_err(|error| format!("could not write embedded SemanticDiff files: {error}"))?;
+    #[cfg(unix)]
+    if let Some(bin) = source.get_dir("bin") {
+        use std::os::unix::fs::PermissionsExt;
+        for file in bin.files() {
+            let target = destination.join(file.path());
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).map_err(|error| {
+                format!("could not make SemanticDiff parser executable: {error}")
+            })?;
+        }
+    }
+    Ok(())
 }
 
 async fn start_session(
@@ -468,11 +526,9 @@ async fn semanticdiff_view(
         .replace('<', "\\u003c")
         .replace('>', "\\u003e")
         .replace('&', "\\u0026");
-    let template = tokio::fs::read_to_string(state.semanticdiff_webview.join("index.html"))
-        .await
-        .map_err(|error| {
-            ApiError::internal(format!("Could not read SemanticDiff webview: {error}"))
-        })?;
+    let template = asset_text(&SEMANTICDIFF_WEBVIEW, "index.html").ok_or_else(|| {
+        ApiError::internal("Embedded SemanticDiff webview is missing index.html.")
+    })?;
     let bridge = r#"<style>:root{color-scheme:dark;--vscode-font-family:ui-sans-serif,system-ui,sans-serif;--vscode-font-size:13px;--vscode-editor-font-family:ui-monospace,SFMono-Regular,Menlo,monospace;--vscode-editor-font-size:12px;--vscode-editor-background:#0d1117;--vscode-editor-foreground:#e6edf3;--vscode-breadcrumb-background:#161b22;--vscode-breadcrumb-foreground:#c9d1d9;--vscode-breadcrumb-focusForeground:#58a6ff;--vscode-editorWidget-border:#30363d;--vscode-scrollbar-shadow:#010409;--vscode-focusBorder:#58a6ff;--vscode-button-background:#238636;--vscode-button-foreground:#fff;--vscode-button-hoverBackground:#2ea043;--vscode-input-background:#0d1117;--vscode-input-foreground:#e6edf3;--vscode-list-activeSelectionBackground:#1f6feb;--vscode-list-hoverBackground:#21262d;--vscode-diffEditor-insertedLineBackground:#033a16;--vscode-diffEditor-removedLineBackground:#67060c;--vscode-diffEditor-insertedTextBackground:#0f6b2e;--vscode-diffEditor-removedTextBackground:#8e1519;--vscode-diffEditor-diagonalFill:#30363d;--vscode-minimapSlider-background:#8b949e99;--vscode-peekViewResult-background:#161b22;--vscode-editorOverviewRuler-modifiedForeground:#58a6ff;--vscode-editorOverviewRuler-deletedForeground:#f85149;--vscode-editorOverviewRuler-addedForeground:#3fb950;--vscode-editorLineNumber-foreground:#8b949e;--vscode-editorUnicodeHighlight-background:#6e40c933;--vscode-editorUnicodeHighlight-border:#6e40c9;--vscode-editor-selectionBackground:#264f78;--vscode-notifications-background:#161b22;--vscode-notifications-border:#30363d;--vscode-notifications-foreground:#c9d1d9;--vscode-notificationsErrorIcon-foreground:#f85149;--vscode-disabledForeground:#8b949e;--vscode-icon-foreground:#c9d1d9;--vscode-editorCodeLens-foreground:#8b949e;--vscode-editorGhostText-foreground:#8b949e;--vscode-editorHint-foreground:#8b949e;--vscode-editorInlayHint-background:#21262d;--vscode-editorLink-activeForeground:#58a6ff;--vscode-editorSuggestWidget-foreground:#c9d1d9;--vscode-editorSuggestWidget-selectedForeground:#fff;--vscode-editorWidget-background:#161b22;--vscode-menu-selectionBackground:#1f6feb;--vscode-menu-selectionForeground:#fff;--vscode-statusBar-background:#161b22;--vscode-statusBar-foreground:#c9d1d9;--vscode-statusBarItem-hoverBackground:#21262d;--vscode-statusBarItem-hoverForeground:#fff;--vscode-toolbar-activeBackground:#30363d;--vscode-toolbar-hoverBackground:#21262d;--vscode-tree-tableColumnsBorder:#30363d;--vscode-tree-tableOddRowsBackground:#161b22}html,body{background:#0d1117!important;color:#e6edf3!important}.patch,.patch .line,.patch .code-fg,.patch .line .content,.patch .header{color:#c9d1d9!important}.patch .line .line-number,.patch .line .number{color:#8b949e!important}</style><script>window.acquireVsCodeApi=()=>({getState:()=>undefined,setState:()=>{},postMessage:(message)=>window.parent!==window&&window.parent.postMessage({source:'semanticdiff',message},'*')});</script><script src="script.js"></script>"#;
     let html = template
         .replace("${webview.cspSource}", "'self'")
