@@ -14,7 +14,7 @@ async function press(page, key) {
 
 const { browser, page } = await openApp()
 try {
-  await press(page, "-")
+  await press(page, "?")
   const shown = await page.evaluate(() => ({
     overlay: Boolean(document.querySelector('[data-testid="keyboard-overlay"]')),
     destinations: document.querySelector('[data-testid="keyboard-overlay"]')?.textContent,
@@ -38,6 +38,13 @@ try {
   await press(page, "Escape")
   const hidden = await page.evaluate(() => !document.querySelector('[data-testid="keyboard-overlay"]'))
   if (!hidden) throw new Error("Escape did not hide the keyboard overlay.")
+
+  await press(page, "?")
+  await pause(20_150)
+  const compact = await page.evaluate(() => document.querySelector('[data-testid="keyboard-overlay"]')?.textContent)
+  if (!compact?.includes("J/K scroll diff") || compact.includes("Focus view")) {
+    throw new Error("Keyboard overlay did not collapse to its compact shortcut strip.")
+  }
 
   console.log("keyboard overlay check passed")
 } finally {

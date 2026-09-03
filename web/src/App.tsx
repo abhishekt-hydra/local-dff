@@ -83,6 +83,7 @@ export default function App() {
   const [prNumber, setPrNumber] = useState("")
   const [chromeHidden, setChromeHidden] = useState(false)
   const [keyboardOverlay, setKeyboardOverlay] = useState(false)
+  const [keyboardOverlayExpanded, setKeyboardOverlayExpanded] = useState(false)
   const [activeRegion, setActiveRegion] = useState<ReviewRegion>("sidebar")
   const [sidebarWidth, setSidebarWidth] = useState(320)
   const [resizingSidebar, setResizingSidebar] = useState(false)
@@ -189,6 +190,35 @@ export default function App() {
     setSelected(available[next])
   }, [selected, session])
 
+  const scrollDiff = useCallback((direction: 1 | -1) => {
+    const frame = diffFrameRef.current
+    const document = frame?.contentDocument
+    const viewport = frame?.contentWindow
+    if (!document || !viewport) return
+    const scrollTarget = [document.scrollingElement, ...document.querySelectorAll<HTMLElement>("*")]
+      .filter((element): element is HTMLElement => Boolean(element && element.scrollHeight > element.clientHeight + 1))
+      .sort((left, right) => (right.scrollHeight - right.clientHeight) - (left.scrollHeight - left.clientHeight))[0]
+    const distance = Math.max(160, Math.round(viewport.innerHeight * 0.72)) * direction
+    if (scrollTarget) {
+      const nextTop = Math.max(0, Math.min(scrollTarget.scrollHeight - scrollTarget.clientHeight, scrollTarget.scrollTop + distance))
+      scrollTarget.scrollTop = nextTop
+    }
+    else viewport.scrollBy({ top: distance, behavior: "smooth" })
+  }, [])
+
+  const toggleKeyboardOverlay = useCallback(() => {
+    setKeyboardOverlay((open) => {
+      const next = !open
+      setKeyboardOverlayExpanded(next)
+      return next
+    })
+  }, [])
+
+  const showKeyboardHelp = useCallback(() => {
+    setKeyboardOverlay(true)
+    setKeyboardOverlayExpanded(true)
+  }, [])
+
   const runOverlayCommand = useCallback((key: string) => {
     switch (key.toLowerCase()) {
       case "f":
@@ -202,13 +232,15 @@ export default function App() {
         focusDiff()
         break
       case "j":
-        moveFile(1)
+        if (activeRegion === "diff") scrollDiff(1)
+        else moveFile(1)
         break
       case "k":
-        moveFile(-1)
+        if (activeRegion === "diff") scrollDiff(-1)
+        else moveFile(-1)
         break
     }
-  }, [focusDiff, focusSidebar, moveFile])
+  }, [activeRegion, focusDiff, focusSidebar, moveFile, scrollDiff])
 
   useEffect(() => {
     if (activeRegion !== "diff") return
@@ -217,11 +249,22 @@ export default function App() {
   }, [activeRegion, selected, session?.id])
 
   useEffect(() => {
+    if (!keyboardOverlay || !keyboardOverlayExpanded) return
+    const timer = window.setTimeout(() => setKeyboardOverlayExpanded(false), 20_000)
+    return () => window.clearTimeout(timer)
+  }, [keyboardOverlay, keyboardOverlayExpanded])
+
+  useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (isEditableTarget(event.target)) return
       if (event.key === "-") {
         event.preventDefault()
-        setKeyboardOverlay((open) => !open)
+        toggleKeyboardOverlay()
+        return
+      }
+      if (event.key === "?") {
+        event.preventDefault()
+        showKeyboardHelp()
         return
       }
       if (event.key === "Escape" && keyboardOverlay) {
@@ -240,7 +283,9 @@ export default function App() {
       const data = event.data as { source?: string; key?: string } | null
       if (data?.source !== "local-diffe-keyboard" || !data.key) return
       if (data.key === "-") {
-        setKeyboardOverlay((open) => !open)
+        toggleKeyboardOverlay()
+      } else if (data.key === "?") {
+        showKeyboardHelp()
       } else if (data.key === "Escape" && keyboardOverlay) {
         setKeyboardOverlay(false)
       } else if (keyboardOverlay && ["f", "d", "v", "j", "k"].includes(data.key.toLowerCase())) {
@@ -253,7 +298,7 @@ export default function App() {
       window.removeEventListener("keydown", onKeyDown)
       window.removeEventListener("message", onMessage)
     }
-  }, [keyboardOverlay, runOverlayCommand])
+  }, [keyboardOverlay, runOverlayCommand, showKeyboardHelp, toggleKeyboardOverlay])
 
   const renderNode = ({ node, style, dragHandle }: NodeRendererProps<TreeItem>) => {
     const item = node.data
@@ -284,7 +329,7 @@ export default function App() {
         <div className="flex h-14 w-full items-center gap-3 px-4">
           <div className="flex items-center gap-2 font-semibold"><FileDiff className="size-5 text-primary" /> Local Diffe</div>
           <span className="hidden text-sm text-muted-foreground md:inline">GitHub-style review, SemanticDiff display engine</span>
-          <div className="ml-auto flex items-center gap-2"><div className="flex items-center gap-1.5 text-xs text-muted-foreground"><Sparkles className="size-3.5" /> local only</div><Button data-testid="keyboard-overlay-toggle" size="sm" variant={keyboardOverlay ? "secondary" : "outline"} onClick={() => setKeyboardOverlay((open) => !open)} aria-pressed={keyboardOverlay} title="Toggle keyboard overlay (-)"><Keyboard className="size-4" /> Keys</Button><Button data-testid="hide-chrome" size="sm" variant="outline" onClick={() => setChromeHidden(true)}><ChevronUp className="size-4" /> Focus view</Button></div>
+          <div className="ml-auto flex items-center gap-2"><div className="flex items-center gap-1.5 text-xs text-muted-foreground"><Sparkles className="size-3.5" /> local only</div><Button data-testid="keyboard-overlay-toggle" size="sm" variant={keyboardOverlay ? "secondary" : "outline"} onClick={toggleKeyboardOverlay} aria-pressed={keyboardOverlay} title="Toggle keyboard overlay (-)"><Keyboard className="size-4" /> Keys</Button><Button data-testid="hide-chrome" size="sm" variant="outline" onClick={() => setChromeHidden(true)}><ChevronUp className="size-4" /> Focus view</Button></div>
         </div>
       </header>}
 
@@ -340,15 +385,17 @@ export default function App() {
           </Card>
         </div>
       </main>
-      {keyboardOverlay && <div data-testid="keyboard-overlay" className="fixed inset-x-0 bottom-5 z-50 mx-auto w-[min(760px,calc(100%-2rem))] rounded-xl border border-primary/30 bg-background/95 p-3 shadow-2xl backdrop-blur" role="status" aria-live="polite">
-        <div className="flex items-center justify-between gap-3 px-1 pb-2 text-xs text-muted-foreground"><span className="flex items-center gap-1.5 font-medium text-foreground"><Keyboard className="size-3.5 text-primary" /> Keyboard overlay</span><span>Press <kbd className="rounded border bg-muted px-1.5 py-0.5 font-mono text-foreground">Esc</kbd> or <kbd className="rounded border bg-muted px-1.5 py-0.5 font-mono text-foreground">-</kbd> to hide</span></div>
-        <div className="grid gap-2 sm:grid-cols-3">
-          <button type="button" onClick={() => runOverlayCommand("f")} className={cn("rounded-lg border p-3 text-left transition-colors hover:bg-accent", activeRegion === "sidebar" && "border-primary bg-primary/5")}><kbd className="mr-2 rounded bg-foreground px-1.5 py-0.5 font-mono text-xs text-background">F</kbd><span className="font-medium">Files</span><span className="mt-1 block text-xs text-muted-foreground">Focus the changed-file sidebar</span></button>
-          <button type="button" onClick={() => runOverlayCommand("d")} className={cn("rounded-lg border p-3 text-left transition-colors hover:bg-accent", activeRegion === "diff" && "border-primary bg-primary/5")}><kbd className="mr-2 rounded bg-foreground px-1.5 py-0.5 font-mono text-xs text-background">D</kbd><span className="font-medium">Diff panel</span><span className="mt-1 block text-xs text-muted-foreground">Focus the SemanticDiff view</span></button>
-          <button type="button" onClick={() => runOverlayCommand("v")} className="rounded-lg border p-3 text-left transition-colors hover:bg-accent"><kbd className="mr-2 rounded bg-foreground px-1.5 py-0.5 font-mono text-xs text-background">V</kbd><span className="font-medium">Focus view</span><span className="mt-1 block text-xs text-muted-foreground">Hide controls and enter the diff</span></button>
-        </div>
-        <div className="mt-2 flex items-center gap-4 rounded-lg bg-muted px-3 py-2 text-xs text-muted-foreground"><span><kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">J</kbd> next file</span><span><kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">K</kbd> previous file</span><span className="ml-auto">{activeRegion === "sidebar" ? "Files sidebar active" : "Diff panel active"}</span></div>
-      </div>}
+      {keyboardOverlay && <aside data-testid="keyboard-overlay" className={cn("fixed inset-x-0 bottom-5 z-50 mx-auto border border-primary/30 bg-background/95 shadow-2xl backdrop-blur transition-[width,padding] duration-300", keyboardOverlayExpanded ? "w-[min(760px,calc(100%-2rem))] rounded-xl p-3" : "w-fit rounded-full px-3 py-2")} aria-label="Keyboard navigation">
+        {keyboardOverlayExpanded ? <>
+          <div className="flex items-center justify-between gap-3 px-1 pb-2 text-xs text-muted-foreground"><span className="flex items-center gap-1.5 font-medium text-foreground"><Keyboard className="size-3.5 text-primary" /> Keyboard overlay</span><span><kbd className="rounded border bg-muted px-1.5 py-0.5 font-mono text-foreground">?</kbd> show keys · <kbd className="rounded border bg-muted px-1.5 py-0.5 font-mono text-foreground">Esc</kbd> or <kbd className="rounded border bg-muted px-1.5 py-0.5 font-mono text-foreground">-</kbd> hide</span></div>
+          <div className="grid gap-2 sm:grid-cols-3">
+            <button type="button" onClick={() => runOverlayCommand("f")} className={cn("rounded-lg border p-3 text-left transition-colors hover:bg-accent", activeRegion === "sidebar" && "border-primary bg-primary/5")}><kbd className="mr-2 rounded bg-foreground px-1.5 py-0.5 font-mono text-xs text-background">F</kbd><span className="font-medium">Files</span><span className="mt-1 block text-xs text-muted-foreground">Focus the changed-file sidebar</span></button>
+            <button type="button" onClick={() => runOverlayCommand("d")} className={cn("rounded-lg border p-3 text-left transition-colors hover:bg-accent", activeRegion === "diff" && "border-primary bg-primary/5")}><kbd className="mr-2 rounded bg-foreground px-1.5 py-0.5 font-mono text-xs text-background">D</kbd><span className="font-medium">Diff panel</span><span className="mt-1 block text-xs text-muted-foreground">Focus the SemanticDiff view</span></button>
+            <button type="button" onClick={() => runOverlayCommand("v")} className="rounded-lg border p-3 text-left transition-colors hover:bg-accent"><kbd className="mr-2 rounded bg-foreground px-1.5 py-0.5 font-mono text-xs text-background">V</kbd><span className="font-medium">Focus view</span><span className="mt-1 block text-xs text-muted-foreground">Hide controls and enter the diff</span></button>
+          </div>
+          <div className="mt-2 flex items-center gap-4 rounded-lg bg-muted px-3 py-2 text-xs text-muted-foreground"><span><kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">J</kbd> {activeRegion === "diff" ? "scroll down" : "next file"}</span><span><kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">K</kbd> {activeRegion === "diff" ? "scroll up" : "previous file"}</span><span className="ml-auto">{activeRegion === "sidebar" ? "Files sidebar active" : "Diff panel active"}</span></div>
+        </> : <button type="button" onClick={showKeyboardHelp} className="flex items-center gap-2 text-xs text-muted-foreground hover:text-foreground"><Keyboard className="size-3.5 text-primary" /><span>{activeRegion === "diff" ? "J/K scroll diff" : "J/K files"}</span><kbd className="rounded border bg-muted px-1.5 py-0.5 font-mono text-foreground">?</kbd><span>keys</span></button>}
+      </aside>}
     </div>
   )
 }
