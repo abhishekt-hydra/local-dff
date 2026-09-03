@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Tree, type NodeRendererProps } from "react-arborist"
 import {
   ChevronRight,
@@ -11,6 +11,7 @@ import {
   GitBranch,
   GitPullRequest,
   GripVertical,
+  Keyboard,
   Link,
   LoaderCircle,
   Minus,
@@ -30,6 +31,12 @@ type PullRequest = { number: number; title: string; url: string; state: string; 
 type Comparison = { base: Revision; target: Revision; changed_paths: number; semantic_paths: number; description: string; pull_request?: PullRequest | null }
 type Session = { id: string; files: PatchFile[]; comparison?: Comparison | null }
 type TreeItem = { id: string; name: string; children?: TreeItem[]; fileIndex?: number; renderable?: boolean }
+
+type ReviewRegion = "sidebar" | "diff"
+
+function isEditableTarget(target: EventTarget | null) {
+  return target instanceof HTMLElement && Boolean(target.closest('input, textarea, select, [contenteditable="true"], [role="textbox"]'))
+}
 
 const initialRepo = "/Users/abhishek/hydradb/hydradb-application"
 
@@ -75,6 +82,8 @@ export default function App() {
   const [pulls, setPulls] = useState<PullRequest[]>([])
   const [prNumber, setPrNumber] = useState("")
   const [chromeHidden, setChromeHidden] = useState(false)
+  const [keyboardOverlay, setKeyboardOverlay] = useState(false)
+  const [activeRegion, setActiveRegion] = useState<ReviewRegion>("sidebar")
   const [sidebarWidth, setSidebarWidth] = useState(320)
   const [resizingSidebar, setResizingSidebar] = useState(false)
   const [session, setSession] = useState<Session | null>(null)
@@ -83,6 +92,9 @@ export default function App() {
   const [status, setStatus] = useState("Ready to compare origin/staging with the checked-out branch.")
   const [loading, setLoading] = useState(false)
   const reviewGrid = useRef<HTMLDivElement>(null)
+  const sidebarRef = useRef<HTMLDivElement>(null)
+  const diffPanelRef = useRef<HTMLDivElement>(null)
+  const diffFrameRef = useRef<HTMLIFrameElement>(null)
   const tree = useMemo(() => makeTree(session?.files ?? []), [session])
 
   useEffect(() => {
@@ -155,6 +167,94 @@ export default function App() {
     void loadSession("/api/github/open-url", { repo, url: prUrl }, "Fetching the GitHub pull request and generating its merge-base diff…")
   }
 
+  const focusSidebar = useCallback(() => {
+    setActiveRegion("sidebar")
+    requestAnimationFrame(() => sidebarRef.current?.focus())
+  }, [])
+
+  const focusDiff = useCallback(() => {
+    const firstRenderable = session?.files.findIndex((file) => file.renderable)
+    if (selected === null && firstRenderable !== undefined && firstRenderable >= 0) setSelected(firstRenderable)
+    setActiveRegion("diff")
+  }, [selected, session])
+
+  const moveFile = useCallback((direction: 1 | -1) => {
+    const files = session?.files ?? []
+    const available = files.flatMap((file, index) => file.renderable ? [index] : [])
+    if (!available.length) return
+    const current = selected === null ? -1 : available.indexOf(selected)
+    const next = current === -1
+      ? (direction === 1 ? 0 : available.length - 1)
+      : (current + direction + available.length) % available.length
+    setSelected(available[next])
+  }, [selected, session])
+
+  const runOverlayCommand = useCallback((key: string) => {
+    switch (key.toLowerCase()) {
+      case "f":
+        focusSidebar()
+        break
+      case "d":
+        focusDiff()
+        break
+      case "v":
+        setChromeHidden(true)
+        focusDiff()
+        break
+      case "j":
+        moveFile(1)
+        break
+      case "k":
+        moveFile(-1)
+        break
+    }
+  }, [focusDiff, focusSidebar, moveFile])
+
+  useEffect(() => {
+    if (activeRegion !== "diff") return
+    const frame = requestAnimationFrame(() => (diffFrameRef.current ?? diffPanelRef.current)?.focus())
+    return () => cancelAnimationFrame(frame)
+  }, [activeRegion, selected, session?.id])
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (isEditableTarget(event.target)) return
+      if (event.key === "-") {
+        event.preventDefault()
+        setKeyboardOverlay((open) => !open)
+        return
+      }
+      if (event.key === "Escape" && keyboardOverlay) {
+        event.preventDefault()
+        setKeyboardOverlay(false)
+        return
+      }
+      if (!keyboardOverlay) return
+      const key = event.key.toLowerCase()
+      if (["f", "d", "v", "j", "k"].includes(key)) {
+        event.preventDefault()
+        runOverlayCommand(key)
+      }
+    }
+    const onMessage = (event: MessageEvent) => {
+      const data = event.data as { source?: string; key?: string } | null
+      if (data?.source !== "local-diffe-keyboard" || !data.key) return
+      if (data.key === "-") {
+        setKeyboardOverlay((open) => !open)
+      } else if (data.key === "Escape" && keyboardOverlay) {
+        setKeyboardOverlay(false)
+      } else if (keyboardOverlay && ["f", "d", "v", "j", "k"].includes(data.key.toLowerCase())) {
+        runOverlayCommand(data.key)
+      }
+    }
+    window.addEventListener("keydown", onKeyDown)
+    window.addEventListener("message", onMessage)
+    return () => {
+      window.removeEventListener("keydown", onKeyDown)
+      window.removeEventListener("message", onMessage)
+    }
+  }, [keyboardOverlay, runOverlayCommand])
+
   const renderNode = ({ node, style, dragHandle }: NodeRendererProps<TreeItem>) => {
     const item = node.data
     const isFile = item.fileIndex !== undefined
@@ -184,7 +284,7 @@ export default function App() {
         <div className="flex h-14 w-full items-center gap-3 px-4">
           <div className="flex items-center gap-2 font-semibold"><FileDiff className="size-5 text-primary" /> Local Diffe</div>
           <span className="hidden text-sm text-muted-foreground md:inline">GitHub-style review, SemanticDiff display engine</span>
-          <div className="ml-auto flex items-center gap-2"><div className="flex items-center gap-1.5 text-xs text-muted-foreground"><Sparkles className="size-3.5" /> local only</div><Button data-testid="hide-chrome" size="sm" variant="outline" onClick={() => setChromeHidden(true)}><ChevronUp className="size-4" /> Focus view</Button></div>
+          <div className="ml-auto flex items-center gap-2"><div className="flex items-center gap-1.5 text-xs text-muted-foreground"><Sparkles className="size-3.5" /> local only</div><Button data-testid="keyboard-overlay-toggle" size="sm" variant={keyboardOverlay ? "secondary" : "outline"} onClick={() => setKeyboardOverlay((open) => !open)} aria-pressed={keyboardOverlay} title="Toggle keyboard overlay (-)"><Keyboard className="size-4" /> Keys</Button><Button data-testid="hide-chrome" size="sm" variant="outline" onClick={() => setChromeHidden(true)}><ChevronUp className="size-4" /> Focus view</Button></div>
         </div>
       </header>}
 
@@ -222,7 +322,7 @@ export default function App() {
         </Card></>}
 
         <div ref={reviewGrid} style={{ "--sidebar-width": `${sidebarWidth}px` } as React.CSSProperties} className={cn("grid min-h-[calc(100vh-150px)] gap-4 lg:grid-cols-[minmax(220px,var(--sidebar-width))_minmax(0,1fr)]", chromeHidden && "min-h-[calc(100vh-2rem)]")}>
-          <Card className="relative flex min-h-0 flex-col overflow-visible">
+          <Card ref={sidebarRef} tabIndex={-1} aria-label="Changed files sidebar" className={cn("relative flex min-h-0 flex-col overflow-visible outline-none", activeRegion === "sidebar" && keyboardOverlay && "ring-2 ring-primary ring-offset-2")}>
             <CardHeader className="gap-3 rounded-t-lg border-b bg-card p-3"><div className="flex items-center justify-between gap-2"><CardTitle className="text-sm">Changed files {session && <span className="font-normal text-muted-foreground">({session.comparison?.changed_paths ?? session.files.length})</span>}</CardTitle><div className="flex items-center gap-0.5"><Button type="button" size="icon" variant="ghost" className="size-7" title="Make file sidebar narrower" onClick={() => setSidebarWidth((width) => Math.max(220, width - 40))}><Minus className="size-3.5" /></Button><Button type="button" size="icon" variant="ghost" className="size-7" title="Make file sidebar wider" onClick={() => setSidebarWidth((width) => Math.min(760, width + 40))}><Plus className="size-3.5" /></Button></div></div>
               <div className="relative"><Search className="pointer-events-none absolute left-2 top-2 size-3.5 text-muted-foreground" /><Input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Filter files" className="h-8 pl-7 text-xs" /></div>
             </CardHeader>
@@ -232,14 +332,23 @@ export default function App() {
             <button type="button" aria-label="Resize file sidebar" title="Drag to resize the file sidebar" onPointerDown={(event) => { event.preventDefault(); setResizingSidebar(true) }} className={cn("absolute -right-3 top-0 z-10 hidden h-full w-6 cursor-col-resize touch-none items-center justify-center lg:flex", resizingSidebar && "bg-primary/5")}><span className="grid h-12 w-3 place-items-center rounded-full border bg-background text-muted-foreground shadow-sm"><GripVertical className="size-3" /></span></button>
           </Card>
 
-          <Card className="min-h-0 overflow-hidden">
+          <Card ref={diffPanelRef} tabIndex={-1} aria-label="Semantic diff panel" className={cn("min-h-0 overflow-hidden outline-none", activeRegion === "diff" && keyboardOverlay && "ring-2 ring-primary ring-offset-2")}>
             <CardHeader className="flex-row items-center justify-between space-y-0 border-b p-3"><div><CardTitle className="text-sm">{selectedFile?.display_path ?? "Semantic diff"}</CardTitle>{session?.comparison?.pull_request && <a href={session.comparison.pull_request.url} target="_blank" rel="noreferrer" className="mt-1 flex w-fit items-center gap-1 text-xs font-medium text-primary hover:underline"><GitPullRequest className="size-3.5" /> #{session.comparison.pull_request.number} · {session.comparison.pull_request.title}</a>}<p className="mt-1 text-xs text-muted-foreground">{status}</p>{session?.comparison && <p className="mt-1 text-[11px] text-muted-foreground/80">{session.comparison.description}</p>}</div>{loading && <LoaderCircle className="size-4 animate-spin text-muted-foreground" />}</CardHeader>
             <CardContent className="h-[calc(100vh-260px)] min-h-[580px] p-0">
-              {selectedFile && session ? <iframe key={`${session.id}:${selected}`} title={`Semantic diff for ${selectedFile.display_path}`} src={`/semanticdiff-view/${session.id}/${selected}`} className="h-full w-full border-0 bg-[#0d1117]" sandbox="allow-scripts allow-same-origin" /> : <div className="grid h-full place-items-center p-8 text-center text-sm text-muted-foreground"><div><FileDiff className="mx-auto mb-3 size-8 opacity-40" /><p>Pick a file from the tree.</p><p className="mt-1 text-xs">SemanticDiff will compute and render the language-aware view here.</p></div></div>}
+              {selectedFile && session ? <iframe ref={diffFrameRef} key={`${session.id}:${selected}`} title={`Semantic diff for ${selectedFile.display_path}`} src={`/semanticdiff-view/${session.id}/${selected}`} className="h-full w-full border-0 bg-[#0d1117]" sandbox="allow-scripts allow-same-origin" /> : <div className="grid h-full place-items-center p-8 text-center text-sm text-muted-foreground"><div><FileDiff className="mx-auto mb-3 size-8 opacity-40" /><p>Pick a file from the tree.</p><p className="mt-1 text-xs">SemanticDiff will compute and render the language-aware view here.</p></div></div>}
             </CardContent>
           </Card>
         </div>
       </main>
+      {keyboardOverlay && <div data-testid="keyboard-overlay" className="fixed inset-x-0 bottom-5 z-50 mx-auto w-[min(760px,calc(100%-2rem))] rounded-xl border border-primary/30 bg-background/95 p-3 shadow-2xl backdrop-blur" role="status" aria-live="polite">
+        <div className="flex items-center justify-between gap-3 px-1 pb-2 text-xs text-muted-foreground"><span className="flex items-center gap-1.5 font-medium text-foreground"><Keyboard className="size-3.5 text-primary" /> Keyboard overlay</span><span>Press <kbd className="rounded border bg-muted px-1.5 py-0.5 font-mono text-foreground">Esc</kbd> or <kbd className="rounded border bg-muted px-1.5 py-0.5 font-mono text-foreground">-</kbd> to hide</span></div>
+        <div className="grid gap-2 sm:grid-cols-3">
+          <button type="button" onClick={() => runOverlayCommand("f")} className={cn("rounded-lg border p-3 text-left transition-colors hover:bg-accent", activeRegion === "sidebar" && "border-primary bg-primary/5")}><kbd className="mr-2 rounded bg-foreground px-1.5 py-0.5 font-mono text-xs text-background">F</kbd><span className="font-medium">Files</span><span className="mt-1 block text-xs text-muted-foreground">Focus the changed-file sidebar</span></button>
+          <button type="button" onClick={() => runOverlayCommand("d")} className={cn("rounded-lg border p-3 text-left transition-colors hover:bg-accent", activeRegion === "diff" && "border-primary bg-primary/5")}><kbd className="mr-2 rounded bg-foreground px-1.5 py-0.5 font-mono text-xs text-background">D</kbd><span className="font-medium">Diff panel</span><span className="mt-1 block text-xs text-muted-foreground">Focus the SemanticDiff view</span></button>
+          <button type="button" onClick={() => runOverlayCommand("v")} className="rounded-lg border p-3 text-left transition-colors hover:bg-accent"><kbd className="mr-2 rounded bg-foreground px-1.5 py-0.5 font-mono text-xs text-background">V</kbd><span className="font-medium">Focus view</span><span className="mt-1 block text-xs text-muted-foreground">Hide controls and enter the diff</span></button>
+        </div>
+        <div className="mt-2 flex items-center gap-4 rounded-lg bg-muted px-3 py-2 text-xs text-muted-foreground"><span><kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">J</kbd> next file</span><span><kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">K</kbd> previous file</span><span className="ml-auto">{activeRegion === "sidebar" ? "Files sidebar active" : "Diff panel active"}</span></div>
+      </div>}
     </div>
   )
 }
