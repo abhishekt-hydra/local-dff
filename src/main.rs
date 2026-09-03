@@ -73,6 +73,7 @@ struct ComparisonInfo {
     changed_paths: usize,
     semantic_paths: usize,
     description: String,
+    pull_request: Option<PullRequestInfo>,
 }
 
 #[derive(Deserialize)]
@@ -88,6 +89,62 @@ struct GitDiffRequest {
     repo: String,
     base: String,
     target: String,
+}
+
+#[derive(Deserialize)]
+struct GitHubPullsRequest {
+    repo: String,
+}
+
+#[derive(Deserialize)]
+struct GitHubCompareRequest {
+    repo: String,
+    number: u64,
+}
+
+#[derive(Deserialize)]
+struct GitHubUrlRequest {
+    repo: String,
+    url: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PullRequestInfo {
+    number: u64,
+    title: String,
+    url: String,
+    state: String,
+    #[serde(rename = "baseRefName")]
+    base_ref_name: String,
+    #[serde(rename = "baseRefOid", default)]
+    base_ref_oid: String,
+    #[serde(rename = "headRefName")]
+    head_ref_name: String,
+    #[serde(rename = "headRefOid", default)]
+    head_ref_oid: String,
+    #[serde(default)]
+    is_draft: bool,
+    #[serde(default)]
+    author: Option<PullRequestAuthor>,
+    #[serde(rename = "updatedAt", default)]
+    updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PullRequestAuthor {
+    login: String,
+}
+
+#[derive(Deserialize)]
+struct GitHubRepoInfo {
+    #[serde(rename = "nameWithOwner")]
+    name_with_owner: String,
+}
+
+#[derive(Debug)]
+struct GitHubPrReference {
+    repo: String,
+    number: u64,
 }
 
 #[derive(Serialize)]
@@ -150,6 +207,9 @@ async fn main() {
         .route("/assets/{*path}", get(web_asset))
         .route("/api/patch", post(start_session))
         .route("/api/git-diff", post(start_git_diff))
+        .route("/api/github/open-prs", post(github_open_prs))
+        .route("/api/github/compare", post(github_compare_pr))
+        .route("/api/github/open-url", post(github_open_url))
         .route("/api/semantic/{id}/{index}", post(semantic_file))
         .route("/semanticdiff-view/{id}/{index}", get(semanticdiff_view))
         .route("/semanticdiff-assets/{*path}", get(semanticdiff_asset))
@@ -279,6 +339,25 @@ async fn start_git_diff(
     validate_git_input(&repo, &request.base, &request.target)?;
     let base = request.base.trim().to_owned();
     let target = request.target.trim().to_owned();
+    create_git_comparison(
+        state,
+        repo,
+        base,
+        target,
+        None,
+        "Committed snapshots only; uncommitted working-tree changes are excluded.".into(),
+    )
+    .await
+}
+
+async fn create_git_comparison(
+    state: AppState,
+    repo: PathBuf,
+    base: String,
+    target: String,
+    pull_request: Option<PullRequestInfo>,
+    description: String,
+) -> Result<Json<StartResponse>, ApiError> {
     let (patch, mut files, base_commit, target_commit) = tokio::try_join!(
         git_diff(&repo, &base, &target),
         git_changed_files(&repo, &base, &target),
@@ -304,8 +383,8 @@ async fn start_git_diff(
         },
         changed_paths: files.len(),
         semantic_paths,
-        description: "Committed snapshots only; uncommitted working-tree changes are excluded."
-            .into(),
+        description,
+        pull_request,
     };
     create_session(
         state,
@@ -316,6 +395,92 @@ async fn start_git_diff(
         Some(files),
         Some(comparison),
     )
+}
+
+async fn github_open_prs(
+    Json(request): Json<GitHubPullsRequest>,
+) -> Result<Json<Vec<PullRequestInfo>>, ApiError> {
+    let repo = PathBuf::from(request.repo.trim());
+    ensure_git_repo(&repo)?;
+    let pulls = gh_json::<Vec<PullRequestInfo>>(
+        Some(&repo),
+        &[
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            "100",
+            "--json",
+            "number,title,url,state,baseRefName,headRefName,isDraft,author,updatedAt",
+        ],
+    )
+    .await?;
+    Ok(Json(pulls))
+}
+
+async fn github_compare_pr(
+    State(state): State<AppState>,
+    Json(request): Json<GitHubCompareRequest>,
+) -> Result<Json<StartResponse>, ApiError> {
+    let repo = PathBuf::from(request.repo.trim());
+    ensure_git_repo(&repo)?;
+    let repository = github_repo_for_local(&repo).await?;
+    start_github_pr_session(state, repo, repository, request.number).await
+}
+
+async fn github_open_url(
+    State(state): State<AppState>,
+    Json(request): Json<GitHubUrlRequest>,
+) -> Result<Json<StartResponse>, ApiError> {
+    let reference = parse_github_pr_url(request.url.trim())?;
+    let selected_repo = PathBuf::from(request.repo.trim());
+    let repo = if selected_repo.is_dir()
+        && github_repo_for_local(&selected_repo)
+            .await
+            .map(|repo| repo.eq_ignore_ascii_case(&reference.repo))
+            .unwrap_or(false)
+    {
+        selected_repo
+    } else {
+        cached_github_repo(&reference.repo).await?
+    };
+    start_github_pr_session(state, repo, reference.repo, reference.number).await
+}
+
+async fn start_github_pr_session(
+    state: AppState,
+    repo: PathBuf,
+    github_repo: String,
+    number: u64,
+) -> Result<Json<StartResponse>, ApiError> {
+    let number_string = number.to_string();
+    let pull = gh_json::<PullRequestInfo>(
+        Some(&repo),
+        &[
+            "pr",
+            "view",
+            &number_string,
+            "--repo",
+            &github_repo,
+            "--json",
+            "number,title,url,state,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,author,updatedAt",
+        ],
+    )
+    .await?;
+    fetch_github_pr(&repo, &pull).await?;
+    let base = git_commit(&repo, &pull.base_ref_oid).await?;
+    let head = git_commit(&repo, &format!("refs/local-diffe/pr/{}", pull.number)).await?;
+    let merge_base = git_merge_base(&repo, &base, &head).await?;
+    create_git_comparison(
+        state,
+        repo,
+        merge_base,
+        head,
+        Some(pull),
+        "PR comparison uses the fetched PR head and its Git merge-base; uncommitted working-tree changes are excluded.".into(),
+    )
+    .await
 }
 
 fn create_session(
@@ -367,6 +532,176 @@ fn validate_git_input(repo: &PathBuf, base: &str, target: &str) -> Result<(), Ap
         }
     }
     Ok(())
+}
+
+fn ensure_git_repo(repo: &PathBuf) -> Result<(), ApiError> {
+    if !repo.is_dir() {
+        return Err(ApiError::bad_request(format!(
+            "Repository directory does not exist: {}",
+            repo.display()
+        )));
+    }
+    Ok(())
+}
+
+async fn gh_json<T: serde::de::DeserializeOwned>(
+    repo: Option<&std::path::Path>,
+    args: &[&str],
+) -> Result<T, ApiError> {
+    let bytes = gh_output(repo, args).await?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        ApiError::internal(format!(
+            "GitHub CLI returned invalid JSON: {error}. Run `gh auth status` to check its setup."
+        ))
+    })
+}
+
+async fn gh_output(
+    repo: Option<&std::path::Path>,
+    args: &[&str],
+) -> Result<Vec<u8>, ApiError> {
+    let mut command = Command::new("gh");
+    command.args(args);
+    if let Some(repo) = repo {
+        command.current_dir(repo);
+    }
+    let output = command.output().await.map_err(|error| {
+        ApiError::internal(format!(
+            "Could not run the GitHub CLI (`gh`): {error}. Install it with `brew install gh`."
+        ))
+    })?;
+    if !output.status.success() {
+        return Err(ApiError::bad_request(format!(
+            "GitHub CLI failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(output.stdout)
+}
+
+async fn github_repo_for_local(repo: &PathBuf) -> Result<String, ApiError> {
+    let info = gh_json::<GitHubRepoInfo>(Some(repo), &["repo", "view", "--json", "nameWithOwner"])
+        .await?;
+    Ok(info.name_with_owner)
+}
+
+fn parse_github_pr_url(url: &str) -> Result<GitHubPrReference, ApiError> {
+    let path = url
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("http://github.com/"))
+        .or_else(|| url.strip_prefix("github.com/"))
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "Enter a GitHub pull-request URL such as https://github.com/owner/repo/pull/123.",
+            )
+        })?;
+    let path = path.split(['?', '#']).next().unwrap_or(path).trim_end_matches('/');
+    let pieces = path.split('/').collect::<Vec<_>>();
+    let [owner, name, "pull", number] = pieces.as_slice() else {
+        return Err(ApiError::bad_request(
+            "Enter a GitHub pull-request URL such as https://github.com/owner/repo/pull/123.",
+        ));
+    };
+    if !is_github_slug_part(owner) || !is_github_slug_part(name) {
+        return Err(ApiError::bad_request("The GitHub owner or repository name is invalid."));
+    }
+    let number = number
+        .parse::<u64>()
+        .ok()
+        .filter(|number| *number > 0)
+        .ok_or_else(|| ApiError::bad_request("The pull-request number must be a positive integer."))?;
+    Ok(GitHubPrReference {
+        repo: format!("{owner}/{name}"),
+        number,
+    })
+}
+
+fn is_github_slug_part(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 100
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+async fn cached_github_repo(github_repo: &str) -> Result<PathBuf, ApiError> {
+    let mut pieces = github_repo.split('/');
+    let (Some(owner), Some(name), None) = (pieces.next(), pieces.next(), pieces.next()) else {
+        return Err(ApiError::bad_request("Invalid GitHub repository name."));
+    };
+    if !is_github_slug_part(owner) || !is_github_slug_part(name) {
+        return Err(ApiError::bad_request("Invalid GitHub repository name."));
+    }
+    let directories = ProjectDirs::from("com", "hydradb", "local-diffe")
+        .ok_or_else(|| ApiError::internal("Could not determine Local Diffe's cache directory."))?;
+    let destination = directories
+        .cache_dir()
+        .join("github-repos")
+        .join(format!("{owner}--{name}"));
+    if destination.join(".git").is_dir() {
+        return Ok(destination);
+    }
+    if destination.exists() {
+        return Err(ApiError::bad_request(format!(
+            "GitHub cache path already exists but is not a repository: {}",
+            destination.display()
+        )));
+    }
+    let parent = destination
+        .parent()
+        .ok_or_else(|| ApiError::internal("Could not construct GitHub cache path."))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| ApiError::internal(format!("Could not create GitHub cache directory: {error}")))?;
+    let destination_string = destination.to_string_lossy().to_string();
+    gh_output(None, &["repo", "clone", github_repo, &destination_string]).await?;
+    if !destination.join(".git").is_dir() {
+        return Err(ApiError::internal("GitHub CLI completed but did not create the expected repository."));
+    }
+    Ok(destination)
+}
+
+async fn fetch_github_pr(repo: &PathBuf, pull: &PullRequestInfo) -> Result<(), ApiError> {
+    git_command(repo, &["fetch", "--prune", "origin"]).await?;
+    git_command(repo, &["fetch", "origin", &pull.base_ref_name]).await?;
+    let refspec = format!(
+        "+refs/pull/{}/head:refs/local-diffe/pr/{}",
+        pull.number, pull.number
+    );
+    git_command(repo, &["fetch", "origin", &refspec]).await
+}
+
+async fn git_command(repo: &PathBuf, args: &[&str]) -> Result<(), ApiError> {
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(args)
+        .output()
+        .await
+        .map_err(|error| ApiError::internal(format!("Could not run git: {error}")))?;
+    if !output.status.success() {
+        return Err(ApiError::bad_request(format!(
+            "Git command failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+async fn git_merge_base(repo: &PathBuf, base: &str, target: &str) -> Result<String, ApiError> {
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(["merge-base", base, target])
+        .output()
+        .await
+        .map_err(|error| ApiError::internal(format!("Could not run git merge-base: {error}")))?;
+    if !output.status.success() {
+        return Err(ApiError::bad_request(format!(
+            "Could not find a merge-base for `{base}` and `{target}`: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    String::from_utf8(output.stdout)
+        .map(|commit| commit.trim().to_owned())
+        .map_err(|_| ApiError::internal("git merge-base returned non-UTF-8 output."))
 }
 
 async fn git_diff(repo: &PathBuf, base: &str, target: &str) -> Result<String, ApiError> {

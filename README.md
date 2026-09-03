@@ -19,6 +19,24 @@ commit; the fields also accept other branches, tags, or commit IDs.
 You can still choose `staging-vs-current.diff` and use **Load .diff file** when
 you already have a patch artifact.
 
+## Review a GitHub pull request
+
+Local Diffe uses the authenticated [GitHub CLI](https://cli.github.com/) rather
+than a separate GitHub token or integration. First authenticate once:
+
+```bash
+gh auth login
+```
+
+Then either paste `https://github.com/owner/repo/pull/123` in **GitHub
+pull-request URL** and click **Open PR**, or enter a local repository path,
+click **List**, select an open PR, and click **Review**. Each review runs
+`git fetch --prune origin`, fetches GitHub's `refs/pull/<number>/head`, and
+compares that head with its Git merge-base. This produces the PR-only diff,
+not a misleading whole-branch snapshot. Pasted links work for open, closed,
+and merged PRs; if the selected repository is different, Local Diffe clones a
+private cache copy under its application cache directory and reuses it later.
+
 For frontend iteration, run `cargo run` in one terminal and `npm run dev` from
 `web/` in another. Vite proxies the API and SemanticDiff routes to the Rust
 server.

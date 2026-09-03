@@ -7,6 +7,8 @@ import {
   Folder,
   FolderOpen,
   GitBranch,
+  GitPullRequest,
+  Link,
   LoaderCircle,
   Search,
   Sparkles,
@@ -19,7 +21,8 @@ import { cn } from "@/lib/utils"
 
 type PatchFile = { old_path: string | null; new_path: string | null; display_path: string; renderable: boolean }
 type Revision = { revision: string; commit: string }
-type Comparison = { base: Revision; target: Revision; changed_paths: number; semantic_paths: number; description: string }
+type PullRequest = { number: number; title: string; url: string; state: string; baseRefName: string; headRefName: string; isDraft: boolean; author?: { login: string } | null; updatedAt: string }
+type Comparison = { base: Revision; target: Revision; changed_paths: number; semantic_paths: number; description: string; pull_request?: PullRequest | null }
 type Session = { id: string; files: PatchFile[]; comparison?: Comparison | null }
 type TreeItem = { id: string; name: string; children?: TreeItem[]; fileIndex?: number; renderable?: boolean }
 
@@ -63,6 +66,9 @@ export default function App() {
   const [repo, setRepo] = useState(initialRepo)
   const [base, setBase] = useState("origin/staging")
   const [target, setTarget] = useState("HEAD")
+  const [prUrl, setPrUrl] = useState("")
+  const [pulls, setPulls] = useState<PullRequest[]>([])
+  const [prNumber, setPrNumber] = useState("")
   const [session, setSession] = useState<Session | null>(null)
   const [selected, setSelected] = useState<number | null>(null)
   const [search, setSearch] = useState("")
@@ -78,8 +84,9 @@ export default function App() {
       setSession(next)
       setSelected(null)
       if (next.comparison) {
-        const { base: resolvedBase, target: resolvedTarget, changed_paths, semantic_paths } = next.comparison
-        setStatus(`${changed_paths} changed paths · ${semantic_paths} content diffs · ${resolvedBase.revision}@${resolvedBase.commit.slice(0, 7)} → ${resolvedTarget.revision}@${resolvedTarget.commit.slice(0, 7)}`)
+        const { base: resolvedBase, target: resolvedTarget, changed_paths, semantic_paths, pull_request } = next.comparison
+        const revisions = `${resolvedBase.commit.slice(0, 7)} → ${resolvedTarget.commit.slice(0, 7)}`
+        setStatus(pull_request ? `PR #${pull_request.number} · ${changed_paths} changed paths · ${semantic_paths} content diffs · ${revisions}` : `${changed_paths} changed paths · ${semantic_paths} content diffs · ${resolvedBase.revision}@${resolvedBase.commit.slice(0, 7)} → ${resolvedTarget.revision}@${resolvedTarget.commit.slice(0, 7)}`)
       } else {
         setStatus(`${next.files.length} text patches loaded · select one to inspect its semantic diff`)
       }
@@ -94,6 +101,34 @@ export default function App() {
   const upload = async (file?: File) => {
     if (!file) return
     await loadSession("/api/patch", { repo, base, target, patch: await file.text() }, `Reading ${file.name}…`)
+  }
+  const listPulls = async () => {
+    setLoading(true)
+    setStatus("Checking GitHub for open pull requests…")
+    try {
+      const next = await api<PullRequest[]>("/api/github/open-prs", { repo })
+      setPulls(next)
+      setPrNumber(next[0] ? String(next[0].number) : "")
+      setStatus(next.length ? `${next.length} open pull requests found for this repository.` : "No open pull requests found for this repository.")
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Unable to list pull requests")
+    } finally {
+      setLoading(false)
+    }
+  }
+  const openPull = () => {
+    if (!prNumber) {
+      setStatus("Choose an open pull request first.")
+      return
+    }
+    void loadSession("/api/github/compare", { repo, number: Number(prNumber) }, `Fetching PR #${prNumber} and generating its merge-base diff…`)
+  }
+  const openPrUrl = () => {
+    if (!prUrl.trim()) {
+      setStatus("Paste a GitHub pull-request URL first.")
+      return
+    }
+    void loadSession("/api/github/open-url", { repo, url: prUrl }, "Fetching the GitHub pull request and generating its merge-base diff…")
   }
 
   const renderNode = ({ node, style, dragHandle }: NodeRendererProps<TreeItem>) => {
@@ -146,6 +181,21 @@ export default function App() {
           </CardContent>
         </Card>
 
+        <Card>
+          <CardContent className="grid gap-3 p-4 lg:grid-cols-[minmax(360px,1fr)_auto_minmax(280px,1fr)_auto] lg:items-end">
+            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">GitHub pull-request URL
+              <Input data-testid="pr-url" value={prUrl} onChange={(event) => setPrUrl(event.target.value)} placeholder="https://github.com/owner/repo/pull/123" />
+            </label>
+            <Button data-testid="open-pr-url" variant="secondary" onClick={openPrUrl} disabled={loading}><Link className="size-4" /> Open PR</Button>
+            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Open PRs for repository
+              <select data-testid="pr-select" value={prNumber} onChange={(event) => setPrNumber(event.target.value)} disabled={!pulls.length || loading} className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50">
+                {pulls.length ? pulls.map((pull) => <option key={pull.number} value={pull.number}>#{pull.number} · {pull.title}</option>) : <option value="">List open PRs first</option>}
+              </select>
+            </label>
+            <div className="flex gap-2"><Button data-testid="list-prs" variant="outline" onClick={listPulls} disabled={loading}><GitPullRequest className="size-4" /> List</Button><Button data-testid="open-selected-pr" onClick={openPull} disabled={loading || !prNumber}><GitBranch className="size-4" /> Review</Button></div>
+          </CardContent>
+        </Card>
+
         <div className="grid min-h-[calc(100vh-150px)] gap-4 lg:grid-cols-[320px_minmax(0,1fr)]">
           <Card className="flex min-h-0 flex-col overflow-hidden">
             <CardHeader className="gap-3 border-b p-3"><CardTitle className="text-sm">Changed files {session && <span className="font-normal text-muted-foreground">({session.comparison?.changed_paths ?? session.files.length})</span>}</CardTitle>
@@ -157,7 +207,7 @@ export default function App() {
           </Card>
 
           <Card className="min-h-0 overflow-hidden">
-            <CardHeader className="flex-row items-center justify-between space-y-0 border-b p-3"><div><CardTitle className="text-sm">{selectedFile?.display_path ?? "Semantic diff"}</CardTitle><p className="mt-1 text-xs text-muted-foreground">{status}</p>{session?.comparison && <p className="mt-1 text-[11px] text-muted-foreground/80">{session.comparison.description}</p>}</div>{loading && <LoaderCircle className="size-4 animate-spin text-muted-foreground" />}</CardHeader>
+            <CardHeader className="flex-row items-center justify-between space-y-0 border-b p-3"><div><CardTitle className="text-sm">{selectedFile?.display_path ?? "Semantic diff"}</CardTitle>{session?.comparison?.pull_request && <a href={session.comparison.pull_request.url} target="_blank" rel="noreferrer" className="mt-1 flex w-fit items-center gap-1 text-xs font-medium text-primary hover:underline"><GitPullRequest className="size-3.5" /> #{session.comparison.pull_request.number} · {session.comparison.pull_request.title}</a>}<p className="mt-1 text-xs text-muted-foreground">{status}</p>{session?.comparison && <p className="mt-1 text-[11px] text-muted-foreground/80">{session.comparison.description}</p>}</div>{loading && <LoaderCircle className="size-4 animate-spin text-muted-foreground" />}</CardHeader>
             <CardContent className="h-[calc(100vh-260px)] min-h-[580px] p-0">
               {selectedFile && session ? <iframe key={`${session.id}:${selected}`} title={`Semantic diff for ${selectedFile.display_path}`} src={`/semanticdiff-view/${session.id}/${selected}`} className="h-full w-full border-0 bg-[#0d1117]" sandbox="allow-scripts allow-same-origin" /> : <div className="grid h-full place-items-center p-8 text-center text-sm text-muted-foreground"><div><FileDiff className="mx-auto mb-3 size-8 opacity-40" /><p>Pick a file from the tree.</p><p className="mt-1 text-xs">SemanticDiff will compute and render the language-aware view here.</p></div></div>}
             </CardContent>
