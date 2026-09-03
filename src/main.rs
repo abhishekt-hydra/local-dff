@@ -166,7 +166,7 @@ async fn index() -> Html<&'static str> {
 }
 
 async fn web_asset(Path(path): Path<String>) -> Response {
-    embedded_asset(&WEB_ASSETS, &path)
+    embedded_asset(&WEB_ASSETS, &format!("assets/{path}"))
 }
 
 async fn semanticdiff_asset(Path(path): Path<String>) -> Response {
