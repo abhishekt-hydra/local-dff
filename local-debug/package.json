@@ -6,7 +6,8 @@
     "capture": "node capture-review.mjs",
     "desktop": "node capture-desktop.mjs",
     "semantic": "node capture-semantic.mjs",
-    "theme": "node check-theme.mjs"
+    "theme": "node check-theme.mjs",
+    "keyboard": "node check-keyboard-overlay.mjs"
   },
   "dependencies": {
     "rustwright": "latest"
