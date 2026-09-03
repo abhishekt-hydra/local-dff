@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Local Diffe</title>
+  <style>
+    :root { color-scheme: dark; --bg:#111827; --panel:#182235; --line:#25324a; --text:#e5e7eb; --muted:#93a4bd; --add:#123b2b; --del:#431d28; --accent:#65d6ad; }
+    * { box-sizing:border-box } body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 ui-sans-serif,system-ui,sans-serif }
+    header { padding:16px 20px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:baseline } h1 { font-size:18px; margin:0 } #status { color:var(--muted); font-size:12px }
+    #controls { display:grid; grid-template-columns:1fr 2fr 110px 110px auto auto; gap:10px; padding:14px 20px; border-bottom:1px solid var(--line); background:#141e2e }
+    input,button { min-width:0; padding:8px 10px; border:1px solid #344561; border-radius:5px; background:#101827; color:var(--text) } button { cursor:pointer; background:#1d6a51; border-color:#29946e; font-weight:600 } button:disabled { opacity:.55; cursor:wait }
+    main { display:grid; grid-template-columns:300px minmax(0,1fr); height:calc(100vh - 111px) } aside { overflow:auto; border-right:1px solid var(--line); padding:10px } #files { list-style:none; padding:0; margin:0 } #files button { width:100%; text-align:left; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; background:transparent; border-color:transparent; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px } #files button:hover,#files button.active { background:#283852; border-color:#3d577d }
+    #viewer { overflow:auto; padding:16px } #empty { color:var(--muted); max-width:720px; margin:36px auto; text-align:center } .file-title { margin:0 0 12px; font:600 14px ui-monospace,SFMono-Regular,Menlo,monospace } .meta { color:var(--muted); font-size:12px; margin-bottom:12px }
+    .block { border:1px solid var(--line); border-radius:6px; overflow:hidden; margin:10px 0 } .columns { display:grid; grid-template-columns:1fr 1fr; min-width:720px } .column + .column { border-left:1px solid var(--line) } .line { display:grid; grid-template-columns:48px 1fr; min-height:20px; font:12px/20px ui-monospace,SFMono-Regular,Menlo,monospace; white-space:pre } .number { text-align:right; padding-right:9px; color:#71829e; user-select:none; border-right:1px solid rgba(255,255,255,.04) } .code { overflow:hidden; padding-left:9px } .old.changed { background:var(--del) } .new.changed { background:var(--add) } .scope { padding:5px 9px; color:var(--muted); border-bottom:1px solid var(--line); font:11px ui-monospace,SFMono-Regular,Menlo,monospace }
+    @media (max-width:800px) { #controls { grid-template-columns:1fr 1fr } main { grid-template-columns:1fr; height:auto } aside { border-right:0; border-bottom:1px solid var(--line); max-height:220px } .columns { grid-template-columns:1fr } .column + .column { border-left:0; border-top:1px solid var(--line) } }
+  </style>
+</head>
+<body>
+  <header><h1>Local Diffe</h1><span id="status">Load a Git-generated unified patch.</span></header>
+  <form id="controls">
+    <input id="patch" type="file" accept=".diff,.patch,text/plain" title="Git unified patch (optional)">
+    <input id="repo" value="/Users/abhishek/hydradb/hydradb-application" required title="Repository path">
+    <input id="base" value="staging" required title="Base revision">
+    <input id="target" value="HEAD" required title="Target revision">
+    <button type="button" id="generate">Generate Git diff</button>
+    <button type="submit">Load .diff file</button>
+  </form>
+  <main><aside><ul id="files"></ul></aside><section id="viewer"><div id="empty">Choose a Git patch, repository, base revision, and target revision. The server uses the patch to identify files, reads each complete version from Git, then asks SemanticDiff to produce the semantic view.</div></section></main>
+  <script>
+    const $ = id => document.getElementById(id);
+    const status = text => $('status').textContent = text;
+    let session = null;
+    const controls = $('controls');
+    controls.addEventListener('submit', async event => {
+      event.preventDefault();
+      const file = $('patch').files[0]; if (!file) { status('Choose a .diff file, or use Generate Git diff.'); return; }
+      await start('/api/patch', { patch:await file.text(), repo:$('repo').value, base:$('base').value, target:$('target').value }, 'Reading patch…');
+    });
+    $('generate').addEventListener('click', async () => {
+      await start('/api/git-diff', { repo:$('repo').value, base:$('base').value, target:$('target').value }, 'Running git diff…');
+    });
+    async function start(endpoint, payload, progress) {
+      const buttons = controls.querySelectorAll('button'); buttons.forEach(button => button.disabled = true); status(progress);
+      try {
+        const response = await fetch(endpoint, { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(payload) });
+        const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Could not load patch');
+        session = data; renderFiles(); status(`${data.files.length} text files found. Choose one.`);
+      } catch (error) { status(error.message); }
+      finally { buttons.forEach(button => button.disabled = false); }
+    }
+    function renderFiles() {
+      const list = $('files'); list.replaceChildren(); $('viewer').replaceChildren();
+      session.files.forEach((file, index) => { const li = document.createElement('li'), button = document.createElement('button'); button.textContent = file.display_path; button.title = file.display_path; button.onclick = () => loadFile(index, button); li.append(button); list.append(li); });
+    }
+    async function loadFile(index, button) {
+      document.querySelectorAll('#files button').forEach(x => x.classList.remove('active')); button.classList.add('active');
+      $('viewer').replaceChildren(); status(`Computing semantic diff for ${session.files[index].display_path}…`);
+      try {
+        const response = await fetch(`/api/semantic/${session.id}/${index}`, { method:'POST' }); const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Could not compute semantic diff'); renderSemantic(data); const timing = data.semantic.timing?.total; status(`${data.file.display_path}${timing ? ` · ${timing.toFixed(3)}s` : ''}`);
+      } catch (error) { $('viewer').textContent = error.message; status('Failed'); }
+    }
+    function renderSemantic(data) {
+      const viewer = $('viewer'); const title = document.createElement('h2'); title.className = 'file-title'; title.textContent = data.file.display_path; viewer.append(title);
+      const meta = document.createElement('div'); meta.className = 'meta'; const patch = data.semantic; meta.textContent = `${patch.language || 'unknown language'} · ${patch.hunks?.length || 0} semantic hunks${patch.fallback ? ' · fallback diff' : ''}`; viewer.append(meta);
+      for (const block of patch.blocks || []) { const shell = document.createElement('div'); shell.className = 'block'; const columns = document.createElement('div'); columns.className = 'columns'; columns.append(renderColumn(block.old_column || [], 'old'), renderColumn(block.new_column || [], 'new')); shell.append(columns); viewer.append(shell); }
+      if (!(patch.blocks || []).length) viewer.append(document.createTextNode('SemanticDiff returned no renderable blocks for this file.'));
+    }
+    function renderColumn(lines, side) {
+      const column = document.createElement('div'); column.className = 'column';
+      for (const line of lines) { const row = document.createElement('div'); row.className = `line ${side}${line.change !== 0 ? ' changed' : ''}`; const number = document.createElement('span'); number.className = 'number'; number.textContent = line.line || ''; const code = document.createElement('span'); code.className = 'code'; code.textContent = line.content || ''; row.append(number, code); column.append(row); }
+      return column;
+    }
+  </script>
+</body>
+</html>

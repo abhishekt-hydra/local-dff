@@ -1,0 +1,35 @@
+{
+  "name": "local-diffe-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@radix-ui/react-scroll-area": "latest",
+    "@radix-ui/react-slot": "latest",
+    "@vitejs/plugin-react": "latest",
+    "class-variance-authority": "latest",
+    "clsx": "latest",
+    "lucide-react": "latest",
+    "react": "latest",
+    "react-arborist": "latest",
+    "react-dom": "latest",
+    "shiki": "^4.4.3",
+    "shadcn": "latest",
+    "tailwind-merge": "latest",
+    "tailwindcss": "latest",
+    "tw-animate-css": "latest"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "latest",
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "typescript": "latest",
+    "vite": "latest"
+  }
+}

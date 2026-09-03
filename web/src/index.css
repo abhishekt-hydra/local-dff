@@ -1,0 +1,26 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --radius-lg: var(--radius);
+}
+
+:root { --background: oklch(.985 .003 264); --foreground: oklch(.17 .02 264); --card: oklch(1 0 0); --card-foreground: oklch(.17 .02 264); --primary: oklch(.31 .08 258); --primary-foreground: oklch(.98 .002 264); --secondary: oklch(.95 .01 264); --secondary-foreground: oklch(.25 .02 264); --muted: oklch(.95 .01 264); --muted-foreground: oklch(.53 .02 264); --accent: oklch(.93 .02 255); --accent-foreground: oklch(.25 .04 255); --input: oklch(.87 .01 264); --ring: oklch(.55 .12 258); --radius: .5rem; }
+* { box-sizing: border-box; }
+html, body, #root { min-height: 100%; }
+body { margin: 0; background: var(--background); color: var(--foreground); font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+button, input { font: inherit; }

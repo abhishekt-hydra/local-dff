@@ -1,0 +1,14 @@
+{
+  "name": "local-diffe-debug",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "capture": "node capture-review.mjs",
+    "desktop": "node capture-desktop.mjs",
+    "semantic": "node capture-semantic.mjs",
+    "theme": "node check-theme.mjs"
+  },
+  "dependencies": {
+    "rustwright": "latest"
+  }
+}
