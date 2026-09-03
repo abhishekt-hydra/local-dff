@@ -54,7 +54,9 @@ This writes one executable to `dist/local-diffe-darwin-arm64`. It embeds the
 React/Shiki build, SemanticDiff's webview assets, and SemanticDiff's CLI. At
 runtime it extracts only the embedded CLI into the current user's cache because
 macOS cannot execute a Mach-O binary from memory; no Cursor extension, Node,
-or Cargo is needed on the machine running the release binary.
+or Cargo is needed on the machine running the release binary. The package task
+also applies an ad-hoc macOS signature after copying the executable, so the
+local executable-trust cache accepts the standalone `dist/` file.
 
 Set `SEMANTICDIFF_EXTENSION_DIR` if the build machine has the extension in a
 different location:

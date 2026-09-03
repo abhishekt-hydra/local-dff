@@ -14,6 +14,7 @@ run: build
 package: build
     mkdir -p dist
     cp .build/release/local-diffe dist/local-diffe-darwin-arm64
+    codesign --force --sign - dist/local-diffe-darwin-arm64
     shasum -a 256 dist/local-diffe-darwin-arm64
 
 # Print the deterministic Git-derived release version: <sha>+<YYYY.MM.DD>.
