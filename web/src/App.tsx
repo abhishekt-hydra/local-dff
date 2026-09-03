@@ -1,15 +1,20 @@
-import { useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { Tree, type NodeRendererProps } from "react-arborist"
 import {
   ChevronRight,
+  ChevronDown,
+  ChevronUp,
   FileCode2,
   FileDiff,
   Folder,
   FolderOpen,
   GitBranch,
   GitPullRequest,
+  GripVertical,
   Link,
   LoaderCircle,
+  Minus,
+  Plus,
   Search,
   Sparkles,
   Upload,
@@ -69,12 +74,31 @@ export default function App() {
   const [prUrl, setPrUrl] = useState("")
   const [pulls, setPulls] = useState<PullRequest[]>([])
   const [prNumber, setPrNumber] = useState("")
+  const [chromeHidden, setChromeHidden] = useState(false)
+  const [sidebarWidth, setSidebarWidth] = useState(320)
+  const [resizingSidebar, setResizingSidebar] = useState(false)
   const [session, setSession] = useState<Session | null>(null)
   const [selected, setSelected] = useState<number | null>(null)
   const [search, setSearch] = useState("")
   const [status, setStatus] = useState("Ready to compare origin/staging with the checked-out branch.")
   const [loading, setLoading] = useState(false)
+  const reviewGrid = useRef<HTMLDivElement>(null)
   const tree = useMemo(() => makeTree(session?.files ?? []), [session])
+
+  useEffect(() => {
+    if (!resizingSidebar) return
+    const resize = (event: PointerEvent) => {
+      const left = reviewGrid.current?.getBoundingClientRect().left ?? 0
+      setSidebarWidth(Math.max(220, Math.min(760, event.clientX - left)))
+    }
+    const stop = () => setResizingSidebar(false)
+    window.addEventListener("pointermove", resize)
+    window.addEventListener("pointerup", stop, { once: true })
+    return () => {
+      window.removeEventListener("pointermove", resize)
+      window.removeEventListener("pointerup", stop)
+    }
+  }, [resizingSidebar])
 
   const loadSession = async (endpoint: string, payload: unknown, progress: string) => {
     setLoading(true)
@@ -156,16 +180,17 @@ export default function App() {
   const selectedFile = selected === null ? null : session?.files[selected]
   return (
     <div className="min-h-screen bg-muted/40">
-      <header className="border-b bg-background">
-        <div className="mx-auto flex h-14 max-w-[1800px] items-center gap-3 px-4">
+      {!chromeHidden && <header className="border-b bg-background">
+        <div className="flex h-14 w-full items-center gap-3 px-4">
           <div className="flex items-center gap-2 font-semibold"><FileDiff className="size-5 text-primary" /> Local Diffe</div>
           <span className="hidden text-sm text-muted-foreground md:inline">GitHub-style review, SemanticDiff display engine</span>
-          <div className="ml-auto flex items-center gap-1.5 text-xs text-muted-foreground"><Sparkles className="size-3.5" /> local only</div>
+          <div className="ml-auto flex items-center gap-2"><div className="flex items-center gap-1.5 text-xs text-muted-foreground"><Sparkles className="size-3.5" /> local only</div><Button data-testid="hide-chrome" size="sm" variant="outline" onClick={() => setChromeHidden(true)}><ChevronUp className="size-4" /> Focus view</Button></div>
         </div>
-      </header>
+      </header>}
 
-      <main className="mx-auto flex max-w-[1800px] flex-col gap-4 p-4">
-        <Card>
+      <main className="flex w-full flex-col gap-4 p-4">
+        {chromeHidden && <Button data-testid="show-chrome" size="sm" variant="outline" className="fixed right-4 top-4 z-20 shadow-md" onClick={() => setChromeHidden(false)}><ChevronDown className="size-4" /> Show controls</Button>}
+        {!chromeHidden && <><Card>
           <CardContent className="grid gap-3 p-4 lg:grid-cols-[minmax(340px,1fr)_150px_150px_auto_auto] lg:items-end">
             <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Repository
               <Input data-testid="repo" value={repo} onChange={(event) => setRepo(event.target.value)} />
@@ -194,16 +219,17 @@ export default function App() {
             </label>
             <div className="flex gap-2"><Button data-testid="list-prs" variant="outline" onClick={listPulls} disabled={loading}><GitPullRequest className="size-4" /> List</Button><Button data-testid="open-selected-pr" onClick={openPull} disabled={loading || !prNumber}><GitBranch className="size-4" /> Review</Button></div>
           </CardContent>
-        </Card>
+        </Card></>}
 
-        <div className="grid min-h-[calc(100vh-150px)] gap-4 lg:grid-cols-[320px_minmax(0,1fr)]">
-          <Card className="flex min-h-0 flex-col overflow-hidden">
-            <CardHeader className="gap-3 border-b p-3"><CardTitle className="text-sm">Changed files {session && <span className="font-normal text-muted-foreground">({session.comparison?.changed_paths ?? session.files.length})</span>}</CardTitle>
+        <div ref={reviewGrid} style={{ "--sidebar-width": `${sidebarWidth}px` } as React.CSSProperties} className={cn("grid min-h-[calc(100vh-150px)] gap-4 lg:grid-cols-[minmax(220px,var(--sidebar-width))_minmax(0,1fr)]", chromeHidden && "min-h-[calc(100vh-2rem)]")}>
+          <Card className="relative flex min-h-0 flex-col overflow-visible">
+            <CardHeader className="gap-3 rounded-t-lg border-b bg-card p-3"><div className="flex items-center justify-between gap-2"><CardTitle className="text-sm">Changed files {session && <span className="font-normal text-muted-foreground">({session.comparison?.changed_paths ?? session.files.length})</span>}</CardTitle><div className="flex items-center gap-0.5"><Button type="button" size="icon" variant="ghost" className="size-7" title="Make file sidebar narrower" onClick={() => setSidebarWidth((width) => Math.max(220, width - 40))}><Minus className="size-3.5" /></Button><Button type="button" size="icon" variant="ghost" className="size-7" title="Make file sidebar wider" onClick={() => setSidebarWidth((width) => Math.min(760, width + 40))}><Plus className="size-3.5" /></Button></div></div>
               <div className="relative"><Search className="pointer-events-none absolute left-2 top-2 size-3.5 text-muted-foreground" /><Input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Filter files" className="h-8 pl-7 text-xs" /></div>
             </CardHeader>
-            <CardContent className="min-h-0 flex-1 p-2">
+            <CardContent className="min-h-0 flex-1 overflow-hidden rounded-b-lg bg-card p-2">
               {tree.length ? <Tree<TreeItem> data={tree} width="100%" height={720} rowHeight={28} indent={14} openByDefault disableDrag disableDrop searchTerm={search}>{renderNode}</Tree> : <p className="p-3 text-xs text-muted-foreground">Generate a Git diff or upload a patch to populate the file tree.</p>}
             </CardContent>
+            <button type="button" aria-label="Resize file sidebar" title="Drag to resize the file sidebar" onPointerDown={(event) => { event.preventDefault(); setResizingSidebar(true) }} className={cn("absolute -right-3 top-0 z-10 hidden h-full w-6 cursor-col-resize touch-none items-center justify-center lg:flex", resizingSidebar && "bg-primary/5")}><span className="grid h-12 w-3 place-items-center rounded-full border bg-background text-muted-foreground shadow-sm"><GripVertical className="size-3" /></span></button>
           </Card>
 
           <Card className="min-h-0 overflow-hidden">

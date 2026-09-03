@@ -16,7 +16,10 @@ try {
   await page.click(`[data-file-index="${fileIndex}"]`)
   await pause(1_800)
   await page.screenshot({ path: path.join(screenshotDir, "05-github-pr.png"), fullPage: true })
-  console.log(JSON.stringify({ appUrl, prUrl, fileIndex, screenshot: path.join(screenshotDir, "05-github-pr.png") }, null, 2))
+  await page.click('[data-testid="hide-chrome"]')
+  await pause(300)
+  await page.screenshot({ path: path.join(screenshotDir, "06-focus-view.png"), fullPage: true })
+  console.log(JSON.stringify({ appUrl, prUrl, fileIndex, screenshots: [path.join(screenshotDir, "05-github-pr.png"), path.join(screenshotDir, "06-focus-view.png")] }, null, 2))
 } finally {
   await browser.close()
 }
