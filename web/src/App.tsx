@@ -104,6 +104,11 @@ export default function App() {
   const diffFrameRef = useRef<HTMLIFrameElement>(null)
   const tree = useMemo(() => makeTree(session?.files ?? []), [session])
   const selectedPull = useMemo(() => pulls.find((pull) => String(pull.number) === prNumber), [pulls, prNumber])
+  const sidebarScale = sidebarFontSize / 12
+  const sidebarRowHeight = Math.max(20, Math.round(28 * sidebarScale))
+  const sidebarIconSize = Math.max(11, Math.round(14 * sidebarScale))
+  const sidebarGap = Math.max(2, Math.round(6 * sidebarScale))
+  const sidebarPadding = Math.max(2, Math.round(6 * sidebarScale))
 
   useEffect(() => {
     if (!resizingSidebar) return
@@ -313,17 +318,17 @@ export default function App() {
     const canRender = !isFile || item.renderable !== false
     const active = isFile && item.fileIndex === selected
     return (
-      <div style={style} ref={dragHandle} className="px-1">
+      <div style={{ ...style, paddingInline: Math.max(1, Math.round(4 * sidebarScale)) }} ref={dragHandle}>
         <button
           type="button"
           data-file-index={isFile ? item.fileIndex : undefined}
           onClick={() => isFile ? canRender && setSelected(item.fileIndex!) : node.toggle()}
           title={isFile && !canRender ? "Empty or metadata-only Git change — no semantic text diff" : undefined}
-          style={{ fontSize: sidebarFontSize }}
-          className={cn("flex h-7 w-full items-center gap-1.5 rounded px-1.5 text-left hover:bg-accent", active && "bg-accent text-accent-foreground", !canRender && "cursor-default opacity-45 hover:bg-transparent")}
+          style={{ fontSize: sidebarFontSize, height: sidebarRowHeight, gap: sidebarGap, paddingInline: sidebarPadding }}
+          className={cn("flex w-full items-center rounded text-left hover:bg-accent", active && "bg-accent text-accent-foreground", !canRender && "cursor-default opacity-45 hover:bg-transparent")}
         >
-          {isFile ? <span className="w-3.5" /> : <ChevronRight className={cn("size-3.5 shrink-0 transition-transform", node.isOpen && "rotate-90")} />}
-          {isFile ? <FileCode2 className={cn("size-3.5 shrink-0", canRender ? "text-sky-600" : "text-muted-foreground")} /> : node.isOpen ? <FolderOpen className="size-3.5 shrink-0 text-amber-500" /> : <Folder className="size-3.5 shrink-0 text-amber-500" />}
+          {isFile ? <span style={{ width: sidebarIconSize }} /> : <ChevronRight style={{ width: sidebarIconSize, height: sidebarIconSize }} className={cn("shrink-0 transition-transform", node.isOpen && "rotate-90")} />}
+          {isFile ? <FileCode2 style={{ width: sidebarIconSize, height: sidebarIconSize }} className={cn("shrink-0", canRender ? "text-sky-600" : "text-muted-foreground")} /> : node.isOpen ? <FolderOpen style={{ width: sidebarIconSize, height: sidebarIconSize }} className="shrink-0 text-amber-500" /> : <Folder style={{ width: sidebarIconSize, height: sidebarIconSize }} className="shrink-0 text-amber-500" />}
           <span className="truncate">{item.name}</span>
         </button>
       </div>
@@ -399,7 +404,7 @@ export default function App() {
               <div className="relative"><Search className="pointer-events-none absolute left-2 top-2 size-3.5 text-muted-foreground" /><Input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Filter files" className="h-8 pl-7 text-xs" /></div>
             </CardHeader>
             <CardContent className="min-h-0 flex-1 overflow-hidden rounded-b-lg bg-card p-2">
-              {tree.length ? <Tree<TreeItem> data={tree} width="100%" height={720} rowHeight={28} indent={14} openByDefault disableDrag disableDrop searchTerm={search}>{renderNode}</Tree> : <p className="p-3 text-xs text-muted-foreground">Generate a Git diff or upload a patch to populate the file tree.</p>}
+              {tree.length ? <Tree<TreeItem> data={tree} width="100%" height={720} rowHeight={sidebarRowHeight} indent={Math.max(9, Math.round(14 * sidebarScale))} openByDefault disableDrag disableDrop searchTerm={search}>{renderNode}</Tree> : <p className="p-3 text-xs text-muted-foreground">Generate a Git diff or upload a patch to populate the file tree.</p>}
             </CardContent>
             <button type="button" aria-label="Resize file sidebar" title="Drag to resize the file sidebar" onPointerDown={(event) => { event.preventDefault(); setResizingSidebar(true) }} className={cn("absolute -right-3 top-0 z-10 hidden h-full w-6 cursor-col-resize touch-none items-center justify-center lg:flex", resizingSidebar && "bg-primary/5")}><span className="grid h-12 w-3 place-items-center rounded-full border bg-background text-muted-foreground shadow-sm"><GripVertical className="size-3" /></span></button>
           </Card>
