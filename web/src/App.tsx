@@ -91,6 +91,7 @@ export default function App() {
   const [keyboardOverlayExpanded, setKeyboardOverlayExpanded] = useState(false)
   const [activeRegion, setActiveRegion] = useState<ReviewRegion>("sidebar")
   const [sidebarWidth, setSidebarWidth] = useState(320)
+  const [sidebarFontSize, setSidebarFontSize] = useState(12)
   const [resizingSidebar, setResizingSidebar] = useState(false)
   const [session, setSession] = useState<Session | null>(null)
   const [selected, setSelected] = useState<number | null>(null)
@@ -145,14 +146,14 @@ export default function App() {
     if (!file) return
     await loadSession("/api/patch", { repo, base, target, patch: await file.text() }, `Reading ${file.name}…`)
   }
-  const listPulls = async () => {
+  const listPulls = async (refresh = false) => {
     setLoading(true)
-    setStatus("Checking GitHub for open pull requests…")
+    setStatus(refresh ? "Refreshing open pull requests from GitHub…" : "Checking GitHub for open pull requests…")
     try {
-      const next = await api<PullRequest[]>("/api/github/open-prs", { repo })
+      const next = await api<PullRequest[]>("/api/github/open-prs", { repo, refresh })
       setPulls(next)
       setPrNumber(next[0] ? String(next[0].number) : "")
-      setStatus(next.length ? `${next.length} open pull requests found for this repository.` : "No open pull requests found for this repository.")
+      setStatus(next.length ? `${next.length} open pull requests found; downloading them into the PR cache in the background.` : "No open pull requests found for this repository.")
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Unable to list pull requests")
     } finally {
@@ -171,7 +172,7 @@ export default function App() {
       setStatus("Paste a GitHub pull-request URL first.")
       return
     }
-    void loadSession("/api/github/open-url", { repo, url: prUrl }, "Fetching the GitHub pull request and generating its merge-base diff…")
+    void loadSession("/api/github/open-url", { url: prUrl }, "Downloading the GitHub pull request if needed and generating its merge-base diff…")
   }
 
   const focusSidebar = useCallback(() => {
@@ -318,7 +319,8 @@ export default function App() {
           data-file-index={isFile ? item.fileIndex : undefined}
           onClick={() => isFile ? canRender && setSelected(item.fileIndex!) : node.toggle()}
           title={isFile && !canRender ? "Empty or metadata-only Git change — no semantic text diff" : undefined}
-          className={cn("flex h-7 w-full items-center gap-1.5 rounded px-1.5 text-left text-xs hover:bg-accent", active && "bg-accent text-accent-foreground", !canRender && "cursor-default opacity-45 hover:bg-transparent")}
+          style={{ fontSize: sidebarFontSize }}
+          className={cn("flex h-7 w-full items-center gap-1.5 rounded px-1.5 text-left hover:bg-accent", active && "bg-accent text-accent-foreground", !canRender && "cursor-default opacity-45 hover:bg-transparent")}
         >
           {isFile ? <span className="w-3.5" /> : <ChevronRight className={cn("size-3.5 shrink-0 transition-transform", node.isOpen && "rotate-90")} />}
           {isFile ? <FileCode2 className={cn("size-3.5 shrink-0", canRender ? "text-sky-600" : "text-muted-foreground")} /> : node.isOpen ? <FolderOpen className="size-3.5 shrink-0 text-amber-500" /> : <Folder className="size-3.5 shrink-0 text-amber-500" />}
@@ -387,13 +389,13 @@ export default function App() {
                 </PopoverContent>
               </Popover>
             </div>
-            <div className="flex gap-2"><Button data-testid="list-prs" variant="outline" onClick={listPulls} disabled={loading}><GitPullRequest className="size-4" /> List</Button><Button data-testid="open-selected-pr" onClick={openPull} disabled={loading || !prNumber}><GitBranch className="size-4" /> Review</Button></div>
+            <div className="flex gap-2"><Button data-testid="list-prs" variant="outline" onClick={() => void listPulls()} disabled={loading}><GitPullRequest className="size-4" /> List</Button><Button data-testid="refresh-prs" variant="outline" onClick={() => void listPulls(true)} disabled={loading}><GitPullRequest className="size-4" /> Refresh</Button><Button data-testid="open-selected-pr" onClick={openPull} disabled={loading || !prNumber}><GitBranch className="size-4" /> Review</Button></div>
           </CardContent>
         </Card></>}
 
         <div ref={reviewGrid} style={{ "--sidebar-width": `${sidebarWidth}px` } as React.CSSProperties} className={cn("grid min-h-[calc(100vh-150px)] gap-4 lg:grid-cols-[minmax(220px,var(--sidebar-width))_minmax(0,1fr)]", chromeHidden && "min-h-[calc(100vh-2rem)]")}>
           <Card ref={sidebarRef} tabIndex={-1} aria-label="Changed files sidebar" className={cn("relative flex min-h-0 flex-col overflow-visible outline-none", activeRegion === "sidebar" && keyboardOverlay && "ring-2 ring-primary ring-offset-2")}>
-            <CardHeader className="gap-3 rounded-t-lg border-b bg-card p-3"><div className="flex items-center justify-between gap-2"><CardTitle className="text-sm">Changed files {session && <span className="font-normal text-muted-foreground">({session.comparison?.changed_paths ?? session.files.length})</span>}</CardTitle><div className="flex items-center gap-0.5"><Button type="button" size="icon" variant="ghost" className="size-7" title="Make file sidebar narrower" onClick={() => setSidebarWidth((width) => Math.max(220, width - 40))}><Minus className="size-3.5" /></Button><Button type="button" size="icon" variant="ghost" className="size-7" title="Make file sidebar wider" onClick={() => setSidebarWidth((width) => Math.min(760, width + 40))}><Plus className="size-3.5" /></Button></div></div>
+            <CardHeader className="gap-3 rounded-t-lg border-b bg-card p-3"><div className="flex items-center justify-between gap-2"><CardTitle className="text-sm">Changed files {session && <span className="font-normal text-muted-foreground">({session.comparison?.changed_paths ?? session.files.length})</span>}</CardTitle><div className="flex items-center gap-0.5"><Button type="button" size="icon" variant="ghost" className="size-7" title="Smaller file text" onClick={() => setSidebarFontSize((size) => Math.max(10, size - 1))}><Minus className="size-3.5" /></Button><span className="w-7 text-center text-[10px] text-muted-foreground" title="File sidebar font size">{sidebarFontSize}px</span><Button type="button" size="icon" variant="ghost" className="size-7" title="Larger file text" onClick={() => setSidebarFontSize((size) => Math.min(18, size + 1))}><Plus className="size-3.5" /></Button><span className="mx-1 h-4 border-l" /><Button type="button" size="icon" variant="ghost" className="size-7" title="Make file sidebar narrower" onClick={() => setSidebarWidth((width) => Math.max(220, width - 40))}><Minus className="size-3.5" /></Button><Button type="button" size="icon" variant="ghost" className="size-7" title="Make file sidebar wider" onClick={() => setSidebarWidth((width) => Math.min(760, width + 40))}><Plus className="size-3.5" /></Button></div></div>
               <div className="relative"><Search className="pointer-events-none absolute left-2 top-2 size-3.5 text-muted-foreground" /><Input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Filter files" className="h-8 pl-7 text-xs" /></div>
             </CardHeader>
             <CardContent className="min-h-0 flex-1 overflow-hidden rounded-b-lg bg-card p-2">
@@ -403,8 +405,8 @@ export default function App() {
           </Card>
 
           <Card ref={diffPanelRef} tabIndex={-1} aria-label="Semantic diff panel" className={cn("min-h-0 overflow-hidden outline-none", activeRegion === "diff" && keyboardOverlay && "ring-2 ring-primary ring-offset-2")}>
-            <CardHeader className="flex-row items-center justify-between space-y-0 border-b p-3"><div><CardTitle className="text-sm">{selectedFile?.display_path ?? "Semantic diff"}</CardTitle>{session?.comparison?.pull_request && <a href={session.comparison.pull_request.url} target="_blank" rel="noreferrer" className="mt-1 flex w-fit items-center gap-1 text-xs font-medium text-primary hover:underline"><GitPullRequest className="size-3.5" /> #{session.comparison.pull_request.number} · {session.comparison.pull_request.title}</a>}<p className="mt-1 text-xs text-muted-foreground">{status}</p>{session?.comparison && <p className="mt-1 text-[11px] text-muted-foreground/80">{session.comparison.description}</p>}</div>{loading && <LoaderCircle className="size-4 animate-spin text-muted-foreground" />}</CardHeader>
-            <CardContent className="h-[calc(100vh-260px)] min-h-[580px] p-0">
+            <CardHeader className={cn("flex-row items-center justify-between space-y-0 border-b", chromeHidden ? "h-8 px-3 py-1" : "p-3")}>{chromeHidden ? <><CardTitle className="truncate text-xs font-medium text-muted-foreground">{selectedFile?.display_path ?? "Semantic diff"}</CardTitle>{loading && <LoaderCircle className="size-3.5 animate-spin text-muted-foreground" />}</> : <><div><CardTitle className="text-sm">{selectedFile?.display_path ?? "Semantic diff"}</CardTitle>{session?.comparison?.pull_request && <a href={session.comparison.pull_request.url} target="_blank" rel="noreferrer" className="mt-1 flex w-fit items-center gap-1 text-xs font-medium text-primary hover:underline"><GitPullRequest className="size-3.5" /> #{session.comparison.pull_request.number} · {session.comparison.pull_request.title}</a>}<p className="mt-1 text-xs text-muted-foreground">{status}</p>{session?.comparison && <p className="mt-1 text-[11px] text-muted-foreground/80">{session.comparison.description}</p>}</div>{loading && <LoaderCircle className="size-4 animate-spin text-muted-foreground" />}</>}</CardHeader>
+            <CardContent className={cn("min-h-[580px] p-0", chromeHidden ? "h-[calc(100vh-4.5rem)]" : "h-[calc(100vh-260px)]")}>
               {selectedFile && session ? <iframe ref={diffFrameRef} key={`${session.id}:${selected}`} title={`Semantic diff for ${selectedFile.display_path}`} src={`/semanticdiff-view/${session.id}/${selected}`} className="h-full w-full border-0 bg-card" sandbox="allow-scripts allow-same-origin" /> : <div className="grid h-full place-items-center p-8 text-center text-sm text-muted-foreground"><div><FileDiff className="mx-auto mb-3 size-8 opacity-40" /><p>Pick a file from the tree.</p><p className="mt-1 text-xs">SemanticDiff will compute and render the language-aware view here.</p></div></div>}
             </CardContent>
           </Card>

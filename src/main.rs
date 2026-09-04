@@ -20,12 +20,16 @@ use directories::ProjectDirs;
 use include_dir::{include_dir, Dir};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::{io::AsyncWriteExt, process::Command};
+use tokio::{io::AsyncWriteExt, process::Command, sync::Mutex as AsyncMutex};
 use uuid::Uuid;
 
 static WEB_ASSETS: Dir<'_> = include_dir!("$OUT_DIR/embedded/web");
 static SEMANTICDIFF_WEBVIEW: Dir<'_> = include_dir!("$OUT_DIR/embedded/semanticdiff-webview");
 static SEMANTICDIFF_RUNTIME: Dir<'_> = include_dir!("$OUT_DIR/embedded/semanticdiff-runtime");
+
+// `gh` is already required for GitHub PR metadata. Reuse its active token for
+// the cache clone rather than relying on this machine's SSH key configuration.
+const GITHUB_GIT_CREDENTIAL_HELPER: &str = "credential.helper=!gh auth git-credential";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -46,6 +50,9 @@ struct Args {
 struct AppState {
     semanticdiff_bin: PathBuf,
     cache_dir: PathBuf,
+    // Git updates use lock files inside a repository. Keep cache population and
+    // foreground PR opens from trying to update the same cached clone at once.
+    github_cache_lock: Arc<AsyncMutex<()>>,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
 }
 
@@ -99,6 +106,8 @@ struct GitDiffRequest {
 #[derive(Deserialize)]
 struct GitHubPullsRequest {
     repo: String,
+    #[serde(default)]
+    refresh: bool,
 }
 
 #[derive(Deserialize)]
@@ -109,7 +118,6 @@ struct GitHubCompareRequest {
 
 #[derive(Deserialize)]
 struct GitHubUrlRequest {
-    repo: String,
     url: String,
 }
 
@@ -207,6 +215,7 @@ async fn main() {
     let state = AppState {
         semanticdiff_bin,
         cache_dir,
+        github_cache_lock: Arc::new(AsyncMutex::new(())),
         sessions: Arc::new(Mutex::new(HashMap::new())),
     };
     let app = Router::new()
@@ -414,24 +423,31 @@ async fn github_open_prs(
     let repo = PathBuf::from(request.repo.trim());
     ensure_git_repo(&repo)?;
     let github_repo = github_repo_for_local(&repo).await?;
-    if let Some(pulls) = read_pr_list_cache(&state.cache_dir, &github_repo) {
-        return Ok(Json(pulls));
-    }
-    let pulls = gh_json::<Vec<PullRequestInfo>>(
-        Some(&repo),
-        &[
-            "pr",
-            "list",
-            "--state",
-            "open",
-            "--limit",
-            "100",
-            "--json",
-            "number,title,url,state,baseRefName,headRefName,isDraft,author,updatedAt",
-        ],
-    )
-    .await?;
-    write_pr_list_cache(&state.cache_dir, &github_repo, &pulls)?;
+    let pulls = match (!request.refresh)
+        .then(|| read_pr_list_cache(&state.cache_dir, &github_repo))
+        .flatten()
+    {
+        Some(pulls) => pulls,
+        None => {
+            let pulls = gh_json::<Vec<PullRequestInfo>>(
+                Some(&repo),
+                &[
+                    "pr",
+                    "list",
+                    "--state",
+                    "open",
+                    "--limit",
+                    "100",
+                    "--json",
+                    "number,title,url,state,baseRefName,headRefName,isDraft,author,updatedAt",
+                ],
+            )
+            .await?;
+            write_pr_list_cache(&state.cache_dir, &github_repo, &pulls)?;
+            pulls
+        }
+    };
+    warm_github_pr_cache(state.clone(), github_repo, pulls.clone(), request.refresh);
     Ok(Json(pulls))
 }
 
@@ -442,7 +458,9 @@ async fn github_compare_pr(
     let repo = PathBuf::from(request.repo.trim());
     ensure_git_repo(&repo)?;
     let repository = github_repo_for_local(&repo).await?;
-    start_github_pr_session(state, repo, repository, request.number).await
+    let _cache_lock = state.github_cache_lock.clone().lock_owned().await;
+    let cached_repo = cached_github_repo(&state.cache_dir, &repository).await?;
+    start_github_pr_session(state, cached_repo, repository, request.number).await
 }
 
 async fn github_open_url(
@@ -450,18 +468,89 @@ async fn github_open_url(
     Json(request): Json<GitHubUrlRequest>,
 ) -> Result<Json<StartResponse>, ApiError> {
     let reference = parse_github_pr_url(request.url.trim())?;
-    let selected_repo = PathBuf::from(request.repo.trim());
-    let repo = if selected_repo.is_dir()
-        && github_repo_for_local(&selected_repo)
-            .await
-            .map(|repo| repo.eq_ignore_ascii_case(&reference.repo))
-            .unwrap_or(false)
-    {
-        selected_repo
-    } else {
-        cached_github_repo(&state.cache_dir, &reference.repo).await?
-    };
+    // A pasted PR URL is intentionally independent from the folder selected in
+    // the UI. Reviews always run against the application's cached clone.
+    let _cache_lock = state.github_cache_lock.clone().lock_owned().await;
+    let repo = cached_github_repo(&state.cache_dir, &reference.repo).await?;
     start_github_pr_session(state, repo, reference.repo, reference.number).await
+}
+
+fn warm_github_pr_cache(
+    state: AppState,
+    github_repo: String,
+    pulls: Vec<PullRequestInfo>,
+    refresh: bool,
+) {
+    tokio::spawn(async move {
+        let _cache_lock = state.github_cache_lock.lock().await;
+        let repo = match cached_github_repo(&state.cache_dir, &github_repo).await {
+            Ok(repo) => repo,
+            Err(error) => {
+                eprintln!(
+                    "Could not warm GitHub PR cache for {github_repo}: {}",
+                    error.message
+                );
+                return;
+            }
+        };
+        if let Err(error) = fetch_github_pr_heads(&repo, &pulls).await {
+            eprintln!(
+                "Could not warm GitHub PR heads for {github_repo}: {}",
+                error.message
+            );
+            return;
+        }
+        for listed_pull in pulls {
+            let result = async {
+                let pull = github_pr_info(
+                    &state.cache_dir,
+                    &repo,
+                    &github_repo,
+                    listed_pull.number,
+                    refresh,
+                )
+                .await?;
+                fetch_github_pr(&repo, &pull, refresh).await
+            }
+            .await;
+            if let Err(error) = result {
+                eprintln!(
+                    "Could not warm PR #{} for {github_repo}: {}",
+                    listed_pull.number, error.message
+                );
+            }
+        }
+    });
+}
+
+async fn github_pr_info(
+    cache_dir: &FsPath,
+    repo: &PathBuf,
+    github_repo: &str,
+    number: u64,
+    refresh: bool,
+) -> Result<PullRequestInfo, ApiError> {
+    if !refresh {
+        if let Some(pull) = read_pr_cache(cache_dir, github_repo, number) {
+            return Ok(pull);
+        }
+    }
+    let number_string = number.to_string();
+    let pull = gh_json::<PullRequestInfo>(
+        Some(repo),
+        &[
+            "pr",
+            "view",
+            &number_string,
+            "--repo",
+            github_repo,
+            "--json",
+            "number,title,url,state,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,author,updatedAt",
+        ],
+    )
+    .await?;
+    write_pr_cache(cache_dir, github_repo, &pull)?;
+    Ok(pull)
 }
 
 async fn start_github_pr_session(
@@ -470,28 +559,8 @@ async fn start_github_pr_session(
     github_repo: String,
     number: u64,
 ) -> Result<Json<StartResponse>, ApiError> {
-    let number_string = number.to_string();
-    let pull = match read_pr_cache(&state.cache_dir, &github_repo, number) {
-        Some(pull) => pull,
-        None => {
-            let pull = gh_json::<PullRequestInfo>(
-                Some(&repo),
-                &[
-                    "pr",
-                    "view",
-                    &number_string,
-                    "--repo",
-                    &github_repo,
-                    "--json",
-                    "number,title,url,state,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,author,updatedAt",
-                ],
-            )
-            .await?;
-            write_pr_cache(&state.cache_dir, &github_repo, &pull)?;
-            pull
-        }
-    };
-    fetch_github_pr(&repo, &pull).await?;
+    let pull = github_pr_info(&state.cache_dir, &repo, &github_repo, number, false).await?;
+    fetch_github_pr(&repo, &pull, false).await?;
     let base = git_commit(&repo, &pull.base_ref_oid).await?;
     let head = git_commit(&repo, &format!("refs/local-diffe/pr/{}", pull.number)).await?;
     let merge_base = git_merge_base(&repo, &base, &head).await?;
@@ -663,6 +732,7 @@ async fn cached_github_repo(cache_dir: &FsPath, github_repo: &str) -> Result<Pat
     let destination = cache_dir
         .join("github-repos")
         .join(format!("{owner}--{name}"));
+    let remote_url = format!("https://github.com/{github_repo}.git");
     if destination.join(".git").is_dir() {
         return Ok(destination);
     }
@@ -679,7 +749,18 @@ async fn cached_github_repo(cache_dir: &FsPath, github_repo: &str) -> Result<Pat
         ApiError::internal(format!("Could not create GitHub cache directory: {error}"))
     })?;
     let destination_string = destination.to_string_lossy().to_string();
-    gh_output(None, &["repo", "clone", github_repo, &destination_string]).await?;
+    let output = Command::new("git")
+        .args(["-c", GITHUB_GIT_CREDENTIAL_HELPER])
+        .args(["clone", &remote_url, &destination_string])
+        .output()
+        .await
+        .map_err(|error| ApiError::internal(format!("Could not run git: {error}")))?;
+    if !output.status.success() {
+        return Err(ApiError::bad_request(format!(
+            "Could not clone the GitHub cache repository: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
     if !destination.join(".git").is_dir() {
         return Err(ApiError::internal(
             "GitHub CLI completed but did not create the expected repository.",
@@ -759,19 +840,55 @@ fn write_json_cache<T: Serialize + ?Sized>(path: &FsPath, value: &T) -> Result<(
         .map_err(|error| ApiError::internal(format!("Could not finalize cache entry: {error}")))
 }
 
-async fn fetch_github_pr(repo: &PathBuf, pull: &PullRequestInfo) -> Result<(), ApiError> {
-    git_command(repo, &["fetch", "--prune", "origin"]).await?;
-    git_command(repo, &["fetch", "origin", &pull.base_ref_name]).await?;
+async fn fetch_github_pr(
+    repo: &PathBuf,
+    pull: &PullRequestInfo,
+    refresh: bool,
+) -> Result<(), ApiError> {
+    if refresh || !git_commit_exists(repo, &pull.base_ref_oid).await {
+        git_command(repo, &["fetch", "origin", &pull.base_ref_name]).await?;
+    }
     let refspec = format!(
         "+refs/pull/{}/head:refs/local-diffe/pr/{}",
         pull.number, pull.number
     );
-    git_command(repo, &["fetch", "origin", &refspec]).await
+    let pr_ref = format!("refs/local-diffe/pr/{}", pull.number);
+    if refresh || !git_commit_exists(repo, &pr_ref).await {
+        git_command(repo, &["fetch", "origin", &refspec]).await?;
+    }
+    Ok(())
+}
+
+async fn fetch_github_pr_heads(repo: &PathBuf, pulls: &[PullRequestInfo]) -> Result<(), ApiError> {
+    let mut args = vec!["fetch".to_owned(), "origin".to_owned()];
+    args.extend(pulls.iter().map(|pull| {
+        format!(
+            "+refs/pull/{}/head:refs/local-diffe/pr/{}",
+            pull.number, pull.number
+        )
+    }));
+    if args.len() > 2 {
+        let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        git_command(repo, &arg_refs).await?;
+    }
+    Ok(())
+}
+
+async fn git_commit_exists(repo: &PathBuf, revision: &str) -> bool {
+    let expression = format!("{revision}^{{commit}}");
+    Command::new("git")
+        .current_dir(repo)
+        .args(["rev-parse", "--verify", "--quiet", &expression])
+        .output()
+        .await
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 async fn git_command(repo: &PathBuf, args: &[&str]) -> Result<(), ApiError> {
     let output = Command::new("git")
         .current_dir(repo)
+        .args(["-c", GITHUB_GIT_CREDENTIAL_HELPER])
         .args(args)
         .output()
         .await
