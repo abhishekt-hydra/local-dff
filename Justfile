@@ -22,5 +22,5 @@ version: build
     ./.build/release/local-diffe --version
 
 frontend:
-    cd web && npm ci
-    cd web && npm run build
+    cd web && bun ci
+    cd web && bun run build

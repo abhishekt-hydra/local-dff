@@ -318,7 +318,7 @@ export default function App() {
     const canRender = !isFile || item.renderable !== false
     const active = isFile && item.fileIndex === selected
     return (
-      <div style={{ ...style, paddingInline: Math.max(1, Math.round(4 * sidebarScale)) }} ref={dragHandle}>
+      <div style={{ ...style, paddingRight: Math.max(1, Math.round(4 * sidebarScale)) }} ref={dragHandle}>
         <button
           type="button"
           data-file-index={isFile ? item.fileIndex : undefined}
@@ -327,7 +327,7 @@ export default function App() {
           style={{ fontSize: sidebarFontSize, height: sidebarRowHeight, gap: sidebarGap, paddingInline: sidebarPadding }}
           className={cn("flex w-full items-center rounded text-left hover:bg-accent", active && "bg-accent text-accent-foreground", !canRender && "cursor-default opacity-45 hover:bg-transparent")}
         >
-          {isFile ? <span style={{ width: sidebarIconSize }} /> : <ChevronRight style={{ width: sidebarIconSize, height: sidebarIconSize }} className={cn("shrink-0 transition-transform", node.isOpen && "rotate-90")} />}
+          {isFile ? <span className="shrink-0" style={{ width: sidebarIconSize }} /> : <ChevronRight style={{ width: sidebarIconSize, height: sidebarIconSize }} className={cn("shrink-0 transition-transform", node.isOpen && "rotate-90")} />}
           {isFile ? <FileCode2 style={{ width: sidebarIconSize, height: sidebarIconSize }} className={cn("shrink-0", canRender ? "text-sky-600" : "text-muted-foreground")} /> : node.isOpen ? <FolderOpen style={{ width: sidebarIconSize, height: sidebarIconSize }} className="shrink-0 text-amber-500" /> : <Folder style={{ width: sidebarIconSize, height: sidebarIconSize }} className="shrink-0 text-amber-500" />}
           <span className="truncate">{item.name}</span>
         </button>

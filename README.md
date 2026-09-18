@@ -92,6 +92,44 @@ SEMANTICDIFF_EXTENSION_DIR=/path/to/semanticdiff.semanticdiff-0.10.0-darwin-arm6
 `<short-sha>+<YYYY.MM.DD>` form. The date is the `HEAD` commit date, making
 rebuilds of the same commit deterministic.
 
+## Set up another machine
+
+The release executable is self-contained, so the machine that runs it needs
+only Git. GitHub pull-request features additionally need an authenticated
+GitHub CLI; Rust is needed only when building from source. On a new macOS
+machine, run:
+
+```bash
+./scripts/bootstrap-macos.sh
+```
+
+It installs Homebrew (when needed), Git, GitHub CLI, and Rust, then starts the
+browser-based GitHub CLI login. Choose SSH during the login flow and let GitHub
+CLI use or create an SSH key. This configures both API access for PR data and
+SSH access for private repositories; no token needs to be copied manually.
+
+On Linux, run the equivalent script instead:
+
+```bash
+./scripts/bootstrap-linux.sh
+```
+
+It supports Debian/Ubuntu (`apt`), Fedora/RHEL (`dnf`), Arch (`pacman`), and
+openSUSE/SUSE (`zypper`). The current `local-diffe-darwin-arm64` release is a
+macOS ARM executable and cannot run on Linux. A Linux release requires a
+separate build with a compatible Linux SemanticDiff extension/runtime.
+
+For a machine that will not use GitHub PR features, skip the interactive login:
+
+```bash
+./scripts/bootstrap-macos.sh --skip-gh-auth
+# or on Linux
+./scripts/bootstrap-linux.sh --skip-gh-auth
+```
+
+Later, enable PR features with `gh auth login --web --git-protocol ssh`, then
+verify the setup with `gh auth status`.
+
 ## How it works
 
 The patch is only an index of changed files. A unified diff lacks sufficient
