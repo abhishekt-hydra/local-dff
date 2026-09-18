@@ -95,6 +95,7 @@ export default function App() {
   const [resizingSidebar, setResizingSidebar] = useState(false)
   const [session, setSession] = useState<Session | null>(null)
   const [selected, setSelected] = useState<number | null>(null)
+  const [viewedFiles, setViewedFiles] = useState<Set<number>>(() => new Set())
   const [search, setSearch] = useState("")
   const [status, setStatus] = useState("Ready to compare origin/staging with the checked-out branch.")
   const [loading, setLoading] = useState(false)
@@ -132,6 +133,7 @@ export default function App() {
       const next = await api<Session>(endpoint, payload)
       setSession(next)
       setSelected(null)
+      setViewedFiles(new Set())
       if (next.comparison) {
         const { base: resolvedBase, target: resolvedTarget, changed_paths, semantic_paths, pull_request } = next.comparison
         const revisions = `${resolvedBase.commit.slice(0, 7)} → ${resolvedTarget.commit.slice(0, 7)}`
@@ -330,12 +332,23 @@ export default function App() {
           {isFile ? <span className="shrink-0" style={{ width: sidebarIconSize }} /> : <ChevronRight style={{ width: sidebarIconSize, height: sidebarIconSize }} className={cn("shrink-0 transition-transform", node.isOpen && "rotate-90")} />}
           {isFile ? <FileCode2 style={{ width: sidebarIconSize, height: sidebarIconSize }} className={cn("shrink-0", canRender ? "text-sky-600" : "text-muted-foreground")} /> : node.isOpen ? <FolderOpen style={{ width: sidebarIconSize, height: sidebarIconSize }} className="shrink-0 text-amber-500" /> : <Folder style={{ width: sidebarIconSize, height: sidebarIconSize }} className="shrink-0 text-amber-500" />}
           <span className="truncate">{item.name}</span>
+          {isFile && viewedFiles.has(item.fileIndex!) && <span className="ml-auto shrink-0 text-emerald-600" title="Viewed"><Check aria-hidden="true" style={{ width: sidebarIconSize, height: sidebarIconSize }} /><span className="sr-only">Viewed</span></span>}
         </button>
       </div>
     )
   }
 
   const selectedFile = selected === null ? null : session?.files[selected]
+  const selectedViewed = selected !== null && viewedFiles.has(selected)
+  const toggleViewed = () => {
+    if (selected === null || !selectedFile) return
+    setViewedFiles((current) => {
+      const next = new Set(current)
+      if (next.has(selected)) next.delete(selected)
+      else next.add(selected)
+      return next
+    })
+  }
   return (
     <div className="min-h-screen bg-muted/40">
       {!chromeHidden && <header className="border-b bg-background">
@@ -410,7 +423,16 @@ export default function App() {
           </Card>
 
           <Card ref={diffPanelRef} tabIndex={-1} aria-label="Semantic diff panel" className={cn("min-h-0 overflow-hidden outline-none", activeRegion === "diff" && keyboardOverlay && "ring-2 ring-primary ring-offset-2")}>
-            <CardHeader className={cn("flex-row items-center justify-between space-y-0 border-b", chromeHidden ? "h-8 px-3 py-1" : "p-3")}>{chromeHidden ? <><CardTitle className="truncate text-xs font-medium text-muted-foreground">{selectedFile?.display_path ?? "Semantic diff"}</CardTitle>{loading && <LoaderCircle className="size-3.5 animate-spin text-muted-foreground" />}</> : <><div><CardTitle className="text-sm">{selectedFile?.display_path ?? "Semantic diff"}</CardTitle>{session?.comparison?.pull_request && <a href={session.comparison.pull_request.url} target="_blank" rel="noreferrer" className="mt-1 flex w-fit items-center gap-1 text-xs font-medium text-primary hover:underline"><GitPullRequest className="size-3.5" /> #{session.comparison.pull_request.number} · {session.comparison.pull_request.title}</a>}<p className="mt-1 text-xs text-muted-foreground">{status}</p>{session?.comparison && <p className="mt-1 text-[11px] text-muted-foreground/80">{session.comparison.description}</p>}</div>{loading && <LoaderCircle className="size-4 animate-spin text-muted-foreground" />}</>}</CardHeader>
+            <CardHeader className={cn("flex-row items-center justify-between gap-3 space-y-0 border-b", chromeHidden ? "h-8 px-3 py-1" : "p-3")}>
+              {chromeHidden ? <CardTitle className="min-w-0 truncate text-xs font-medium text-muted-foreground">{selectedFile?.display_path ?? "Semantic diff"}</CardTitle> : <div className="min-w-0"><CardTitle className="break-all text-sm">{selectedFile?.display_path ?? "Semantic diff"}</CardTitle>{session?.comparison?.pull_request && <a href={session.comparison.pull_request.url} target="_blank" rel="noreferrer" className="mt-1 flex w-fit items-center gap-1 text-xs font-medium text-primary hover:underline"><GitPullRequest className="size-3.5" /> #{session.comparison.pull_request.number} · {session.comparison.pull_request.title}</a>}<p className="mt-1 text-xs text-muted-foreground">{status}</p>{session?.comparison && <p className="mt-1 text-[11px] text-muted-foreground/80">{session.comparison.description}</p>}</div>}
+              <div className="flex shrink-0 items-center gap-2">
+                {loading && <LoaderCircle className="size-3.5 animate-spin text-muted-foreground" />}
+                {selectedFile && <Button type="button" data-testid="mark-as-viewed" size="sm" variant={selectedViewed ? "secondary" : "outline"} className={cn(chromeHidden && "h-6")} aria-pressed={selectedViewed} title={selectedViewed ? "Mark as unviewed" : "Mark as viewed"} disabled={loading} onClick={toggleViewed}>
+                  {selectedViewed && <Check aria-hidden="true" className="size-3.5 text-emerald-600" />}
+                  {selectedViewed ? "Viewed" : "Mark as viewed"}
+                </Button>}
+              </div>
+            </CardHeader>
             <CardContent className={cn("min-h-[580px] p-0", chromeHidden ? "h-[calc(100vh-4.5rem)]" : "h-[calc(100vh-260px)]")}>
               {selectedFile && session ? <iframe ref={diffFrameRef} key={`${session.id}:${selected}`} title={`Semantic diff for ${selectedFile.display_path}`} src={`/semanticdiff-view/${session.id}/${selected}`} className="h-full w-full border-0 bg-card" sandbox="allow-scripts allow-same-origin" /> : <div className="grid h-full place-items-center p-8 text-center text-sm text-muted-foreground"><div><FileDiff className="mx-auto mb-3 size-8 opacity-40" /><p>Pick a file from the tree.</p><p className="mt-1 text-xs">SemanticDiff will compute and render the language-aware view here.</p></div></div>}
             </CardContent>
