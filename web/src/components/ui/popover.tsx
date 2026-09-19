@@ -14,7 +14,7 @@ function PopoverContent({
       <PopoverPrimitive.Content
         align={align}
         sideOffset={sideOffset}
-        className={`z-50 w-72 rounded-md border bg-popover p-0 text-popover-foreground shadow-md outline-none ${className ?? ""}`}
+        className={`z-50 w-72 rounded-2xl bg-popover p-0 text-popover-foreground shadow-[0_18px_55px_-24px_rgba(15,23,42,0.55)] outline-none ${className ?? ""}`}
         {...props}
       />
     </PopoverPrimitive.Portal>

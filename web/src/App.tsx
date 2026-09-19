@@ -95,14 +95,17 @@ export default function App() {
   const [resizingSidebar, setResizingSidebar] = useState(false)
   const [session, setSession] = useState<Session | null>(null)
   const [selected, setSelected] = useState<number | null>(null)
+  const [diffLoading, setDiffLoading] = useState(false)
   const [viewedFiles, setViewedFiles] = useState<Set<number>>(() => new Set())
   const [search, setSearch] = useState("")
   const [status, setStatus] = useState("Ready to compare origin/staging with the checked-out branch.")
   const [loading, setLoading] = useState(false)
   const reviewGrid = useRef<HTMLDivElement>(null)
   const sidebarRef = useRef<HTMLDivElement>(null)
+  const sidebarContentRef = useRef<HTMLDivElement>(null)
   const diffPanelRef = useRef<HTMLDivElement>(null)
   const diffFrameRef = useRef<HTMLIFrameElement>(null)
+  const [treeHeight, setTreeHeight] = useState(480)
   const tree = useMemo(() => makeTree(session?.files ?? []), [session])
   const selectedPull = useMemo(() => pulls.find((pull) => String(pull.number) === prNumber), [pulls, prNumber])
   const sidebarScale = sidebarFontSize / 12
@@ -125,6 +128,20 @@ export default function App() {
       window.removeEventListener("pointerup", stop)
     }
   }, [resizingSidebar])
+
+  useEffect(() => {
+    const element = sidebarContentRef.current
+    if (!element) return
+    const updateHeight = () => setTreeHeight(Math.max(160, Math.floor(element.clientHeight - 4)))
+    updateHeight()
+    const observer = new ResizeObserver(updateHeight)
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [session, chromeHidden])
+
+  useEffect(() => {
+    setDiffLoading(selected !== null && Boolean(session))
+  }, [selected, session?.id])
 
   const loadSession = async (endpoint: string, payload: unknown, progress: string) => {
     setLoading(true)
@@ -416,9 +433,13 @@ export default function App() {
             <CardHeader className="gap-3 rounded-t-lg border-b bg-card p-3"><div className="flex items-center justify-between gap-2"><CardTitle className="text-sm">Changed files {session && <span className="font-normal text-muted-foreground">({session.comparison?.changed_paths ?? session.files.length})</span>}</CardTitle><div className="flex items-center gap-0.5"><Button type="button" size="icon" variant="ghost" className="size-7" title="Smaller file text" onClick={() => setSidebarFontSize((size) => Math.max(10, size - 1))}><Minus className="size-3.5" /></Button><span className="w-7 text-center text-[10px] text-muted-foreground" title="File sidebar font size">{sidebarFontSize}px</span><Button type="button" size="icon" variant="ghost" className="size-7" title="Larger file text" onClick={() => setSidebarFontSize((size) => Math.min(18, size + 1))}><Plus className="size-3.5" /></Button><span className="mx-1 h-4 border-l" /><Button type="button" size="icon" variant="ghost" className="size-7" title="Make file sidebar narrower" onClick={() => setSidebarWidth((width) => Math.max(220, width - 40))}><Minus className="size-3.5" /></Button><Button type="button" size="icon" variant="ghost" className="size-7" title="Make file sidebar wider" onClick={() => setSidebarWidth((width) => Math.min(760, width + 40))}><Plus className="size-3.5" /></Button></div></div>
               <div className="relative"><Search className="pointer-events-none absolute left-2 top-2 size-3.5 text-muted-foreground" /><Input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Filter files" className="h-8 pl-7 text-xs" /></div>
             </CardHeader>
-            <CardContent className="min-h-0 flex-1 overflow-hidden rounded-b-lg bg-card p-2">
-              {tree.length ? <Tree<TreeItem> data={tree} width="100%" height={720} rowHeight={sidebarRowHeight} indent={Math.max(9, Math.round(14 * sidebarScale))} openByDefault disableDrag disableDrop searchTerm={search}>{renderNode}</Tree> : <p className="p-3 text-xs text-muted-foreground">Generate a Git diff or upload a patch to populate the file tree.</p>}
+            <CardContent ref={sidebarContentRef} className="min-h-0 flex-1 overflow-hidden rounded-b-2xl bg-card p-2">
+              {tree.length ? <Tree<TreeItem> data={tree} width="100%" height={treeHeight} rowHeight={sidebarRowHeight} indent={Math.max(9, Math.round(14 * sidebarScale))} openByDefault disableDrag disableDrop searchTerm={search}>{renderNode}</Tree> : <p className="p-3 text-xs text-muted-foreground">Generate a Git diff or upload a patch to populate the file tree.</p>}
             </CardContent>
+            <div className="flex items-center justify-between gap-3 px-4 pb-4 pt-2 text-[11px] text-muted-foreground">
+              <span>{session ? `${session.files.length} ${session.files.length === 1 ? "file" : "files"}` : "No comparison loaded"}</span>
+              {session && <span>{viewedFiles.size} viewed</span>}
+            </div>
             <button type="button" aria-label="Resize file sidebar" title="Drag to resize the file sidebar" onPointerDown={(event) => { event.preventDefault(); setResizingSidebar(true) }} className={cn("absolute -right-3 top-0 z-10 hidden h-full w-6 cursor-col-resize touch-none items-center justify-center lg:flex", resizingSidebar && "bg-primary/5")}><span className="grid h-12 w-3 place-items-center rounded-full border bg-background text-muted-foreground shadow-sm"><GripVertical className="size-3" /></span></button>
           </Card>
 
@@ -434,7 +455,10 @@ export default function App() {
               </div>
             </CardHeader>
             <CardContent className={cn("min-h-[580px] p-0", chromeHidden ? "h-[calc(100vh-4.5rem)]" : "h-[calc(100vh-260px)]")}>
-              {selectedFile && session ? <iframe ref={diffFrameRef} key={`${session.id}:${selected}`} title={`Semantic diff for ${selectedFile.display_path}`} src={`/semanticdiff-view/${session.id}/${selected}`} className="h-full w-full border-0 bg-card" sandbox="allow-scripts allow-same-origin" /> : <div className="grid h-full place-items-center p-8 text-center text-sm text-muted-foreground"><div><FileDiff className="mx-auto mb-3 size-8 opacity-40" /><p>Pick a file from the tree.</p><p className="mt-1 text-xs">SemanticDiff will compute and render the language-aware view here.</p></div></div>}
+              {selectedFile && session ? <div className="relative h-full w-full">
+                <iframe ref={diffFrameRef} key={`${session.id}:${selected}`} title={`Semantic diff for ${selectedFile.display_path}`} src={`/semanticdiff-view/${session.id}/${selected}`} onLoad={() => setDiffLoading(false)} onError={() => { setDiffLoading(false); setStatus("Unable to render the semantic diff for this file.") }} className="h-full w-full border-0 bg-card" sandbox="allow-scripts allow-same-origin" />
+                {diffLoading && <div className="absolute inset-0 grid place-items-center bg-card/80 backdrop-blur-[2px]" role="status" aria-live="polite"><div className="flex items-center gap-2 rounded-full bg-muted/80 px-4 py-2 text-sm text-muted-foreground shadow-sm"><LoaderCircle className="size-4 animate-spin text-primary" /> Loading file…</div></div>}
+              </div> : <div className="grid h-full place-items-center p-8 text-center text-sm text-muted-foreground"><div><FileDiff className="mx-auto mb-3 size-8 opacity-40" /><p>Pick a file from the tree.</p><p className="mt-1 text-xs">SemanticDiff will compute and render the language-aware view here.</p></div></div>}
             </CardContent>
           </Card>
         </div>

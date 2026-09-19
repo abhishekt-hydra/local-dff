@@ -23,29 +23,30 @@
 }
 
 :root {
-  color-scheme: light dark;
-  --background: oklch(.985 .003 264);
-  --foreground: oklch(.17 .02 264);
-  --card: oklch(1 0 0);
-  --card-foreground: oklch(.17 .02 264);
-  --popover: oklch(1 0 0);
-  --popover-foreground: oklch(.17 .02 264);
-  --primary: oklch(.31 .08 258);
-  --primary-foreground: oklch(.98 .002 264);
-  --secondary: oklch(.95 .01 264);
+  color-scheme: light;
+  --background: oklch(.965 .006 264);
+  --foreground: oklch(.18 .018 264);
+  --card: oklch(.995 .002 264);
+  --card-foreground: oklch(.18 .018 264);
+  --popover: oklch(.995 .002 264);
+  --popover-foreground: oklch(.18 .018 264);
+  --primary: oklch(.56 .20 255);
+  --primary-foreground: oklch(.99 .002 264);
+  --secondary: oklch(.93 .012 264);
   --secondary-foreground: oklch(.25 .02 264);
-  --muted: oklch(.95 .01 264);
-  --muted-foreground: oklch(.53 .02 264);
-  --accent: oklch(.93 .02 255);
-  --accent-foreground: oklch(.25 .04 255);
-  --input: oklch(.87 .01 264);
-  --border: oklch(.87 .01 264);
-  --ring: oklch(.55 .12 258);
-  --radius: .5rem;
+  --muted: oklch(.935 .01 264);
+  --muted-foreground: oklch(.52 .022 264);
+  --accent: oklch(.93 .035 255);
+  --accent-foreground: oklch(.29 .06 255);
+  --input: transparent;
+  --border: transparent;
+  --ring: oklch(.62 .18 255);
+  --radius: 1rem;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
+    color-scheme: dark;
     --background: oklch(.17 .02 264);
     --foreground: oklch(.95 .01 264);
     --card: oklch(.22 .02 264);
@@ -61,11 +62,16 @@
     --accent: oklch(.31 .04 255);
     --accent-foreground: oklch(.93 .02 255);
     --input: oklch(.37 .02 264);
-    --border: oklch(.37 .02 264);
+    --border: transparent;
     --ring: oklch(.72 .12 258);
   }
 }
 * { box-sizing: border-box; }
 html, body, #root { min-height: 100%; }
-body { margin: 0; background: var(--background); color: var(--foreground); font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+body { margin: 0; background: var(--background); color: var(--foreground); font-family: Inter, ui-sans-serif, system-ui, sans-serif; letter-spacing: -0.006em; }
 button, input { font: inherit; }
+
+/* The review surface is intentionally quiet: structure comes from spacing and
+   tonal shifts, with borders reserved for keyboard focus only. */
+button, input, [role="button"] { -webkit-tap-highlight-color: transparent; }
+::selection { background: oklch(.78 .14 250 / .35); }
