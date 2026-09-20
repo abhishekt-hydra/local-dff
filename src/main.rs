@@ -3,7 +3,6 @@ use std::{
     fs,
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
-    process::Stdio,
     sync::{Arc, Mutex},
 };
 
@@ -19,9 +18,19 @@ use clap::Parser;
 use directories::ProjectDirs;
 use include_dir::{include_dir, Dir};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use tokio::{io::AsyncWriteExt, process::Command, sync::Mutex as AsyncMutex};
+use serde_json::json;
+use tokio::{process::Command, sync::Mutex as AsyncMutex};
 use uuid::Uuid;
+
+mod adapters;
+mod application;
+mod domain;
+mod http;
+mod ports;
+mod storage;
+#[cfg(test)]
+mod test_support;
+use domain::{FileEntry, SemanticResponse};
 
 static WEB_ASSETS: Dir<'_> = include_dir!("$OUT_DIR/embedded/web");
 static SEMANTICDIFF_WEBVIEW: Dir<'_> = include_dir!("$OUT_DIR/embedded/semanticdiff-webview");
@@ -48,7 +57,7 @@ struct Args {
 
 #[derive(Clone)]
 struct AppState {
-    semanticdiff_bin: PathBuf,
+    diffs: Arc<dyn ports::DiffReader>,
     cache_dir: PathBuf,
     // Git updates use lock files inside a repository. Keep cache population and
     // foreground PR opens from trying to update the same cached clone at once.
@@ -62,14 +71,6 @@ struct Session {
     base: String,
     target: String,
     files: Vec<FileEntry>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct FileEntry {
-    old_path: Option<String>,
-    new_path: Option<String>,
-    display_path: String,
-    renderable: bool,
 }
 
 #[derive(Serialize)]
@@ -167,14 +168,6 @@ struct StartResponse {
     comparison: Option<ComparisonInfo>,
 }
 
-#[derive(Serialize)]
-struct SemanticResponse {
-    file: FileEntry,
-    old_content: String,
-    new_content: String,
-    semantic: Value,
-}
-
 #[derive(Debug)]
 struct ApiError {
     status: StatusCode,
@@ -213,7 +206,11 @@ async fn main() {
     });
 
     let state = AppState {
-        semanticdiff_bin,
+        diffs: Arc::new(application::DiffService::new(
+            Arc::new(adapters::GitDiffSource),
+            Arc::new(adapters::SemanticCli::new(semanticdiff_bin)),
+            Arc::new(storage::FoyerDiffStore::new(64 * 1024 * 1024)),
+        )),
         cache_dir,
         github_cache_lock: Arc::new(AsyncMutex::new(())),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -227,6 +224,7 @@ async fn main() {
         .route("/api/github/compare", post(github_compare_pr))
         .route("/api/github/open-url", post(github_open_url))
         .route("/api/semantic/{id}/{index}", post(semantic_file))
+        .route("/api/diff/{id}/{index}", get(http::text_diff))
         .route("/semanticdiff-view/{id}/{index}", get(semanticdiff_view))
         .route("/semanticdiff-assets/{*path}", get(semanticdiff_asset))
         .layer(DefaultBodyLimit::max(25 * 1024 * 1024))
@@ -317,9 +315,21 @@ fn materialize_embedded_dir(
     source: &'static Dir<'static>,
     destination: &std::path::Path,
 ) -> Result<(), String> {
-    source
-        .extract(destination)
-        .map_err(|error| format!("could not write embedded SemanticDiff files: {error}"))?;
+    fn extract(source: &Dir<'_>, destination: &FsPath) -> Result<(), String> {
+        for file in source.files() {
+            let target = destination.join(file.path());
+            fs::create_dir_all(target.parent().unwrap()).map_err(|error| error.to_string())?;
+            let bytes =
+                zstd::stream::decode_all(file.contents()).map_err(|error| error.to_string())?;
+            fs::write(target, bytes).map_err(|error| error.to_string())?;
+        }
+        for directory in source.dirs() {
+            extract(directory, destination)?;
+        }
+        Ok(())
+    }
+    extract(source, destination)
+        .map_err(|error| format!("could not extract embedded SemanticDiff files: {error}"))?;
     #[cfg(unix)]
     if let Some(bin) = source.get_dir("bin") {
         use std::os::unix::fs::PermissionsExt;
@@ -339,15 +349,11 @@ async fn start_session(
 ) -> Result<Json<StartResponse>, ApiError> {
     let repo = PathBuf::from(request.repo.trim());
     validate_git_input(&repo, &request.base, &request.target)?;
-    create_session(
-        state,
-        repo,
-        request.base,
-        request.target,
-        request.patch,
-        None,
-        None,
-    )
+    let (base, target) = tokio::try_join!(
+        git_commit(&repo, &request.base),
+        git_commit(&repo, &request.target),
+    )?;
+    create_session(state, repo, base, target, request.patch, None, None)
 }
 
 async fn start_git_diff(
@@ -377,28 +383,24 @@ async fn create_git_comparison(
     pull_request: Option<PullRequestInfo>,
     description: String,
 ) -> Result<Json<StartResponse>, ApiError> {
-    let (patch, mut files, base_commit, target_commit) = tokio::try_join!(
-        git_diff(&repo, &base, &target),
-        git_changed_files(&repo, &base, &target),
-        git_commit(&repo, &base),
-        git_commit(&repo, &target),
+    let (base_commit, target_commit) =
+        tokio::try_join!(git_commit(&repo, &base), git_commit(&repo, &target),)?;
+    let (mut files, renderable_paths) = tokio::try_join!(
+        git_changed_files(&repo, &base_commit, &target_commit),
+        git_renderable_paths(&repo, &base_commit, &target_commit),
     )?;
-    let patched_paths = parse_patch(&patch)
-        .into_iter()
-        .map(|file| file.display_path)
-        .collect::<HashSet<_>>();
     for file in &mut files {
-        file.renderable = patched_paths.contains(&file.display_path);
+        file.renderable = renderable_paths.contains(&file.display_path);
     }
     let semantic_paths = files.iter().filter(|file| file.renderable).count();
     let comparison = ComparisonInfo {
         base: RevisionInfo {
             revision: base.clone(),
-            commit: base_commit,
+            commit: base_commit.clone(),
         },
         target: RevisionInfo {
             revision: target.clone(),
-            commit: target_commit,
+            commit: target_commit.clone(),
         },
         changed_paths: files.len(),
         semantic_paths,
@@ -408,9 +410,9 @@ async fn create_git_comparison(
     create_session(
         state,
         repo,
-        base,
-        target,
-        patch,
+        base_commit,
+        target_commit,
+        String::new(),
         Some(files),
         Some(comparison),
     )
@@ -525,7 +527,7 @@ fn warm_github_pr_cache(
 
 async fn github_pr_info(
     cache_dir: &FsPath,
-    repo: &PathBuf,
+    repo: &FsPath,
     github_repo: &str,
     number: u64,
     refresh: bool,
@@ -606,7 +608,7 @@ fn create_session(
     }))
 }
 
-fn validate_git_input(repo: &PathBuf, base: &str, target: &str) -> Result<(), ApiError> {
+fn validate_git_input(repo: &FsPath, base: &str, target: &str) -> Result<(), ApiError> {
     if !repo.is_dir() {
         return Err(ApiError::bad_request(format!(
             "Repository directory does not exist: {}",
@@ -626,7 +628,7 @@ fn validate_git_input(repo: &PathBuf, base: &str, target: &str) -> Result<(), Ap
     Ok(())
 }
 
-fn ensure_git_repo(repo: &PathBuf) -> Result<(), ApiError> {
+fn ensure_git_repo(repo: &FsPath) -> Result<(), ApiError> {
     if !repo.is_dir() {
         return Err(ApiError::bad_request(format!(
             "Repository directory does not exist: {}",
@@ -668,7 +670,7 @@ async fn gh_output(repo: Option<&std::path::Path>, args: &[&str]) -> Result<Vec<
     Ok(output.stdout)
 }
 
-async fn github_repo_for_local(repo: &PathBuf) -> Result<String, ApiError> {
+async fn github_repo_for_local(repo: &FsPath) -> Result<String, ApiError> {
     let info =
         gh_json::<GitHubRepoInfo>(Some(repo), &["repo", "view", "--json", "nameWithOwner"]).await?;
     Ok(info.name_with_owner)
@@ -920,23 +922,6 @@ async fn git_merge_base(repo: &PathBuf, base: &str, target: &str) -> Result<Stri
         .map_err(|_| ApiError::internal("git merge-base returned non-UTF-8 output."))
 }
 
-async fn git_diff(repo: &PathBuf, base: &str, target: &str) -> Result<String, ApiError> {
-    let output = Command::new("git")
-        .current_dir(repo)
-        .args(["diff", "--no-ext-diff", base, target])
-        .output()
-        .await
-        .map_err(|error| ApiError::internal(format!("Could not run git diff: {error}")))?;
-    if !output.status.success() {
-        return Err(ApiError::bad_request(format!(
-            "Could not diff `{base}` and `{target}`: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    String::from_utf8(output.stdout)
-        .map_err(|_| ApiError::internal("git diff returned non-UTF-8 output."))
-}
-
 /// Read changed paths from Git's NUL-delimited machine format.  Patch headers are
 /// intentionally not used here: an added empty file has no `---`/`+++` hunk even
 /// though it is a real changed path.
@@ -1013,6 +998,51 @@ async fn git_changed_files(
     Ok(files)
 }
 
+/// Return paths with textual content changes without materializing the full
+/// patch. This keeps large pull requests responsive and excludes binary or
+/// metadata-only changes from the semantic viewer.
+async fn git_renderable_paths(
+    repo: &PathBuf,
+    base: &str,
+    target: &str,
+) -> Result<HashSet<String>, ApiError> {
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(["diff", "--no-ext-diff", "--numstat", "-z", base, target])
+        .output()
+        .await
+        .map_err(|error| {
+            ApiError::internal(format!("Could not inspect changed file content: {error}"))
+        })?;
+    if !output.status.success() {
+        return Err(ApiError::bad_request(format!(
+            "Could not inspect changed file content between `{base}` and `{target}`: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+
+    let mut renderable = HashSet::new();
+    let fields = output
+        .stdout
+        .split(|byte| *byte == b'\0')
+        .collect::<Vec<_>>();
+    for record in fields.into_iter().filter(|record| !record.is_empty()) {
+        let Ok(record) = std::str::from_utf8(record) else {
+            return Err(ApiError::internal(
+                "Git returned a non-UTF-8 content summary.",
+            ));
+        };
+        let mut columns = record.splitn(3, '\t');
+        let additions = columns.next().unwrap_or_default();
+        let deletions = columns.next().unwrap_or_default();
+        let path = columns.next().unwrap_or_default();
+        if additions != "-" && deletions != "-" && (additions != "0" || deletions != "0") {
+            renderable.insert(path.to_owned());
+        }
+    }
+    Ok(renderable)
+}
+
 async fn git_commit(repo: &PathBuf, revision: &str) -> Result<String, ApiError> {
     let expression = format!("{revision}^{{commit}}");
     let output = Command::new("git")
@@ -1036,14 +1066,14 @@ async fn semantic_file(
     State(state): State<AppState>,
     Path((id, index)): Path<(String, usize)>,
 ) -> Result<Json<SemanticResponse>, ApiError> {
-    Ok(Json(compute_semantic(&state, &id, index).await?))
+    Ok(Json(http::semantic_response(&state, &id, index).await?))
 }
 
 async fn semanticdiff_view(
     State(state): State<AppState>,
     Path((id, index)): Path<(String, usize)>,
 ) -> Result<Html<String>, ApiError> {
-    let result = compute_semantic(&state, &id, index).await?;
+    let result = http::semantic_response(&state, &id, index).await?;
     let options = json!({
         "contextLines": 3,
         "hideComments": false,
@@ -1060,12 +1090,6 @@ async fn semanticdiff_view(
         "options": options,
         "threads": [],
         "viewerCanAddThread": false,
-        "syntax": {
-            "old": result.old_content,
-            "new": result.new_content,
-            "oldPath": result.file.old_path.clone().unwrap_or_default(),
-            "newPath": result.file.new_path.clone().or(result.file.old_path.clone()).unwrap_or_default()
-        },
         "patch": result.semantic,
         "remoteIsGitHubSSH": false,
         "suggestGitHubApp": false,
@@ -1084,129 +1108,16 @@ async fn semanticdiff_view(
     // The renderer lives in an iframe, so relay the outer app's keyboard-overlay
     // keys to its parent. Local Diffe decides whether a relayed key is active.
     let keyboard_bridge = r#"<script>window.addEventListener('keydown',(event)=>{if(['-','?','Escape','f','d','v','j','k','F','D','V','J','K'].includes(event.key)){window.parent.postMessage({source:'local-diffe-keyboard',key:event.key},'*')}});</script>"#;
+    let readiness_bridge = format!("<script>{}</script>", include_str!("semantic-bridge.js"));
     let html = template
         .replace("${webview.cspSource}", "'self'")
         .replace("${baseURL}", "/semanticdiff-assets")
         .replace("${ initialState }", &state_json)
         .replace(
             "<script src=\"script.js\"></script>",
-            &format!("{bridge}{keyboard_bridge}").replace(
-                r#"<script src="script.js"></script>"#,
-                r#"<script type="module">import{decorateSemanticPatch}from"/assets/semantic-highlight.js";try{await decorateSemanticPatch(initialState.patch,initialState.syntax)}catch(error){console.warn("Shiki highlighting unavailable",error)}const script=document.createElement("script");script.src="script.js";document.body.append(script)</script>"#,
-            ),
+            &format!("{readiness_bridge}{bridge}{keyboard_bridge}"),
         );
     Ok(Html(html))
-}
-
-async fn compute_semantic(
-    state: &AppState,
-    id: &str,
-    index: usize,
-) -> Result<SemanticResponse, ApiError> {
-    let session = state
-        .sessions
-        .lock()
-        .unwrap()
-        .get(id)
-        .cloned()
-        .ok_or_else(|| {
-            ApiError::bad_request("This browser session has expired; load the patch again.")
-        })?;
-    let file = session
-        .files
-        .get(index)
-        .cloned()
-        .ok_or_else(|| ApiError::bad_request("Unknown patch file index."))?;
-
-    let old_content = match &file.old_path {
-        Some(path) => git_show(&session.repo, &session.base, path).await?,
-        None => String::new(),
-    };
-    let new_content = match &file.new_path {
-        Some(path) => git_show(&session.repo, &session.target, path).await?,
-        None => String::new(),
-    };
-
-    let extension = file
-        .new_path
-        .as_ref()
-        .or(file.old_path.as_ref())
-        .and_then(|path| std::path::Path::new(path).extension())
-        .map(|extension| format!(".{}", extension.to_string_lossy()))
-        .unwrap_or_default();
-    let request = json!({
-        "old_content": old_content,
-        "new_content": new_content,
-        "extension": extension,
-        "fallback": true,
-        "options": { "ignore_comments": false }
-    });
-    let semantic = run_semanticdiff(&state.semanticdiff_bin, request).await?;
-
-    Ok(SemanticResponse {
-        file,
-        old_content,
-        new_content,
-        semantic,
-    })
-}
-
-async fn git_show(repo: &PathBuf, revision: &str, path: &str) -> Result<String, ApiError> {
-    let object = format!("{revision}:{path}");
-    let output = Command::new("git")
-        .current_dir(repo)
-        .args(["show", &object])
-        .output()
-        .await
-        .map_err(|error| ApiError::internal(format!("Could not run git: {error}")))?;
-    if !output.status.success() {
-        let details = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        return Err(ApiError::bad_request(format!(
-            "Could not read `{object}` from {}: {details}",
-            repo.display()
-        )));
-    }
-    String::from_utf8(output.stdout).map_err(|_| {
-        ApiError::bad_request(format!(
-            "`{object}` is not UTF-8 text and cannot be rendered."
-        ))
-    })
-}
-
-async fn run_semanticdiff(bin: &PathBuf, input: Value) -> Result<Value, ApiError> {
-    let mut child = Command::new(bin)
-        .arg("--diff-stdin")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| ApiError::internal(format!("Could not start SemanticDiff: {error}")))?;
-    let payload = serde_json::to_vec(&input).unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(&payload)
-        .await
-        .map_err(|error| {
-            ApiError::internal(format!("Could not send input to SemanticDiff: {error}"))
-        })?;
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|error| ApiError::internal(format!("SemanticDiff did not finish: {error}")))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let result: Value = serde_json::from_str(&stdout).map_err(|error| {
-        ApiError::internal(format!(
-            "SemanticDiff returned invalid JSON ({error}): {stdout}"
-        ))
-    })?;
-    if !output.status.success() {
-        return Err(ApiError::bad_request(format!(
-            "SemanticDiff could not parse this file: {result}"
-        )));
-    }
-    Ok(result)
 }
 
 fn parse_patch(patch: &str) -> Vec<FileEntry> {

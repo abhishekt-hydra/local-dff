@@ -28,6 +28,7 @@ import { Input } from "@/components/ui/input"
 import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from "@/components/ui/command"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { cn } from "@/lib/utils"
+import { DiffViewer } from "@/components/DiffViewer"
 
 type PatchFile = { old_path: string | null; new_path: string | null; display_path: string; renderable: boolean }
 type Revision = { revision: string; commit: string }
@@ -95,7 +96,6 @@ export default function App() {
   const [resizingSidebar, setResizingSidebar] = useState(false)
   const [session, setSession] = useState<Session | null>(null)
   const [selected, setSelected] = useState<number | null>(null)
-  const [diffLoading, setDiffLoading] = useState(false)
   const [viewedFiles, setViewedFiles] = useState<Set<number>>(() => new Set())
   const [search, setSearch] = useState("")
   const [status, setStatus] = useState("Ready to compare origin/staging with the checked-out branch.")
@@ -138,10 +138,6 @@ export default function App() {
     observer.observe(element)
     return () => observer.disconnect()
   }, [session, chromeHidden])
-
-  useEffect(() => {
-    setDiffLoading(selected !== null && Boolean(session))
-  }, [selected, session?.id])
 
   const loadSession = async (endpoint: string, payload: unknown, progress: string) => {
     setLoading(true)
@@ -223,6 +219,11 @@ export default function App() {
 
   const scrollDiff = useCallback((direction: 1 | -1) => {
     const frame = diffFrameRef.current
+    const textViewport = diffPanelRef.current?.querySelector<HTMLElement>('[data-testid="diff-scroll"]')
+    if (textViewport) {
+      textViewport.scrollBy({ top: Math.max(160, textViewport.clientHeight * 0.72) * direction })
+      return
+    }
     const document = frame?.contentDocument
     const viewport = frame?.contentWindow
     if (!document || !viewport) return
@@ -455,10 +456,7 @@ export default function App() {
               </div>
             </CardHeader>
             <CardContent className={cn("min-h-[580px] p-0", chromeHidden ? "h-[calc(100vh-4.5rem)]" : "h-[calc(100vh-260px)]")}>
-              {selectedFile && session ? <div className="relative h-full w-full">
-                <iframe ref={diffFrameRef} key={`${session.id}:${selected}`} title={`Semantic diff for ${selectedFile.display_path}`} src={`/semanticdiff-view/${session.id}/${selected}`} onLoad={() => setDiffLoading(false)} onError={() => { setDiffLoading(false); setStatus("Unable to render the semantic diff for this file.") }} className="h-full w-full border-0 bg-card" sandbox="allow-scripts allow-same-origin" />
-                {diffLoading && <div className="absolute inset-0 grid place-items-center bg-card/80 backdrop-blur-[2px]" role="status" aria-live="polite"><div className="flex items-center gap-2 rounded-full bg-muted/80 px-4 py-2 text-sm text-muted-foreground shadow-sm"><LoaderCircle className="size-4 animate-spin text-primary" /> Loading file…</div></div>}
-              </div> : <div className="grid h-full place-items-center p-8 text-center text-sm text-muted-foreground"><div><FileDiff className="mx-auto mb-3 size-8 opacity-40" /><p>Pick a file from the tree.</p><p className="mt-1 text-xs">SemanticDiff will compute and render the language-aware view here.</p></div></div>}
+              {selectedFile && session && selected !== null ? <DiffViewer key={`${session.id}:${selected}`} sessionId={session.id} index={selected} path={selectedFile.display_path} frameRef={diffFrameRef} /> : <div className="grid h-full place-items-center p-8 text-center text-sm text-muted-foreground"><div><FileDiff className="mx-auto mb-3 size-8 opacity-40" /><p>Pick a file from the tree.</p><p className="mt-1 text-xs">Select a file to review its text or semantic diff.</p></div></div>}
             </CardContent>
           </Card>
         </div>

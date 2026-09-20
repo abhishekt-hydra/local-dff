@@ -49,9 +49,9 @@ fn main() {
     )
     .expect("could not embed SemanticDiff webview assets");
     let runtime_dir = embedded_dir.join("semanticdiff-runtime");
-    copy_tree(&semanticdiff_parsers, &runtime_dir.join("bin"))
+    compress_tree(&semanticdiff_parsers, &runtime_dir.join("bin"))
         .expect("could not embed SemanticDiff CLI and language parsers");
-    copy_tree(&semanticdiff_lib, &runtime_dir.join("lib"))
+    compress_tree(&semanticdiff_lib, &runtime_dir.join("lib"))
         .expect("could not embed SemanticDiff runtime libraries");
 
     watch_tree(&web_dist).expect("could not watch React assets");
@@ -103,6 +103,23 @@ fn copy_tree(source: &Path, destination: &Path) -> io::Result<()> {
             copy_tree(&source_path, &destination_path)?;
         } else {
             fs::copy(source_path, destination_path)?;
+        }
+    }
+    Ok(())
+}
+
+// Executable parsers dominate the bundle. Compress only the embedded copies;
+// runtime extraction restores the original bytes before setting permissions.
+fn compress_tree(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let target = destination.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            compress_tree(&entry.path(), &target)?;
+        } else {
+            let encoded = zstd::stream::encode_all(fs::File::open(entry.path())?, 9)?;
+            fs::write(target, encoded)?;
         }
     }
     Ok(())

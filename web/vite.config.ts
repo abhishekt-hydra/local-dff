@@ -12,10 +12,9 @@ export default defineConfig({
       preserveEntrySignatures: "strict",
       input: {
         index: fileURLToPath(new URL("./index.html", import.meta.url)),
-        semanticHighlight: fileURLToPath(new URL("./src/semantic-highlight.ts", import.meta.url)),
       },
       output: {
-        entryFileNames: (chunk) => chunk.name === "semanticHighlight" ? "assets/semantic-highlight.js" : "assets/[name]-[hash].js",
+        entryFileNames: "assets/[name]-[hash].js",
       },
     },
   },
