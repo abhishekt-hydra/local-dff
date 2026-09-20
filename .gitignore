@@ -4,6 +4,7 @@
 .DS_Store
 /web/node_modules/
 /web/dist/
-/local-debug/node_modules/
-/local-debug/screenshots/
-/local-debug/local-diffe.log
+/web/dist-profile/
+/local-debug/
+/.optmem/
+.env

@@ -75,3 +75,17 @@ button, input { font: inherit; }
    tonal shifts, with borders reserved for keyboard focus only. */
 button, input, [role="button"] { -webkit-tap-highlight-color: transparent; }
 ::selection { background: oklch(.78 .14 250 / .35); }
+
+@keyframes loading-sheen {
+  from { transform: translateX(-140%); }
+  to { transform: translateX(420%); }
+}
+
+@keyframes loading-dots {
+  0%, 20% { opacity: .2; }
+  50% { opacity: 1; }
+  80%, 100% { opacity: .2; }
+}
+
+.loading-sheen { animation: loading-sheen 1.25s ease-in-out infinite; }
+.loading-dots { display: inline-block; min-width: 1.25rem; letter-spacing: .12em; animation: loading-dots 1.2s ease-in-out infinite; }

@@ -47,8 +47,12 @@ const GITHUB_GIT_CREDENTIAL_HELPER: &str = "credential.helper=!gh auth git-crede
 )]
 struct Args {
     /// Address to listen on.
-    #[arg(long, default_value = "0.0.0.0:4317")]
-    listen: SocketAddr,
+    #[arg(long)]
+    listen: Option<SocketAddr>,
+
+    /// Port to listen on when --listen is not supplied.
+    #[arg(long, env = "LOCAL_DIFFE_PORT", default_value_t = 3333)]
+    port: u16,
 
     /// Directory for SemanticDiff, GitHub repository, and pull-request caches.
     #[arg(long, env = "LOCAL_DIFFE_CACHE_DIR", value_name = "DIR")]
@@ -198,7 +202,11 @@ impl IntoResponse for ApiError {
 
 #[tokio::main]
 async fn main() {
+    dotenvy::dotenv().ok();
     let args = Args::parse();
+    let listen = args
+        .listen
+        .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], args.port)));
     let cache_dir = args.cache_dir.unwrap_or_else(default_cache_dir);
     let semanticdiff_bin = extract_semanticdiff(&cache_dir).unwrap_or_else(|error| {
         eprintln!("Could not prepare embedded SemanticDiff: {error}");
@@ -230,8 +238,8 @@ async fn main() {
         .layer(DefaultBodyLimit::max(25 * 1024 * 1024))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(args.listen).await.unwrap();
-    println!("Local Diffe listening at http://{}", args.listen);
+    let listener = tokio::net::TcpListener::bind(listen).await.unwrap();
+    println!("Local Diffe listening at http://{}", listen);
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -753,7 +761,13 @@ async fn cached_github_repo(cache_dir: &FsPath, github_repo: &str) -> Result<Pat
     let destination_string = destination.to_string_lossy().to_string();
     let output = Command::new("git")
         .args(["-c", GITHUB_GIT_CREDENTIAL_HELPER])
-        .args(["clone", &remote_url, &destination_string])
+        .args([
+            "clone",
+            "--filter=blob:none",
+            "--no-checkout",
+            &remote_url,
+            &destination_string,
+        ])
         .output()
         .await
         .map_err(|error| ApiError::internal(format!("Could not run git: {error}")))?;
@@ -1101,6 +1115,19 @@ async fn semanticdiff_view(
         .replace('<', "\\u003c")
         .replace('>', "\\u003e")
         .replace('&', "\\u0026");
+    let highlight_input = serde_json::to_string(&json!({
+        "old": result.old_content,
+        "new": result.new_content,
+        "oldPath": result.file.old_path.as_deref().unwrap_or(""),
+        "newPath": result.file.new_path.as_deref().unwrap_or("")
+    }))
+    .unwrap()
+    .replace('<', "\\u003c")
+    .replace('>', "\\u003e")
+    .replace('&', "\\u0026");
+    let highlighting_bridge = format!(
+        "<script>window.initialHighlightInput={highlight_input};</script><script type=\"module\" src=\"/assets/semantic-viewer.js\"></script>"
+    );
     let template = asset_text(&SEMANTICDIFF_WEBVIEW, "index.html").ok_or_else(|| {
         ApiError::internal("Embedded SemanticDiff webview is missing index.html.")
     })?;
@@ -1111,11 +1138,12 @@ async fn semanticdiff_view(
     let readiness_bridge = format!("<script>{}</script>", include_str!("semantic-bridge.js"));
     let html = template
         .replace("${webview.cspSource}", "'self'")
+        .replace("default-src 'self';", "default-src 'self'; worker-src 'self' blob:;")
         .replace("${baseURL}", "/semanticdiff-assets")
         .replace("${ initialState }", &state_json)
         .replace(
             "<script src=\"script.js\"></script>",
-            &format!("{readiness_bridge}{bridge}{keyboard_bridge}"),
+            &format!("{readiness_bridge}{bridge}{keyboard_bridge}{highlighting_bridge}"),
         );
     Ok(Html(html))
 }

@@ -6,20 +6,22 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "build:profile": "tsc -b && vite build --mode profile",
+    "preview": "vite preview",
+    "preview:profile": "vite preview --mode profile"
   },
   "dependencies": {
     "@radix-ui/react-popover": "^1.1.23",
     "@radix-ui/react-scroll-area": "latest",
     "@radix-ui/react-slot": "latest",
-    "@vitejs/plugin-react": "latest",
+    "@vitejs/plugin-react": "6.1.1",
     "class-variance-authority": "latest",
     "clsx": "latest",
     "cmdk": "^1.1.1",
     "lucide-react": "latest",
-    "react": "latest",
+    "react": "19.3.0",
     "react-arborist": "latest",
-    "react-dom": "latest",
+    "react-dom": "19.3.0",
     "shadcn": "latest",
     "shiki": "^4.4.3",
     "tailwind-merge": "latest",
@@ -29,9 +31,9 @@
   "devDependencies": {
     "@tailwindcss/vite": "latest",
     "@types/node": "latest",
-    "@types/react": "latest",
-    "@types/react-dom": "latest",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
     "typescript": "latest",
-    "vite": "latest"
+    "vite": "8.3.0"
   }
 }

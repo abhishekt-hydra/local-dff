@@ -1,0 +1,74 @@
+<html>
+    <head>
+        <meta charset="UTF-8">
+        <meta http-equiv="Content-Security-Policy"
+            content="default-src ${webview.cspSource}; script-src ${webview.cspSource} 'unsafe-inline'; style-src ${webview.cspSource} 'unsafe-inline'; img-src ${webview.cspSource} https:;" />
+
+        <base href="${baseURL}/">
+
+        <title>SemanticDiff</title>
+        <link rel="stylesheet" type="text/css" href="style.css">
+        <link rel="stylesheet" type="text/css" href="codicon/codicon.css">
+    </head>
+    <body>
+        <script type="module" src="toolkit.min.js"></script>
+
+        <div class="viewer">
+            <div class="viewer__left">
+                <div id="stickyHeader" class="viewer__header">
+                    <div id="infoMessage" class="info-message" style="display: none;">
+                        <div class="icon codicon codicon-info"></div>
+                        <div class="text">Message</div>
+                        <div id="closeInfo" class="close codicon codicon-close"></div>
+                    </div>
+                    <div id="path" class="path">
+                        <span id="old-path" class="path-elements"></span>
+                        <span id="path-separator" class="path-separator codicon codicon-arrow-right"></span>
+                        <span id="new-path" class="path-elements"></span>
+                    </div>
+                </div>
+
+                <div class="viewer__patch">
+
+                    <div id="errorNotification" class="error-notification" style="display: none;">
+                        <div class="icon codicon codicon-error"></div>
+                        <div class="text">Message</div>
+                        <vscode-button id="closeError" appearance="primary">Close</vscode-button>
+                        <vscode-button id="showParserError" appearance="secondary">Show Errors</vscode-button>
+                    </div>
+
+                    <div id="patch" class="patch" style="display: none;">
+                        <div class="sizing" style="visibility: hidden;">
+                            <div id="headerExample" class="header" style="display: inline-block">
+                                <div style="display: inline-block">X</div>
+                            </div>
+                            <div id="lineExample" class="line" style="display: inline-block">
+                                <div style="display: inline-block">X</div>
+                            </div>
+                            <div id="codeExample" class="code-fg" style="display: inline-block">
+                                <div style="display: inline-block">X</div>
+                            </div>
+                        </div>
+                        <div id="noChangeNotification" class="no-change-notification" style="display: none;">
+                            <div class="text">No logic changes found</div>
+                            <vscode-button id="showAll" appearance="primary">Show Anyways</vscode-button>
+                        </div>
+                        <div id="placeholder">
+                            <div class="separator"></div>
+                        </div>
+                    </div>
+                    <div id="image-diff" style="display: none;"></div>
+
+                </div>
+            </div>
+            <div class="viewer__right" style="display: none;">
+                <canvas id="minimap"></canvas>
+            </div>
+        </div>
+
+        <script>
+            initialState = ${ initialState };
+        </script>
+        <script src="script.js"></script>
+    </body>
+</html>

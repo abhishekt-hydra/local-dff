@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { createContext, memo, Profiler, useCallback, useContext, useDeferredValue, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react"
 import { Tree, type NodeRendererProps } from "react-arborist"
 import {
   ChevronRight,
@@ -29,13 +29,15 @@ import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, Command
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { cn } from "@/lib/utils"
 import { DiffViewer } from "@/components/DiffViewer"
+import { buildFileNavigation, makeTree, type TreeItem } from "./sidebarTree"
+import { PERFORMANCE_BUILD_ENABLED, onRender } from "./lib/performance"
 
 type PatchFile = { old_path: string | null; new_path: string | null; display_path: string; renderable: boolean }
 type Revision = { revision: string; commit: string }
 type PullRequest = { number: number; title: string; url: string; state: string; baseRefName: string; headRefName: string; isDraft: boolean; author?: { login: string } | null; updatedAt: string }
 type Comparison = { base: Revision; target: Revision; changed_paths: number; semantic_paths: number; description: string; pull_request?: PullRequest | null }
 type Session = { id: string; files: PatchFile[]; comparison?: Comparison | null }
-type TreeItem = { id: string; name: string; children?: TreeItem[]; fileIndex?: number; renderable?: boolean }
+const EMPTY_FILES: PatchFile[] = []
 
 type ReviewRegion = "sidebar" | "diff"
 
@@ -45,28 +47,126 @@ function isEditableTarget(target: EventTarget | null) {
 
 const initialRepo = "/Users/abhishek/hydradb/hydradb-application"
 
-function makeTree(files: PatchFile[]): TreeItem[] {
-  const roots: TreeItem[] = []
-  for (const [fileIndex, file] of files.entries()) {
-    const parts = file.display_path.split("/").filter(Boolean)
-    let level = roots
-    let id = ""
-    parts.forEach((name, partIndex) => {
-      id = id ? `${id}/${name}` : name
-      let node = level.find((candidate) => candidate.id === id)
-      if (!node) {
-        node = { id, name, children: partIndex === parts.length - 1 ? undefined : [] }
-        level.push(node)
-      }
-      if (partIndex === parts.length - 1) {
-        node.fileIndex = fileIndex
-        node.renderable = file.renderable
-      }
-      else level = node.children ?? (node.children = [])
-    })
+// Session ids are fresh UUIDs per comparison, so viewed state is keyed by the
+// revisions under review and stored as display paths: both survive a reload and
+// a re-generated session whose file order changed.
+function viewedStorageKey(session: Session | null) {
+  if (!session) return null
+  const comparison = session.comparison
+  if (comparison) {
+    const scope = comparison.pull_request ? `pr-${comparison.pull_request.number}` : `${comparison.base.revision}..${comparison.target.revision}`
+    return `local-diffe:viewed:${scope}:${comparison.base.commit}:${comparison.target.commit}`
   }
-  return roots
+  return `local-diffe:viewed:patch:${session.files.length}:${session.files[0]?.display_path ?? ""}`
 }
+
+function readViewedPaths(key: string) {
+  try {
+    const stored = JSON.parse(window.localStorage.getItem(key) ?? "[]")
+    return new Set<string>(Array.isArray(stored) ? stored.filter((entry): entry is string => typeof entry === "string") : [])
+  } catch {
+    return new Set<string>()
+  }
+}
+
+type TreeRowProps = NodeRendererProps<TreeItem> & {
+  active: boolean
+  viewed: boolean
+  sidebarScale: number
+  sidebarFontSize: number
+  sidebarRowHeight: number
+  sidebarIconSize: number
+  sidebarGap: number
+  sidebarPadding: number
+  onSelectFile: (fileIndex: number) => void
+}
+
+const TreeRow = memo(function TreeRow({
+  node,
+  style,
+  dragHandle,
+  active,
+  viewed,
+  sidebarScale,
+  sidebarFontSize,
+  sidebarRowHeight,
+  sidebarIconSize,
+  sidebarGap,
+  sidebarPadding,
+  onSelectFile,
+}: TreeRowProps) {
+  const item = node.data
+  const isFile = item.fileIndex !== undefined
+  const canRender = !isFile || item.renderable !== false
+  return (
+    <div style={{ ...style, paddingRight: Math.max(1, Math.round(4 * sidebarScale)) }} ref={dragHandle}>
+      <button
+        type="button"
+        data-file-index={isFile ? item.fileIndex : undefined}
+        onClick={() => isFile ? canRender && onSelectFile(item.fileIndex!) : node.toggle()}
+        title={isFile && !canRender ? "Empty or metadata-only Git change — no semantic text diff" : undefined}
+        style={{ fontSize: sidebarFontSize, height: sidebarRowHeight, gap: sidebarGap, paddingInline: sidebarPadding }}
+        className={cn("flex w-full items-center rounded text-left hover:bg-accent", active && "bg-accent text-accent-foreground", !canRender && "cursor-default opacity-45 hover:bg-transparent")}
+      >
+        {isFile ? <span className="shrink-0" style={{ width: sidebarIconSize }} /> : <ChevronRight style={{ width: sidebarIconSize, height: sidebarIconSize }} className={cn("shrink-0 transition-transform", node.isOpen && "rotate-90")} />}
+        {isFile ? <FileCode2 style={{ width: sidebarIconSize, height: sidebarIconSize }} className={cn("shrink-0", canRender ? "text-sky-600" : "text-muted-foreground")} /> : node.isOpen ? <FolderOpen style={{ width: sidebarIconSize, height: sidebarIconSize }} className="shrink-0 text-amber-500" /> : <Folder style={{ width: sidebarIconSize, height: sidebarIconSize }} className="shrink-0 text-amber-500" />}
+        <span className="truncate">{item.name}</span>
+        {isFile && viewed && <span className="ml-auto shrink-0 text-emerald-600" title="Viewed"><Check aria-hidden="true" style={{ width: sidebarIconSize, height: sidebarIconSize }} /><span className="sr-only">Viewed</span></span>}
+      </button>
+    </div>
+  )
+})
+
+type SidebarTreeContextValue = Omit<TreeRowProps, "node" | "style" | "dragHandle" | "tree" | "active" | "viewed"> & {
+  selected: number | null
+  viewedFiles: ReadonlySet<number>
+}
+const SidebarTreeContext = createContext<SidebarTreeContextValue | null>(null)
+
+const SidebarTreeRow = (props: NodeRendererProps<TreeItem>) => {
+  const context = useContext(SidebarTreeContext)
+  if (!context) return null
+  const fileIndex = props.node.data.fileIndex
+  const { selected, viewedFiles, ...rowProps } = context
+  return <TreeRow {...props} {...rowProps} active={fileIndex !== undefined && fileIndex === selected} viewed={fileIndex !== undefined && viewedFiles.has(fileIndex)} />
+}
+
+function SidebarProfilerBoundary({ children }: { children: ReactNode }) {
+  return PERFORMANCE_BUILD_ENABLED ? <Profiler id="Sidebar" onRender={onRender}>{children}</Profiler> : <>{children}</>
+}
+
+const SidebarTree = memo(function SidebarTree({
+  tree,
+  treeHeight,
+  rowHeight,
+  indent,
+  searchTerm,
+  selected,
+  viewedFiles,
+  sidebarScale,
+  sidebarFontSize,
+  sidebarIconSize,
+  sidebarGap,
+  sidebarPadding,
+  onSelectFile,
+}: {
+  tree: TreeItem[]
+  treeHeight: number
+  rowHeight: number
+  indent: number
+  searchTerm: string
+  selected: number | null
+  viewedFiles: ReadonlySet<number>
+  sidebarScale: number
+  sidebarFontSize: number
+  sidebarIconSize: number
+  sidebarGap: number
+  sidebarPadding: number
+  onSelectFile: (fileIndex: number) => void
+}) {
+  const context = useMemo(() => ({ selected, viewedFiles, sidebarScale, sidebarFontSize, sidebarRowHeight: rowHeight, sidebarIconSize, sidebarGap, sidebarPadding, onSelectFile }), [onSelectFile, rowHeight, selected, sidebarFontSize, sidebarGap, sidebarIconSize, sidebarPadding, sidebarScale, viewedFiles])
+  return <SidebarTreeContext.Provider value={context}><Tree<TreeItem> data={tree} width="100%" height={treeHeight} rowHeight={rowHeight} indent={indent} openByDefault disableDrag disableDrop searchTerm={searchTerm}>{SidebarTreeRow}</Tree></SidebarTreeContext.Provider>
+})
 
 async function api<T>(path: string, payload: unknown): Promise<T> {
   const response = await fetch(path, {
@@ -105,39 +205,112 @@ export default function App() {
   const sidebarContentRef = useRef<HTMLDivElement>(null)
   const diffPanelRef = useRef<HTMLDivElement>(null)
   const diffFrameRef = useRef<HTMLIFrameElement>(null)
+  const resizeOriginLeftRef = useRef(0)
+  const resizePendingWidthRef = useRef<number | null>(null)
+  const resizeFrameRef = useRef<number | null>(null)
+  const hydratedViewedKeyRef = useRef<string | null>(null)
+  const textViewportCacheRef = useRef<HTMLElement | null | undefined>(undefined)
+  const semanticScrollCacheRef = useRef<{ document: Document; target: HTMLElement | null } | undefined>(undefined)
   const [treeHeight, setTreeHeight] = useState(480)
-  const tree = useMemo(() => makeTree(session?.files ?? []), [session])
+  const files = session?.files ?? EMPTY_FILES
+  const tree = useMemo(() => makeTree(files), [files])
+  const fileNavigation = useMemo(() => buildFileNavigation(files), [files])
+  const deferredSearch = useDeferredValue(search)
   const selectedPull = useMemo(() => pulls.find((pull) => String(pull.number) === prNumber), [pulls, prNumber])
+  const viewedKey = useMemo(() => viewedStorageKey(session), [session])
   const sidebarScale = sidebarFontSize / 12
   const sidebarRowHeight = Math.max(20, Math.round(28 * sidebarScale))
   const sidebarIconSize = Math.max(11, Math.round(14 * sidebarScale))
   const sidebarGap = Math.max(2, Math.round(6 * sidebarScale))
   const sidebarPadding = Math.max(2, Math.round(6 * sidebarScale))
 
+  const startSidebarResize = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
+    event.preventDefault()
+    // Capture the stable grid origin once at drag start. Pointer moves only
+    // update the pending width and are committed at most once per frame.
+    resizeOriginLeftRef.current = reviewGrid.current?.getBoundingClientRect().left ?? 0
+    resizePendingWidthRef.current = null
+    setResizingSidebar(true)
+  }, [])
+
   useEffect(() => {
     if (!resizingSidebar) return
-    const resize = (event: PointerEvent) => {
-      const left = reviewGrid.current?.getBoundingClientRect().left ?? 0
-      setSidebarWidth(Math.max(220, Math.min(760, event.clientX - left)))
+    const resize = (event: globalThis.PointerEvent) => {
+      resizePendingWidthRef.current = Math.max(220, Math.min(760, event.clientX - resizeOriginLeftRef.current))
+      if (resizeFrameRef.current !== null) return
+      resizeFrameRef.current = requestAnimationFrame(() => {
+        resizeFrameRef.current = null
+        const nextWidth = resizePendingWidthRef.current
+        if (nextWidth !== null) setSidebarWidth((current) => current === nextWidth ? current : nextWidth)
+      })
     }
-    const stop = () => setResizingSidebar(false)
+    const stop = () => {
+      if (resizeFrameRef.current !== null) cancelAnimationFrame(resizeFrameRef.current)
+      resizeFrameRef.current = null
+      const nextWidth = resizePendingWidthRef.current
+      resizePendingWidthRef.current = null
+      if (nextWidth !== null) setSidebarWidth((current) => current === nextWidth ? current : nextWidth)
+      setResizingSidebar(false)
+    }
     window.addEventListener("pointermove", resize)
     window.addEventListener("pointerup", stop, { once: true })
     return () => {
       window.removeEventListener("pointermove", resize)
       window.removeEventListener("pointerup", stop)
+      if (resizeFrameRef.current !== null) cancelAnimationFrame(resizeFrameRef.current)
+      resizeFrameRef.current = null
     }
   }, [resizingSidebar])
 
   useEffect(() => {
     const element = sidebarContentRef.current
     if (!element) return
-    const updateHeight = () => setTreeHeight(Math.max(160, Math.floor(element.clientHeight - 4)))
-    updateHeight()
-    const observer = new ResizeObserver(updateHeight)
+    const updateHeight = (entry: ResizeObserverEntry) => {
+      // The tree is a flex child inside the sidebar card. Reading its own
+      // height while assigning the tree height creates a positive feedback
+      // loop through the grid's intrinsic row size. `contain:size` on the
+      // body removes that intrinsic contribution; contentRect is the body's
+      // content box and tracks the fixed grid/diff-panel height.
+      const nextHeight = Math.max(160, Math.floor(entry.contentRect.height))
+      setTreeHeight((current) => current === nextHeight ? current : nextHeight)
+    }
+    const observer = new ResizeObserver(([entry]) => updateHeight(entry))
     observer.observe(element)
     return () => observer.disconnect()
   }, [session, chromeHidden])
+
+  useEffect(() => {
+    if (!viewedKey) {
+      hydratedViewedKeyRef.current = null
+      return
+    }
+    const paths = readViewedPaths(viewedKey)
+    const restored = new Set<number>()
+    files.forEach((file, index) => { if (paths.has(file.display_path)) restored.add(index) })
+    hydratedViewedKeyRef.current = viewedKey
+    setViewedFiles(restored)
+  }, [files, viewedKey])
+
+  useEffect(() => {
+    // Only write once this key's stored state has been read back, so the empty
+    // set a fresh session starts with never erases what was saved for it.
+    if (!viewedKey || hydratedViewedKeyRef.current !== viewedKey) return
+    const paths = [...viewedFiles].map((index) => files[index]?.display_path).filter((path): path is string => Boolean(path))
+    try {
+      if (paths.length) window.localStorage.setItem(viewedKey, JSON.stringify(paths))
+      else window.localStorage.removeItem(viewedKey)
+    } catch {
+      // Private browsing or a full quota: viewed state stays in-memory only.
+    }
+  }, [files, viewedFiles, viewedKey])
+
+  useEffect(() => {
+    // DiffViewer replaces both viewports when the selected file changes.
+    // Keyboard scrolling validates connected cached nodes and retries when a
+    // renderer has not mounted yet, so no subtree observer is needed here.
+    textViewportCacheRef.current = undefined
+    semanticScrollCacheRef.current = undefined
+  }, [selected, session?.id])
 
   const loadSession = async (endpoint: string, payload: unknown, progress: string) => {
     setLoading(true)
@@ -201,35 +374,45 @@ export default function App() {
   }, [])
 
   const focusDiff = useCallback(() => {
-    const firstRenderable = session?.files.findIndex((file) => file.renderable)
-    if (selected === null && firstRenderable !== undefined && firstRenderable >= 0) setSelected(firstRenderable)
+    const firstRenderable = fileNavigation.indices[0]
+    if (selected === null && firstRenderable !== undefined) setSelected(firstRenderable)
     setActiveRegion("diff")
-  }, [selected, session])
+  }, [fileNavigation, selected])
 
   const moveFile = useCallback((direction: 1 | -1) => {
-    const files = session?.files ?? []
-    const available = files.flatMap((file, index) => file.renderable ? [index] : [])
-    if (!available.length) return
-    const current = selected === null ? -1 : available.indexOf(selected)
+    const { indices, positions } = fileNavigation
+    if (!indices.length) return
+    const current = selected === null ? -1 : (positions.get(selected) ?? -1)
     const next = current === -1
-      ? (direction === 1 ? 0 : available.length - 1)
-      : (current + direction + available.length) % available.length
-    setSelected(available[next])
-  }, [selected, session])
+      ? (direction === 1 ? 0 : indices.length - 1)
+      : (current + direction + indices.length) % indices.length
+    setSelected(indices[next])
+  }, [fileNavigation, selected])
 
   const scrollDiff = useCallback((direction: 1 | -1) => {
-    const frame = diffFrameRef.current
-    const textViewport = diffPanelRef.current?.querySelector<HTMLElement>('[data-testid="diff-scroll"]')
+    const panel = diffPanelRef.current
+    let textViewport = textViewportCacheRef.current
+    if (!textViewport || !textViewport.isConnected || !panel?.contains(textViewport)) {
+      textViewport = panel?.querySelector<HTMLElement>('[data-testid="diff-scroll"]') ?? null
+      textViewportCacheRef.current = textViewport
+    }
     if (textViewport) {
       textViewport.scrollBy({ top: Math.max(160, textViewport.clientHeight * 0.72) * direction })
       return
     }
+    const frame = diffFrameRef.current
     const document = frame?.contentDocument
     const viewport = frame?.contentWindow
     if (!document || !viewport) return
-    const scrollTarget = [document.scrollingElement, ...document.querySelectorAll<HTMLElement>("*")]
-      .filter((element): element is HTMLElement => Boolean(element && element.scrollHeight > element.clientHeight + 1))
-      .sort((left, right) => (right.scrollHeight - right.clientHeight) - (left.scrollHeight - left.clientHeight))[0]
+    let scrollTarget = semanticScrollCacheRef.current?.document === document
+      ? semanticScrollCacheRef.current.target
+      : null
+    if (!scrollTarget || !scrollTarget.isConnected || scrollTarget.ownerDocument !== document || scrollTarget.scrollHeight <= scrollTarget.clientHeight + 1) {
+      scrollTarget = [document.scrollingElement, ...document.querySelectorAll<HTMLElement>("*")]
+        .filter((element): element is HTMLElement => Boolean(element && element.scrollHeight > element.clientHeight + 1))
+        .sort((left, right) => (right.scrollHeight - right.clientHeight) - (left.scrollHeight - left.clientHeight))[0] ?? null
+      semanticScrollCacheRef.current = scrollTarget ? { document, target: scrollTarget } : undefined
+    }
     const distance = Math.max(160, Math.round(viewport.innerHeight * 0.72)) * direction
     if (scrollTarget) {
       const nextTop = Math.max(0, Math.min(scrollTarget.scrollHeight - scrollTarget.clientHeight, scrollTarget.scrollTop + distance))
@@ -332,29 +515,7 @@ export default function App() {
     }
   }, [keyboardOverlay, runOverlayCommand, showKeyboardHelp, toggleKeyboardOverlay])
 
-  const renderNode = ({ node, style, dragHandle }: NodeRendererProps<TreeItem>) => {
-    const item = node.data
-    const isFile = item.fileIndex !== undefined
-    const canRender = !isFile || item.renderable !== false
-    const active = isFile && item.fileIndex === selected
-    return (
-      <div style={{ ...style, paddingRight: Math.max(1, Math.round(4 * sidebarScale)) }} ref={dragHandle}>
-        <button
-          type="button"
-          data-file-index={isFile ? item.fileIndex : undefined}
-          onClick={() => isFile ? canRender && setSelected(item.fileIndex!) : node.toggle()}
-          title={isFile && !canRender ? "Empty or metadata-only Git change — no semantic text diff" : undefined}
-          style={{ fontSize: sidebarFontSize, height: sidebarRowHeight, gap: sidebarGap, paddingInline: sidebarPadding }}
-          className={cn("flex w-full items-center rounded text-left hover:bg-accent", active && "bg-accent text-accent-foreground", !canRender && "cursor-default opacity-45 hover:bg-transparent")}
-        >
-          {isFile ? <span className="shrink-0" style={{ width: sidebarIconSize }} /> : <ChevronRight style={{ width: sidebarIconSize, height: sidebarIconSize }} className={cn("shrink-0 transition-transform", node.isOpen && "rotate-90")} />}
-          {isFile ? <FileCode2 style={{ width: sidebarIconSize, height: sidebarIconSize }} className={cn("shrink-0", canRender ? "text-sky-600" : "text-muted-foreground")} /> : node.isOpen ? <FolderOpen style={{ width: sidebarIconSize, height: sidebarIconSize }} className="shrink-0 text-amber-500" /> : <Folder style={{ width: sidebarIconSize, height: sidebarIconSize }} className="shrink-0 text-amber-500" />}
-          <span className="truncate">{item.name}</span>
-          {isFile && viewedFiles.has(item.fileIndex!) && <span className="ml-auto shrink-0 text-emerald-600" title="Viewed"><Check aria-hidden="true" style={{ width: sidebarIconSize, height: sidebarIconSize }} /><span className="sr-only">Viewed</span></span>}
-        </button>
-      </div>
-    )
-  }
+  const selectFile = useCallback((fileIndex: number) => setSelected(fileIndex), [])
 
   const selectedFile = selected === null ? null : session?.files[selected]
   const selectedViewed = selected !== null && viewedFiles.has(selected)
@@ -369,6 +530,7 @@ export default function App() {
   }
   return (
     <div className="min-h-screen bg-muted/40">
+      {loading && <div className="fixed inset-x-0 top-0 z-[60] h-1 overflow-hidden bg-primary/10" role="progressbar" aria-label="Loading comparison"><div className="loading-sheen h-full w-1/3 bg-primary" /></div>}
       {!chromeHidden && <header className="border-b bg-background">
         <div className="flex h-14 w-full items-center gap-3 px-4">
           <div className="flex items-center gap-2 font-semibold"><FileDiff className="size-5 text-primary" /> Local Diffe</div>
@@ -378,6 +540,11 @@ export default function App() {
       </header>}
 
       <main className="flex w-full flex-col gap-4 p-4">
+        {loading && <div className="flex items-center gap-3 rounded-2xl bg-primary/[.07] px-4 py-3 text-sm text-foreground shadow-[0_12px_32px_-28px_rgba(0,113,227,0.8)]" role="status" aria-live="polite">
+          <LoaderCircle className="size-4 shrink-0 animate-spin text-primary" />
+          <span className="min-w-0 truncate">{status}</span>
+          <span className="loading-dots shrink-0 text-primary" aria-hidden="true">•••</span>
+        </div>}
         {chromeHidden && <Button data-testid="show-chrome" size="sm" variant="outline" className="fixed right-4 top-4 z-20 shadow-md" onClick={() => setChromeHidden(false)}><ChevronDown className="size-4" /> Show controls</Button>}
         {!chromeHidden && <><Card>
           <CardContent className="grid gap-3 p-4 lg:grid-cols-[minmax(340px,1fr)_150px_150px_auto_auto] lg:items-end">
@@ -390,8 +557,8 @@ export default function App() {
             <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Compare
               <Input data-testid="target" value={target} onChange={(event) => setTarget(event.target.value)} />
             </label>
-            <Button data-testid="generate-diff" onClick={generate} disabled={loading}><GitBranch className="size-4" /> Generate diff</Button>
-            <Button asChild variant="outline" disabled={loading}><label className="cursor-pointer"><Upload className="size-4" /> Upload patch<input className="hidden" type="file" accept=".diff,.patch,text/plain" onChange={(event) => upload(event.target.files?.[0])} /></label></Button>
+            <Button data-testid="generate-diff" onClick={generate} disabled={loading}>{loading ? <LoaderCircle className="size-4 animate-spin" /> : <GitBranch className="size-4" />} {loading ? "Generating…" : "Generate diff"}</Button>
+            <Button asChild variant="outline" disabled={loading}><label className="cursor-pointer">{loading ? <LoaderCircle className="size-4 animate-spin" /> : <Upload className="size-4" />} {loading ? "Loading…" : "Upload patch"}<input className="hidden" type="file" accept=".diff,.patch,text/plain" onChange={(event) => upload(event.target.files?.[0])} /></label></Button>
           </CardContent>
         </Card>
 
@@ -400,7 +567,7 @@ export default function App() {
             <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">GitHub pull-request URL
               <Input data-testid="pr-url" value={prUrl} onChange={(event) => setPrUrl(event.target.value)} placeholder="https://github.com/owner/repo/pull/123" />
             </label>
-            <Button data-testid="open-pr-url" variant="secondary" onClick={openPrUrl} disabled={loading}><Link className="size-4" /> Open PR</Button>
+            <Button data-testid="open-pr-url" variant="secondary" onClick={openPrUrl} disabled={loading}>{loading ? <LoaderCircle className="size-4 animate-spin" /> : <Link className="size-4" />} {loading ? "Opening…" : "Open PR"}</Button>
             <div className="grid gap-1.5 text-xs font-medium text-muted-foreground">
               <span id="pr-picker-label">Open PRs for repository</span>
               <Popover open={prPickerOpen} onOpenChange={setPrPickerOpen}>
@@ -425,38 +592,43 @@ export default function App() {
                 </PopoverContent>
               </Popover>
             </div>
-            <div className="flex gap-2"><Button data-testid="list-prs" variant="outline" onClick={() => void listPulls()} disabled={loading}><GitPullRequest className="size-4" /> List</Button><Button data-testid="refresh-prs" variant="outline" onClick={() => void listPulls(true)} disabled={loading}><GitPullRequest className="size-4" /> Refresh</Button><Button data-testid="open-selected-pr" onClick={openPull} disabled={loading || !prNumber}><GitBranch className="size-4" /> Review</Button></div>
+            <div className="flex gap-2"><Button data-testid="list-prs" variant="outline" onClick={() => void listPulls()} disabled={loading}>{loading ? <LoaderCircle className="size-4 animate-spin" /> : <GitPullRequest className="size-4" />} {loading ? "Loading…" : "List"}</Button><Button data-testid="refresh-prs" variant="outline" onClick={() => void listPulls(true)} disabled={loading}><GitPullRequest className="size-4" /> Refresh</Button><Button data-testid="open-selected-pr" onClick={openPull} disabled={loading || !prNumber}>{loading ? <LoaderCircle className="size-4 animate-spin" /> : <GitBranch className="size-4" />} {loading ? "Reviewing…" : "Review"}</Button></div>
           </CardContent>
         </Card></>}
 
-        <div ref={reviewGrid} style={{ "--sidebar-width": `${sidebarWidth}px` } as React.CSSProperties} className={cn("grid min-h-[calc(100vh-150px)] gap-4 lg:grid-cols-[minmax(220px,var(--sidebar-width))_minmax(0,1fr)]", chromeHidden && "min-h-[calc(100vh-2rem)]")}>
+        <div ref={reviewGrid} aria-busy={loading} style={{ "--sidebar-width": `${sidebarWidth}px` } as React.CSSProperties} className={cn("grid min-h-[calc(100vh-150px)] gap-4 lg:grid-cols-[minmax(220px,var(--sidebar-width))_minmax(0,1fr)]", chromeHidden && "min-h-[calc(100vh-2rem)]")}>
+          <SidebarProfilerBoundary>
           <Card ref={sidebarRef} tabIndex={-1} aria-label="Changed files sidebar" className={cn("relative flex min-h-0 flex-col overflow-visible outline-none", activeRegion === "sidebar" && keyboardOverlay && "ring-2 ring-primary ring-offset-2")}>
             <CardHeader className="gap-3 rounded-t-lg border-b bg-card p-3"><div className="flex items-center justify-between gap-2"><CardTitle className="text-sm">Changed files {session && <span className="font-normal text-muted-foreground">({session.comparison?.changed_paths ?? session.files.length})</span>}</CardTitle><div className="flex items-center gap-0.5"><Button type="button" size="icon" variant="ghost" className="size-7" title="Smaller file text" onClick={() => setSidebarFontSize((size) => Math.max(10, size - 1))}><Minus className="size-3.5" /></Button><span className="w-7 text-center text-[10px] text-muted-foreground" title="File sidebar font size">{sidebarFontSize}px</span><Button type="button" size="icon" variant="ghost" className="size-7" title="Larger file text" onClick={() => setSidebarFontSize((size) => Math.min(18, size + 1))}><Plus className="size-3.5" /></Button><span className="mx-1 h-4 border-l" /><Button type="button" size="icon" variant="ghost" className="size-7" title="Make file sidebar narrower" onClick={() => setSidebarWidth((width) => Math.max(220, width - 40))}><Minus className="size-3.5" /></Button><Button type="button" size="icon" variant="ghost" className="size-7" title="Make file sidebar wider" onClick={() => setSidebarWidth((width) => Math.min(760, width + 40))}><Plus className="size-3.5" /></Button></div></div>
               <div className="relative"><Search className="pointer-events-none absolute left-2 top-2 size-3.5 text-muted-foreground" /><Input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Filter files" className="h-8 pl-7 text-xs" /></div>
             </CardHeader>
-            <CardContent ref={sidebarContentRef} className="min-h-0 flex-1 overflow-hidden rounded-b-2xl bg-card p-2">
-              {tree.length ? <Tree<TreeItem> data={tree} width="100%" height={treeHeight} rowHeight={sidebarRowHeight} indent={Math.max(9, Math.round(14 * sidebarScale))} openByDefault disableDrag disableDrop searchTerm={search}>{renderNode}</Tree> : <p className="p-3 text-xs text-muted-foreground">Generate a Git diff or upload a patch to populate the file tree.</p>}
+            <CardContent ref={sidebarContentRef} style={{ contain: "size" }} className="min-h-[240px] flex-1 overflow-hidden lg:min-h-0 rounded-b-2xl bg-card p-2">
+              {tree.length ? <SidebarTree tree={tree} treeHeight={treeHeight} rowHeight={sidebarRowHeight} indent={Math.max(9, Math.round(14 * sidebarScale))} searchTerm={deferredSearch} selected={selected} viewedFiles={viewedFiles} sidebarScale={sidebarScale} sidebarFontSize={sidebarFontSize} sidebarIconSize={sidebarIconSize} sidebarGap={sidebarGap} sidebarPadding={sidebarPadding} onSelectFile={selectFile} /> : loading ? <div className="grid h-full place-items-center p-6 text-center text-sm text-muted-foreground"><div><LoaderCircle className="mx-auto mb-3 size-6 animate-spin text-primary" /><p>Preparing changed files<span className="loading-dots text-primary" aria-hidden="true">•••</span></p><p className="mt-1 text-xs">Large pull requests can take a moment to index.</p></div></div> : <p className="p-3 text-xs text-muted-foreground">Generate a Git diff or upload a patch to populate the file tree.</p>}
             </CardContent>
             <div className="flex items-center justify-between gap-3 px-4 pb-4 pt-2 text-[11px] text-muted-foreground">
               <span>{session ? `${session.files.length} ${session.files.length === 1 ? "file" : "files"}` : "No comparison loaded"}</span>
               {session && <span>{viewedFiles.size} viewed</span>}
             </div>
-            <button type="button" aria-label="Resize file sidebar" title="Drag to resize the file sidebar" onPointerDown={(event) => { event.preventDefault(); setResizingSidebar(true) }} className={cn("absolute -right-3 top-0 z-10 hidden h-full w-6 cursor-col-resize touch-none items-center justify-center lg:flex", resizingSidebar && "bg-primary/5")}><span className="grid h-12 w-3 place-items-center rounded-full border bg-background text-muted-foreground shadow-sm"><GripVertical className="size-3" /></span></button>
+            <button type="button" aria-label="Resize file sidebar" title="Drag to resize the file sidebar" onPointerDown={startSidebarResize} className={cn("absolute -right-3 top-0 z-10 hidden h-full w-6 cursor-col-resize touch-none items-center justify-center lg:flex", resizingSidebar && "bg-primary/5")}><span className="grid h-12 w-3 place-items-center rounded-full border bg-background text-muted-foreground shadow-sm"><GripVertical className="size-3" /></span></button>
           </Card>
+          </SidebarProfilerBoundary>
 
           <Card ref={diffPanelRef} tabIndex={-1} aria-label="Semantic diff panel" className={cn("min-h-0 overflow-hidden outline-none", activeRegion === "diff" && keyboardOverlay && "ring-2 ring-primary ring-offset-2")}>
-            <CardHeader className={cn("flex-row items-center justify-between gap-3 space-y-0 border-b", chromeHidden ? "h-8 px-3 py-1" : "p-3")}>
+            {/* The floating "Show controls" button is fixed at the top-right of
+                the viewport, so the collapsed header reserves room for it and
+                keeps the viewed checkbox clickable underneath. */}
+            <CardHeader className={cn("flex-row items-center justify-between gap-3 space-y-0 border-b", chromeHidden ? "h-8 py-1 pl-3 pr-[180px]" : "p-3")}>
               {chromeHidden ? <CardTitle className="min-w-0 truncate text-xs font-medium text-muted-foreground">{selectedFile?.display_path ?? "Semantic diff"}</CardTitle> : <div className="min-w-0"><CardTitle className="break-all text-sm">{selectedFile?.display_path ?? "Semantic diff"}</CardTitle>{session?.comparison?.pull_request && <a href={session.comparison.pull_request.url} target="_blank" rel="noreferrer" className="mt-1 flex w-fit items-center gap-1 text-xs font-medium text-primary hover:underline"><GitPullRequest className="size-3.5" /> #{session.comparison.pull_request.number} · {session.comparison.pull_request.title}</a>}<p className="mt-1 text-xs text-muted-foreground">{status}</p>{session?.comparison && <p className="mt-1 text-[11px] text-muted-foreground/80">{session.comparison.description}</p>}</div>}
               <div className="flex shrink-0 items-center gap-2">
                 {loading && <LoaderCircle className="size-3.5 animate-spin text-muted-foreground" />}
-                {selectedFile && <Button type="button" data-testid="mark-as-viewed" size="sm" variant={selectedViewed ? "secondary" : "outline"} className={cn(chromeHidden && "h-6")} aria-pressed={selectedViewed} title={selectedViewed ? "Mark as unviewed" : "Mark as viewed"} disabled={loading} onClick={toggleViewed}>
-                  {selectedViewed && <Check aria-hidden="true" className="size-3.5 text-emerald-600" />}
-                  {selectedViewed ? "Viewed" : "Mark as viewed"}
-                </Button>}
+                {selectedFile && <label className={cn("flex shrink-0 cursor-pointer select-none items-center gap-1.5 whitespace-nowrap text-xs font-medium transition-colors", selectedViewed ? "text-emerald-600" : "text-muted-foreground hover:text-foreground", loading && "cursor-default opacity-50")} title={selectedViewed ? "Mark as unviewed" : "Mark as viewed"}>
+                  <input type="checkbox" data-testid="mark-as-viewed" className="size-3.5 shrink-0 cursor-pointer accent-emerald-600" checked={selectedViewed} disabled={loading} onChange={toggleViewed} />
+                  Viewed
+                </label>}
               </div>
             </CardHeader>
             <CardContent className={cn("min-h-[580px] p-0", chromeHidden ? "h-[calc(100vh-4.5rem)]" : "h-[calc(100vh-260px)]")}>
-              {selectedFile && session && selected !== null ? <DiffViewer key={`${session.id}:${selected}`} sessionId={session.id} index={selected} path={selectedFile.display_path} frameRef={diffFrameRef} /> : <div className="grid h-full place-items-center p-8 text-center text-sm text-muted-foreground"><div><FileDiff className="mx-auto mb-3 size-8 opacity-40" /><p>Pick a file from the tree.</p><p className="mt-1 text-xs">Select a file to review its text or semantic diff.</p></div></div>}
+              {selectedFile && session && selected !== null ? <DiffViewer key={`${session.id}:${selected}`} sessionId={session.id} index={selected} path={selectedFile.display_path} frameRef={diffFrameRef} /> : <div className="grid h-full place-items-center p-8 text-center text-sm text-muted-foreground"><div>{loading ? <LoaderCircle className="mx-auto mb-3 size-8 animate-spin text-primary" /> : <FileDiff className="mx-auto mb-3 size-8 opacity-40" />}<p>{loading ? "Building your review" : "Pick a file from the tree."}<span className={cn("loading-dots text-primary", !loading && "hidden")} aria-hidden="true">•••</span></p><p className="mt-1 text-xs">{loading ? "Fetching the pull request and preparing diffs." : "Select a file to review its text or semantic diff."}</p></div></div>}
             </CardContent>
           </Card>
         </div>

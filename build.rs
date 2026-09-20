@@ -21,7 +21,7 @@ fn main() {
     let semanticdiff_bin = extension_dir.join("bin/semanticdiff");
     let semanticdiff_parsers = extension_dir.join("bin");
     let semanticdiff_lib = extension_dir.join("lib");
-    let semanticdiff_webview = extension_dir.join("out/webview");
+    let semanticdiff_webview = manifest_dir.join("vendor/semanticdiff/webview");
 
     require_directory(
         &web_dist,
@@ -33,7 +33,7 @@ fn main() {
     );
     require_directory(
         &semanticdiff_webview,
-        "SemanticDiff webview assets are missing from the Cursor extension.",
+        "Vendored SemanticDiff webview assets are missing from vendor/semanticdiff/webview.",
     );
     require_directory(
         &semanticdiff_lib,

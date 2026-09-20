@@ -6,7 +6,7 @@ default: build
 build: frontend
     cargo build --release --target-dir .build
 
-# Run the packaged-equivalent executable on its default 0.0.0.0:4317 listener.
+# Run the packaged-equivalent executable on its default 0.0.0.0:3333 listener.
 run: package
     ./dist/local-diffe-darwin-arm64
 

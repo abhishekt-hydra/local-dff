@@ -11,7 +11,13 @@ cd /Users/abhishek/hydradb/2026-07/local-diffe
 just run
 ```
 
-Open <http://localhost:4317>. To compare the checked-out branch with staging,
+The port is configured in the root `.env` file: `LOCAL_DIFFE_PORT=3333`.
+Change that one value and restart the server and Vite to use a different port;
+the frontend proxy and local debug scripts read the same setting. The server
+loads `.env` from the working directory or its parents. `--port` overrides the
+setting, and `--listen` overrides the full bind address.
+
+Open <http://localhost:3333>. To compare the checked-out branch with staging,
 leave the repository as `hydradb-application`, retain `origin/staging` / `HEAD`, and
 click **Generate Git diff**. `HEAD` means the repository's currently checked-out
 commit; the fields also accept other branches, tags, or commit IDs.
@@ -63,6 +69,42 @@ LOCAL_DIFFE_CACHE_DIR=/path/to/local-diffe-cache just run
 For frontend iteration, run `cargo run` in one terminal and `npm run dev` from
 `web/` in another. Vite proxies the API and SemanticDiff routes to the Rust
 server.
+
+## Browser performance profiling
+
+Performance telemetry is opt-in. In a profiling build, add `?perf=1` to the
+frontend URL, or set `LOCAL_DIFFE_PERF=1` when building. Samples stay in memory, are
+capped at 200 entries, and are exposed through the local
+`window.__LOCAL_DIFFE_PERF__` handle; they are never sent to a network service.
+The normal production build removes the telemetry and React profiling renderer;
+adding a query parameter cannot activate them in that build.
+
+Build the profiling renderer explicitly, then serve the separate `dist-profile/`:
+
+```bash
+cd web
+npm run build:profile
+npm run preview:profile -- --host 127.0.0.1 --port 4173
+```
+
+The reproducible Rustwright benchmark prepares source-shaped 10,000, 100,000,
+and 200,000-row fixtures with a 5,000-file sidebar. It reports repeated cold file
+loads, warm cache loads, rapid scrolling p50/p95 timings, and delayed-response
+cancellation:
+
+```bash
+cd local-debug
+PROFILE_REQUIRE_REACT=1 PROFILE_LABEL=profile LOCAL_DIFFE_URL=http://127.0.0.1:4173 npm run profile
+```
+
+Run against a preserved baseline and an optimized normal-build preview without
+`PROFILE_REQUIRE_REACT` to compare end-user timings without profiler overhead.
+The benchmark's DOM-ready and two
+`requestAnimationFrame` measurements describe browser scheduling; they do not
+claim that a frame was painted. Set `PROFILE_SIZE=10000` or
+`PROFILE_REPEATS=5` to narrow or repeat a run. The runner is TypeScript (tested
+with Node 26); application instrumentation and workers are TypeScript bundled
+and minified by Vite. See [profiling details](local-debug/README.md).
 
 ## Release a single executable
 
@@ -147,7 +189,8 @@ large diff more cleanly than a generic shadcn component. The official shadcn
 registry has no first-party tree component.
 
 For supported languages, the selected-file panel is an iframe running the
-SemanticDiff `out/webview` assets unchanged. Rust supplies the state
+SemanticDiff 0.10.0 `out/webview` assets, copied unchanged into
+`vendor/semanticdiff/webview` with checksums and original license notices. Rust supplies the state
 that VS Code normally supplies and a tiny `acquireVsCodeApi` host shim; it does
 not modify the extension's renderer. This is intentionally a local,
 version-pinned integration: SemanticDiff extension upgrades can change the
@@ -155,6 +198,18 @@ private webview contract. The release build embeds those pinned extension assets
 into the executable; check SemanticDiff/Cursor licensing before redistributing
 the embedded helper outside internal use.
 
-The server binds to `0.0.0.0:4317` by default, so machines on your network can
+Semantic diff is the default. The mode buttons persist the selected mode in
+`localStorage` under `local-diffe:diff-mode`. An 8 MiB estimated LRU cache retains
+semantic HTML for file revisits; a failed render evicts its entry before retry.
+
+The CLI produces change tokens but does not run VS Code's syntax-highlighting
+host. Our `semantic-viewer.ts` adapter fills that gap using a Shiki worker, with
+language grammars loaded on demand. The diff renders first; syntax colors arrive
+through the viewer's native state-update protocol. The worker is terminated on
+completion, navigation, failure, or timeout. The upstream viewer files remain
+unchanged. React profiling covers the surrounding application; the PR profiling
+script measures iframe readiness and highlighting completion separately.
+
+The server binds to `0.0.0.0:3333` by default, so machines on your network can
 reach it. It can read any local repository path supplied by its user, so only
-use it on a trusted network (or bind to `127.0.0.1:4317` explicitly).
+use it on a trusted network (or bind to `127.0.0.1:3333` explicitly).
