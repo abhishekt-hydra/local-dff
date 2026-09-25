@@ -43,6 +43,18 @@ not a misleading whole-branch snapshot. Pasted links work for open, closed,
 and merged PRs; if the selected repository is different, Local Diffe clones a
 private cache copy under its application cache directory and reuses it later.
 
+## Review commit by commit
+
+Any Git or PR comparison lists its commits above the file filter, oldest first.
+Pick one from the commit menu, or step with the ‹ › buttons (or `[` / `]` with
+the keyboard overlay on); `[` from the first commit returns to **All changes**.
+**This commit** shows the commit against its parent, as GitHub's Commits tab
+does; **Up to commit** shows everything from the comparison base through it.
+The list follows the first-parent chain, so a PR that merged its base branch
+back in lists that merge once — diffed against its first parent — instead of
+every commit it brought along. A root commit is compared with the empty tree.
+Viewed marks are kept separately for each commit.
+
 ## Cache directory
 
 By default, Local Diffe stores its data in the operating system's application

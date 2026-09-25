@@ -24,12 +24,14 @@ use uuid::Uuid;
 
 mod adapters;
 mod application;
+mod commits;
 mod domain;
 mod http;
 mod ports;
 mod storage;
 #[cfg(test)]
 mod test_support;
+use commits::{CommitInfo, CommitLog, ScopeMode};
 use domain::{FileEntry, SemanticResponse};
 
 static WEB_ASSETS: Dir<'_> = include_dir!("$OUT_DIR/embedded/web");
@@ -75,6 +77,8 @@ struct Session {
     base: String,
     target: String,
     files: Vec<FileEntry>,
+    /// First-parent commits of a full comparison; empty for commit scopes.
+    commits: Vec<CommitInfo>,
 }
 
 #[derive(Serialize)]
@@ -106,6 +110,14 @@ struct GitDiffRequest {
     repo: String,
     base: String,
     target: String,
+}
+
+#[derive(Deserialize)]
+struct CommitScopeRequest {
+    /// The full comparison's session, which owns the commit list.
+    id: String,
+    sha: String,
+    mode: ScopeMode,
 }
 
 #[derive(Deserialize)]
@@ -170,6 +182,8 @@ struct StartResponse {
     id: String,
     files: Vec<FileEntry>,
     comparison: Option<ComparisonInfo>,
+    commits: Vec<CommitInfo>,
+    commits_truncated: bool,
 }
 
 #[derive(Debug)]
@@ -231,6 +245,7 @@ async fn main() {
         .route("/api/github/open-prs", post(github_open_prs))
         .route("/api/github/compare", post(github_compare_pr))
         .route("/api/github/open-url", post(github_open_url))
+        .route("/api/commit-scope", post(commit_scope))
         .route("/api/semantic/{id}/{index}", post(semantic_file))
         .route("/api/diff/{id}/{index}", get(http::text_diff))
         .route("/semanticdiff-view/{id}/{index}", get(semanticdiff_view))
@@ -361,7 +376,17 @@ async fn start_session(
         git_commit(&repo, &request.base),
         git_commit(&repo, &request.target),
     )?;
-    create_session(state, repo, base, target, request.patch, None, None)
+    let files = parse_patch(&request.patch);
+    require_files(&files)?;
+    Ok(create_session(
+        state,
+        repo,
+        base,
+        target,
+        files,
+        None,
+        CommitLog::default(),
+    ))
 }
 
 async fn start_git_diff(
@@ -393,37 +418,137 @@ async fn create_git_comparison(
 ) -> Result<Json<StartResponse>, ApiError> {
     let (base_commit, target_commit) =
         tokio::try_join!(git_commit(&repo, &base), git_commit(&repo, &target),)?;
-    let (mut files, renderable_paths) = tokio::try_join!(
-        git_changed_files(&repo, &base_commit, &target_commit),
-        git_renderable_paths(&repo, &base_commit, &target_commit),
+    let (files, log) = tokio::try_join!(
+        comparison_files(&repo, &base_commit, &target_commit),
+        commits::commit_log(&repo, &base_commit, &target_commit),
     )?;
-    for file in &mut files {
-        file.renderable = renderable_paths.contains(&file.display_path);
-    }
-    let semantic_paths = files.iter().filter(|file| file.renderable).count();
-    let comparison = ComparisonInfo {
-        base: RevisionInfo {
-            revision: base.clone(),
+    require_files(&files)?;
+    let comparison = comparison_info(
+        RevisionInfo {
+            revision: base,
             commit: base_commit.clone(),
         },
-        target: RevisionInfo {
-            revision: target.clone(),
+        RevisionInfo {
+            revision: target,
             commit: target_commit.clone(),
         },
-        changed_paths: files.len(),
-        semantic_paths,
+        &files,
         description,
         pull_request,
-    };
-    create_session(
+    );
+    Ok(create_session(
         state,
         repo,
         base_commit,
         target_commit,
-        String::new(),
-        Some(files),
+        files,
         Some(comparison),
-    )
+        log,
+    ))
+}
+
+/// Scope a full comparison to one of its commits. The commit must come from
+/// that comparison's own list, so no client-supplied revision reaches Git.
+async fn commit_scope(
+    State(state): State<AppState>,
+    Json(request): Json<CommitScopeRequest>,
+) -> Result<Json<StartResponse>, ApiError> {
+    let (repo, range_base, commit, position, total) = {
+        let sessions = state.sessions.lock().unwrap();
+        let session = sessions.get(&request.id).ok_or_else(|| {
+            ApiError::bad_request("This session has expired. Reload the comparison.")
+        })?;
+        let position = session
+            .commits
+            .iter()
+            .position(|commit| commit.sha == request.sha)
+            .ok_or_else(|| ApiError::bad_request("That commit is not part of this comparison."))?;
+        (
+            session.repo.clone(),
+            session.base.clone(),
+            session.commits[position].clone(),
+            position + 1,
+            session.commits.len(),
+        )
+    };
+    let base_commit = commits::scope_base(&repo, &commit, request.mode, &range_base).await?;
+    let files = comparison_files(&repo, &base_commit, &commit.sha).await?;
+    let (base_revision, description) = match request.mode {
+        ScopeMode::Commit if commit.parents.is_empty() => (
+            "empty tree".to_owned(),
+            format!("Commit {position} of {total}: a root commit, compared with the empty tree."),
+        ),
+        ScopeMode::Commit if commit.parents.len() > 1 => (
+            format!("{}^", commit.short),
+            format!("Commit {position} of {total}: a merge, compared with its first parent."),
+        ),
+        ScopeMode::Commit => (
+            format!("{}^", commit.short),
+            format!("Commit {position} of {total}, compared with its parent."),
+        ),
+        ScopeMode::Cumulative => (
+            "base".to_owned(),
+            format!(
+                "Commits 1–{position} of {total}: the comparison base through {}.",
+                commit.short
+            ),
+        ),
+    };
+    let comparison = comparison_info(
+        RevisionInfo {
+            revision: base_revision,
+            commit: base_commit.clone(),
+        },
+        RevisionInfo {
+            revision: commit.short.clone(),
+            commit: commit.sha.clone(),
+        },
+        &files,
+        description,
+        None,
+    );
+    let target = commit.sha.clone();
+    Ok(create_session(
+        state,
+        repo,
+        base_commit,
+        target,
+        files,
+        Some(comparison),
+        CommitLog::default(),
+    ))
+}
+
+async fn comparison_files(
+    repo: &PathBuf,
+    base: &str,
+    target: &str,
+) -> Result<Vec<FileEntry>, ApiError> {
+    let (mut files, renderable_paths) = tokio::try_join!(
+        git_changed_files(repo, base, target),
+        git_renderable_paths(repo, base, target),
+    )?;
+    for file in &mut files {
+        file.renderable = renderable_paths.contains(&file.display_path);
+    }
+    Ok(files)
+}
+
+fn comparison_info(
+    base: RevisionInfo,
+    target: RevisionInfo,
+    files: &[FileEntry],
+    description: String,
+    pull_request: Option<PullRequestInfo>,
+) -> ComparisonInfo {
+    ComparisonInfo {
+        base,
+        target,
+        changed_paths: files.len(),
+        semantic_paths: files.iter().filter(|file| file.renderable).count(),
+        description,
+        pull_request,
+    }
 }
 
 async fn github_open_prs(
@@ -585,35 +710,42 @@ async fn start_github_pr_session(
     .await
 }
 
-fn create_session(
-    state: AppState,
-    repo: PathBuf,
-    base: String,
-    target: String,
-    patch: String,
-    git_files: Option<Vec<FileEntry>>,
-    comparison: Option<ComparisonInfo>,
-) -> Result<Json<StartResponse>, ApiError> {
-    let files = git_files.unwrap_or_else(|| parse_patch(&patch));
+/// A full comparison with nothing to show is an error; a single commit may
+/// legitimately change no files.
+fn require_files(files: &[FileEntry]) -> Result<(), ApiError> {
     if files.is_empty() {
         return Err(ApiError::bad_request(
             "No text file changes were found between these revisions.",
         ));
     }
+    Ok(())
+}
 
+fn create_session(
+    state: AppState,
+    repo: PathBuf,
+    base: String,
+    target: String,
+    files: Vec<FileEntry>,
+    comparison: Option<ComparisonInfo>,
+    log: CommitLog,
+) -> Json<StartResponse> {
     let id = Uuid::new_v4().to_string();
     let session = Session {
         repo,
         base: base.trim().to_owned(),
         target: target.trim().to_owned(),
         files: files.clone(),
+        commits: log.commits.clone(),
     };
     state.sessions.lock().unwrap().insert(id.clone(), session);
-    Ok(Json(StartResponse {
+    Json(StartResponse {
         id,
         files,
         comparison,
-    }))
+        commits: log.commits,
+        commits_truncated: log.truncated,
+    })
 }
 
 fn validate_git_input(repo: &FsPath, base: &str, target: &str) -> Result<(), ApiError> {
@@ -1134,11 +1266,14 @@ async fn semanticdiff_view(
     let bridge = r#"<style>:root{color-scheme:dark;--vscode-font-family:ui-sans-serif,system-ui,sans-serif;--vscode-font-size:13px;--vscode-editor-font-family:ui-monospace,SFMono-Regular,Menlo,monospace;--vscode-editor-font-size:12px;--vscode-editor-background:#0d1117;--vscode-editor-foreground:#e6edf3;--vscode-breadcrumb-background:#161b22;--vscode-breadcrumb-foreground:#c9d1d9;--vscode-breadcrumb-focusForeground:#58a6ff;--vscode-editorWidget-border:#30363d;--vscode-scrollbar-shadow:#010409;--vscode-focusBorder:#58a6ff;--vscode-button-background:#238636;--vscode-button-foreground:#fff;--vscode-button-hoverBackground:#2ea043;--vscode-input-background:#0d1117;--vscode-input-foreground:#e6edf3;--vscode-list-activeSelectionBackground:#1f6feb;--vscode-list-hoverBackground:#21262d;--vscode-diffEditor-insertedLineBackground:#0c281a;--vscode-diffEditor-removedLineBackground:#2a171d;--vscode-diffEditor-insertedTextBackground:#10351f;--vscode-diffEditor-removedTextBackground:#43212a;--vscode-diffEditor-diagonalFill:#30363d;--vscode-minimapSlider-background:#8b949e99;--vscode-peekViewResult-background:#161b22;--vscode-editorOverviewRuler-modifiedForeground:#58a6ff;--vscode-editorOverviewRuler-deletedForeground:#f85149;--vscode-editorOverviewRuler-addedForeground:#3fb950;--vscode-editorLineNumber-foreground:#8b949e;--vscode-editorUnicodeHighlight-background:#6e40c933;--vscode-editorUnicodeHighlight-border:#6e40c9;--vscode-editor-selectionBackground:#264f78;--vscode-notifications-background:#161b22;--vscode-notifications-border:#30363d;--vscode-notifications-foreground:#c9d1d9;--vscode-notificationsErrorIcon-foreground:#f85149;--vscode-disabledForeground:#8b949e;--vscode-icon-foreground:#c9d1d9;--vscode-editorCodeLens-foreground:#8b949e;--vscode-editorGhostText-foreground:#8b949e;--vscode-editorHint-foreground:#8b949e;--vscode-editorInlayHint-background:#21262d;--vscode-editorLink-activeForeground:#58a6ff;--vscode-editorSuggestWidget-foreground:#c9d1d9;--vscode-editorSuggestWidget-selectedForeground:#fff;--vscode-editorWidget-background:#161b22;--vscode-menu-selectionBackground:#1f6feb;--vscode-menu-selectionForeground:#fff;--vscode-statusBar-background:#161b22;--vscode-statusBar-foreground:#c9d1d9;--vscode-statusBarItem-hoverBackground:#21262d;--vscode-statusBarItem-hoverForeground:#fff;--vscode-toolbar-activeBackground:#30363d;--vscode-toolbar-hoverBackground:#21262d;--vscode-tree-tableColumnsBorder:#30363d;--vscode-tree-tableOddRowsBackground:#161b22}html,body{background:#0d1117!important;color:#e6edf3!important}.patch,.patch .line,.patch .code-fg,.patch .line .content,.patch .header{color:#c9d1d9!important}.patch .line .line-number,.patch .line .number{color:#8b949e!important}.patch .code-bg.added+.code-fg span[style*="rgb(139, 148, 158)"],.patch .code-bg.removed+.code-fg span[style*="rgb(139, 148, 158)"]{color:#d0d7de!important}.patch .line.added,.patch .mark.added{color:#b7dfc2!important}.patch .line.removed,.patch .mark.removed{color:#f0c8cf!important}</style><script>window.acquireVsCodeApi=()=>({getState:()=>undefined,setState:()=>{},postMessage:(message)=>window.parent!==window&&window.parent.postMessage({source:'semanticdiff',message},'*')});</script><script src="script.js"></script>"#;
     // The renderer lives in an iframe, so relay the outer app's keyboard-overlay
     // keys to its parent. Local Diffe decides whether a relayed key is active.
-    let keyboard_bridge = r#"<script>window.addEventListener('keydown',(event)=>{if(['-','?','Escape','f','d','v','j','k','F','D','V','J','K'].includes(event.key)){window.parent.postMessage({source:'local-diffe-keyboard',key:event.key},'*')}});</script>"#;
+    let keyboard_bridge = r#"<script>window.addEventListener('keydown',(event)=>{if(['-','?','Escape','f','d','v','j','k','F','D','V','J','K','[',']'].includes(event.key)){window.parent.postMessage({source:'local-diffe-keyboard',key:event.key},'*')}});</script>"#;
     let readiness_bridge = format!("<script>{}</script>", include_str!("semantic-bridge.js"));
     let html = template
         .replace("${webview.cspSource}", "'self'")
-        .replace("default-src 'self';", "default-src 'self'; worker-src 'self' blob:;")
+        .replace(
+            "default-src 'self';",
+            "default-src 'self'; worker-src 'self' blob:;",
+        )
         .replace("${baseURL}", "/semanticdiff-assets")
         .replace("${ initialState }", &state_json)
         .replace(

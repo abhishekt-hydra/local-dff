@@ -1,6 +1,7 @@
 import { createContext, memo, Profiler, useCallback, useContext, useDeferredValue, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react"
 import { Tree, type NodeRendererProps } from "react-arborist"
 import {
+  ChevronLeft,
   ChevronRight,
   ChevronDown,
   ChevronUp,
@@ -11,6 +12,7 @@ import {
   Folder,
   FolderOpen,
   GitBranch,
+  GitCommitHorizontal,
   GitPullRequest,
   GripVertical,
   Keyboard,
@@ -36,8 +38,13 @@ type PatchFile = { old_path: string | null; new_path: string | null; display_pat
 type Revision = { revision: string; commit: string }
 type PullRequest = { number: number; title: string; url: string; state: string; baseRefName: string; headRefName: string; isDraft: boolean; author?: { login: string } | null; updatedAt: string }
 type Comparison = { base: Revision; target: Revision; changed_paths: number; semantic_paths: number; description: string; pull_request?: PullRequest | null }
-type Session = { id: string; files: PatchFile[]; comparison?: Comparison | null }
+type Commit = { sha: string; short: string; parents: string[]; author: string; date: string; subject: string; files_changed: number }
+type Session = { id: string; files: PatchFile[]; comparison?: Comparison | null; commits?: Commit[]; commits_truncated?: boolean }
+type ScopeMode = "commit" | "cumulative"
 const EMPTY_FILES: PatchFile[] = []
+const EMPTY_COMMITS: Commit[] = []
+const OVERLAY_KEYS = ["f", "d", "v", "j", "k", "[", "]"]
+const NO_VIEWED: ReadonlySet<number> = new Set()
 
 type ReviewRegion = "sidebar" | "diff"
 
@@ -49,15 +56,38 @@ const initialRepo = "/Users/abhishek/hydradb/hydradb-application"
 
 // Session ids are fresh UUIDs per comparison, so viewed state is keyed by the
 // revisions under review and stored as display paths: both survive a reload and
-// a re-generated session whose file order changed.
-function viewedStorageKey(session: Session | null) {
+// a re-generated session whose file order changed. A commit scope is named after
+// the full comparison it belongs to, e.g. `pr-123@abc1234`.
+function viewedStorageKey(session: Session | null, root: Session | null) {
   if (!session) return null
   const comparison = session.comparison
-  if (comparison) {
-    const scope = comparison.pull_request ? `pr-${comparison.pull_request.number}` : `${comparison.base.revision}..${comparison.target.revision}`
+  const rootComparison = root?.comparison ?? comparison
+  if (comparison && rootComparison) {
+    const range = rootComparison.pull_request ? `pr-${rootComparison.pull_request.number}` : `${rootComparison.base.revision}..${rootComparison.target.revision}`
+    const scope = session === root ? range : `${range}@${comparison.target.revision}`
     return `local-diffe:viewed:${scope}:${comparison.base.commit}:${comparison.target.commit}`
   }
   return `local-diffe:viewed:patch:${session.files.length}:${session.files[0]?.display_path ?? ""}`
+}
+
+function comparisonStatus(session: Session) {
+  if (!session.comparison) return `${session.files.length} text patches loaded · select one to inspect its semantic diff`
+  const { base, target, changed_paths, semantic_paths, pull_request } = session.comparison
+  const revisions = `${base.commit.slice(0, 7)} → ${target.commit.slice(0, 7)}`
+  if (pull_request) return `PR #${pull_request.number} · ${changed_paths} changed paths · ${semantic_paths} content diffs · ${revisions}`
+  return `${changed_paths} changed paths · ${semantic_paths} content diffs · ${base.revision}@${base.commit.slice(0, 7)} → ${target.revision}@${target.commit.slice(0, 7)}`
+}
+
+function scopeStatus(scoped: Session, commits: Commit[], index: number, mode: ScopeMode) {
+  const commit = commits[index]
+  const position = mode === "commit" ? `Commit ${index + 1} of ${commits.length}` : `Commits 1–${index + 1} of ${commits.length}`
+  const changed = scoped.comparison?.changed_paths ?? scoped.files.length
+  return `${position} · ${commit.short} ${commit.subject} · ${changed ? `${changed} changed paths · ${scoped.comparison?.semantic_paths ?? 0} content diffs` : "no file changes"}`
+}
+
+function formatCommitDate(iso: string) {
+  const date = new Date(iso)
+  return Number.isNaN(date.getTime()) ? "" : date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: date.getFullYear() === new Date().getFullYear() ? undefined : "numeric" })
 }
 
 function readViewedPaths(key: string) {
@@ -195,8 +225,17 @@ export default function App() {
   const [sidebarFontSize, setSidebarFontSize] = useState(12)
   const [resizingSidebar, setResizingSidebar] = useState(false)
   const [session, setSession] = useState<Session | null>(null)
+  // The full comparison owns the commit list; `session` is whichever scope of
+  // it is on screen (the full comparison itself, or one commit).
+  const [rootSession, setRootSession] = useState<Session | null>(null)
+  const [commitIndex, setCommitIndex] = useState<number | null>(null)
+  const [scopeMode, setScopeMode] = useState<ScopeMode>("commit")
+  const [scopeLoading, setScopeLoading] = useState(false)
+  const [commitPickerOpen, setCommitPickerOpen] = useState(false)
   const [selected, setSelected] = useState<number | null>(null)
-  const [viewedFiles, setViewedFiles] = useState<Set<number>>(() => new Set())
+  // Viewed indices are tagged with the storage key and file list they were read
+  // for, so a scope switch never shows or persists another scope's marks.
+  const [viewedState, setViewedState] = useState<{ key: string | null; files: PatchFile[]; indices: ReadonlySet<number> }>({ key: null, files: EMPTY_FILES, indices: NO_VIEWED })
   const [search, setSearch] = useState("")
   const [status, setStatus] = useState("Ready to compare origin/staging with the checked-out branch.")
   const [loading, setLoading] = useState(false)
@@ -208,16 +247,22 @@ export default function App() {
   const resizeOriginLeftRef = useRef(0)
   const resizePendingWidthRef = useRef<number | null>(null)
   const resizeFrameRef = useRef<number | null>(null)
-  const hydratedViewedKeyRef = useRef<string | null>(null)
   const textViewportCacheRef = useRef<HTMLElement | null | undefined>(undefined)
   const semanticScrollCacheRef = useRef<{ document: Document; target: HTMLElement | null } | undefined>(undefined)
+  const scopeCacheRef = useRef(new Map<string, Session>())
+  const scopeRequestRef = useRef(0)
+  const shownCommitIndexRef = useRef<number | null>(null)
+  const selectionRef = useRef({ session, selected })
+  selectionRef.current = { session, selected }
   const [treeHeight, setTreeHeight] = useState(480)
   const files = session?.files ?? EMPTY_FILES
   const tree = useMemo(() => makeTree(files), [files])
   const fileNavigation = useMemo(() => buildFileNavigation(files), [files])
   const deferredSearch = useDeferredValue(search)
   const selectedPull = useMemo(() => pulls.find((pull) => String(pull.number) === prNumber), [pulls, prNumber])
-  const viewedKey = useMemo(() => viewedStorageKey(session), [session])
+  const commits = rootSession?.commits ?? EMPTY_COMMITS
+  const viewedKey = useMemo(() => viewedStorageKey(session, rootSession), [rootSession, session])
+  const viewedFiles = viewedState.key === viewedKey && viewedState.files === files ? viewedState.indices : NO_VIEWED
   const sidebarScale = sidebarFontSize / 12
   const sidebarRowHeight = Math.max(20, Math.round(28 * sidebarScale))
   const sidebarIconSize = Math.max(11, Math.round(14 * sidebarScale))
@@ -280,29 +325,25 @@ export default function App() {
   }, [session, chromeHidden])
 
   useEffect(() => {
-    if (!viewedKey) {
-      hydratedViewedKeyRef.current = null
-      return
-    }
+    if (!viewedKey) return
     const paths = readViewedPaths(viewedKey)
     const restored = new Set<number>()
     files.forEach((file, index) => { if (paths.has(file.display_path)) restored.add(index) })
-    hydratedViewedKeyRef.current = viewedKey
-    setViewedFiles(restored)
+    setViewedState({ key: viewedKey, files, indices: restored })
   }, [files, viewedKey])
 
   useEffect(() => {
-    // Only write once this key's stored state has been read back, so the empty
-    // set a fresh session starts with never erases what was saved for it.
-    if (!viewedKey || hydratedViewedKeyRef.current !== viewedKey) return
-    const paths = [...viewedFiles].map((index) => files[index]?.display_path).filter((path): path is string => Boolean(path))
+    // Only write a set that was read back for this key and file list, so the
+    // placeholder a fresh scope starts with never erases what was saved for it.
+    if (!viewedKey || viewedState.key !== viewedKey || viewedState.files !== files) return
+    const paths = [...viewedState.indices].map((index) => files[index]?.display_path).filter((path): path is string => Boolean(path))
     try {
       if (paths.length) window.localStorage.setItem(viewedKey, JSON.stringify(paths))
       else window.localStorage.removeItem(viewedKey)
     } catch {
       // Private browsing or a full quota: viewed state stays in-memory only.
     }
-  }, [files, viewedFiles, viewedKey])
+  }, [files, viewedKey, viewedState])
 
   useEffect(() => {
     // DiffViewer replaces both viewports when the selected file changes.
@@ -317,16 +358,16 @@ export default function App() {
     setStatus(progress)
     try {
       const next = await api<Session>(endpoint, payload)
+      // Drop any in-flight commit scope of the previous comparison.
+      scopeRequestRef.current += 1
+      scopeCacheRef.current = new Map()
+      shownCommitIndexRef.current = null
+      setScopeLoading(false)
+      setCommitIndex(null)
+      setRootSession(next)
       setSession(next)
       setSelected(null)
-      setViewedFiles(new Set())
-      if (next.comparison) {
-        const { base: resolvedBase, target: resolvedTarget, changed_paths, semantic_paths, pull_request } = next.comparison
-        const revisions = `${resolvedBase.commit.slice(0, 7)} → ${resolvedTarget.commit.slice(0, 7)}`
-        setStatus(pull_request ? `PR #${pull_request.number} · ${changed_paths} changed paths · ${semantic_paths} content diffs · ${revisions}` : `${changed_paths} changed paths · ${semantic_paths} content diffs · ${resolvedBase.revision}@${resolvedBase.commit.slice(0, 7)} → ${resolvedTarget.revision}@${resolvedTarget.commit.slice(0, 7)}`)
-      } else {
-        setStatus(`${next.files.length} text patches loaded · select one to inspect its semantic diff`)
-      }
+      setStatus(comparisonStatus(next))
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Unable to create comparison")
     } finally {
@@ -366,6 +407,58 @@ export default function App() {
       return
     }
     void loadSession("/api/github/open-url", { url: prUrl }, "Downloading the GitHub pull request if needed and generating its merge-base diff…")
+  }
+
+  // Show one commit (or `null` for all changes). Scopes are cached per commit
+  // and mode, and the reviewed file stays selected when the next scope has it.
+  const selectScope = useCallback(async (index: number | null, mode: ScopeMode) => {
+    if (!rootSession) return
+    const request = ++scopeRequestRef.current
+    setCommitIndex(index)
+    let next: Session | undefined = rootSession
+    if (index !== null) {
+      const commit = rootSession.commits?.[index]
+      if (!commit) return
+      const cacheKey = `${commit.sha}:${mode}`
+      next = scopeCacheRef.current.get(cacheKey)
+      if (!next) {
+        setScopeLoading(true)
+        try {
+          next = await api<Session>("/api/commit-scope", { id: rootSession.id, sha: commit.sha, mode })
+          scopeCacheRef.current.set(cacheKey, next)
+        } catch (error) {
+          if (request !== scopeRequestRef.current) return
+          setScopeLoading(false)
+          setCommitIndex(shownCommitIndexRef.current)
+          setStatus(error instanceof Error ? error.message : "Unable to load this commit")
+          return
+        }
+      }
+    }
+    if (request !== scopeRequestRef.current) return
+    const { session: current, selected: currentSelected } = selectionRef.current
+    const selectedPath = currentSelected === null ? null : current?.files[currentSelected]?.display_path
+    const keep = selectedPath ? next.files.findIndex((file) => file.renderable && file.display_path === selectedPath) : -1
+    shownCommitIndexRef.current = index
+    setScopeLoading(false)
+    setSession(next)
+    setSelected(keep === -1 ? null : keep)
+    setStatus(index === null ? comparisonStatus(next) : scopeStatus(next, rootSession.commits ?? EMPTY_COMMITS, index, mode))
+  }, [rootSession])
+
+  // `[` from the first commit returns to all changes; neither end wraps.
+  const stepCommit = useCallback((direction: 1 | -1) => {
+    if (!commits.length) return
+    const next = direction === 1
+      ? (commitIndex === null ? 0 : Math.min(commits.length - 1, commitIndex + 1))
+      : (commitIndex === null || commitIndex === 0 ? null : commitIndex - 1)
+    if (next !== commitIndex) void selectScope(next, scopeMode)
+  }, [commitIndex, commits.length, scopeMode, selectScope])
+
+  const changeScopeMode = (mode: ScopeMode) => {
+    if (mode === scopeMode) return
+    setScopeMode(mode)
+    if (commitIndex !== null) void selectScope(commitIndex, mode)
   }
 
   const focusSidebar = useCallback(() => {
@@ -454,8 +547,14 @@ export default function App() {
         if (activeRegion === "diff") scrollDiff(-1)
         else moveFile(-1)
         break
+      case "[":
+        stepCommit(-1)
+        break
+      case "]":
+        stepCommit(1)
+        break
     }
-  }, [activeRegion, focusDiff, focusSidebar, moveFile, scrollDiff])
+  }, [activeRegion, focusDiff, focusSidebar, moveFile, scrollDiff, stepCommit])
 
   useEffect(() => {
     if (activeRegion !== "diff") return
@@ -489,7 +588,7 @@ export default function App() {
       }
       if (!keyboardOverlay) return
       const key = event.key.toLowerCase()
-      if (["f", "d", "v", "j", "k"].includes(key)) {
+      if (OVERLAY_KEYS.includes(key)) {
         event.preventDefault()
         runOverlayCommand(key)
       }
@@ -503,7 +602,7 @@ export default function App() {
         showKeyboardHelp()
       } else if (data.key === "Escape" && keyboardOverlay) {
         setKeyboardOverlay(false)
-      } else if (keyboardOverlay && ["f", "d", "v", "j", "k"].includes(data.key.toLowerCase())) {
+      } else if (keyboardOverlay && OVERLAY_KEYS.includes(data.key.toLowerCase())) {
         runOverlayCommand(data.key)
       }
     }
@@ -521,11 +620,12 @@ export default function App() {
   const selectedViewed = selected !== null && viewedFiles.has(selected)
   const toggleViewed = () => {
     if (selected === null || !selectedFile) return
-    setViewedFiles((current) => {
-      const next = new Set(current)
-      if (next.has(selected)) next.delete(selected)
-      else next.add(selected)
-      return next
+    setViewedState((current) => {
+      if (current.key !== viewedKey || current.files !== files) return current
+      const indices = new Set(current.indices)
+      if (indices.has(selected)) indices.delete(selected)
+      else indices.add(selected)
+      return { ...current, indices }
     })
   }
   return (
@@ -600,10 +700,55 @@ export default function App() {
           <SidebarProfilerBoundary>
           <Card ref={sidebarRef} tabIndex={-1} aria-label="Changed files sidebar" className={cn("relative flex min-h-0 flex-col overflow-visible outline-none", activeRegion === "sidebar" && keyboardOverlay && "ring-2 ring-primary ring-offset-2")}>
             <CardHeader className="gap-3 rounded-t-lg border-b bg-card p-3"><div className="flex items-center justify-between gap-2"><CardTitle className="text-sm">Changed files {session && <span className="font-normal text-muted-foreground">({session.comparison?.changed_paths ?? session.files.length})</span>}</CardTitle><div className="flex items-center gap-0.5"><Button type="button" size="icon" variant="ghost" className="size-7" title="Smaller file text" onClick={() => setSidebarFontSize((size) => Math.max(10, size - 1))}><Minus className="size-3.5" /></Button><span className="w-7 text-center text-[10px] text-muted-foreground" title="File sidebar font size">{sidebarFontSize}px</span><Button type="button" size="icon" variant="ghost" className="size-7" title="Larger file text" onClick={() => setSidebarFontSize((size) => Math.min(18, size + 1))}><Plus className="size-3.5" /></Button><span className="mx-1 h-4 border-l" /><Button type="button" size="icon" variant="ghost" className="size-7" title="Make file sidebar narrower" onClick={() => setSidebarWidth((width) => Math.max(220, width - 40))}><Minus className="size-3.5" /></Button><Button type="button" size="icon" variant="ghost" className="size-7" title="Make file sidebar wider" onClick={() => setSidebarWidth((width) => Math.min(760, width + 40))}><Plus className="size-3.5" /></Button></div></div>
+              {commits.length > 0 && <div data-testid="commit-rail" className="grid grid-cols-[minmax(0,1fr)] gap-1.5">
+                <div className="flex items-center gap-1">
+                  <Button type="button" data-testid="previous-commit" size="icon" variant="outline" className="size-8 shrink-0" title="Previous commit ([)" disabled={commitIndex === null} onClick={() => stepCommit(-1)}><ChevronLeft className="size-4" /></Button>
+                  <Popover open={commitPickerOpen} onOpenChange={setCommitPickerOpen}>
+                    <PopoverTrigger asChild>
+                      <Button type="button" data-testid="commit-select" variant="outline" role="combobox" aria-label="Commit to review" aria-expanded={commitPickerOpen} className="h-8 min-w-0 flex-1 justify-between px-2 font-normal">
+                        <span className="flex min-w-0 items-center gap-1.5 text-xs">
+                          {scopeLoading ? <LoaderCircle className="size-3.5 shrink-0 animate-spin text-primary" /> : <GitCommitHorizontal className="size-3.5 shrink-0 text-muted-foreground" />}
+                          <span className="min-w-0 truncate">{commitIndex === null ? `All changes · ${commits.length} ${commits.length === 1 ? "commit" : "commits"}` : <><span className="tabular-nums text-muted-foreground">{commitIndex + 1}/{commits.length}</span> <span className="font-mono">{commits[commitIndex].short}</span> {commits[commitIndex].subject}</>}</span>
+                        </span>
+                        <ChevronsUpDown className="ml-1 size-3.5 shrink-0 opacity-50" />
+                      </Button>
+                    </PopoverTrigger>
+                    <PopoverContent align="start" className="w-[min(480px,calc(100vw-2rem))]">
+                      <Command>
+                        <CommandInput placeholder="Search commits by subject, SHA or author…" />
+                        <CommandList className="max-h-80">
+                          <CommandEmpty>No matching commit.</CommandEmpty>
+                          <CommandGroup>
+                            <CommandItem value="all changes" onSelect={() => { setCommitPickerOpen(false); void selectScope(null, scopeMode) }}>
+                              <Check className={cn("mr-2 size-4 shrink-0", commitIndex === null ? "opacity-100" : "opacity-0")} />
+                              <span className="font-medium">All changes</span>
+                              <span className="ml-auto pl-3 text-xs text-muted-foreground">{rootSession?.comparison?.changed_paths ?? rootSession?.files.length} files</span>
+                            </CommandItem>
+                          </CommandGroup>
+                          <CommandGroup heading={rootSession?.commits_truncated ? `Newest ${commits.length} commits` : `${commits.length} ${commits.length === 1 ? "commit" : "commits"}, oldest first`}>
+                            {commits.map((commit, index) => <CommandItem key={commit.sha} value={`${commit.sha} ${commit.subject} ${commit.author}`} onSelect={() => { setCommitPickerOpen(false); void selectScope(index, scopeMode) }}>
+                              <Check className={cn("mr-2 size-4 shrink-0", commitIndex === index ? "opacity-100" : "opacity-0")} />
+                              <span className="mr-2 w-6 shrink-0 text-right text-xs tabular-nums text-muted-foreground">{index + 1}</span>
+                              <span className="min-w-0 flex-1">
+                                <span className="block truncate">{commit.subject || "(no message)"}</span>
+                                <span className="block truncate text-[11px] text-muted-foreground"><span className="font-mono">{commit.short}</span> · {commit.author} · {formatCommitDate(commit.date)} · {commit.files_changed ? `${commit.files_changed} ${commit.files_changed === 1 ? "file" : "files"}` : "no file changes"}{commit.parents.length > 1 ? " · merge" : ""}</span>
+                              </span>
+                            </CommandItem>)}
+                          </CommandGroup>
+                        </CommandList>
+                      </Command>
+                    </PopoverContent>
+                  </Popover>
+                  <Button type="button" data-testid="next-commit" size="icon" variant="outline" className="size-8 shrink-0" title="Next commit (])" disabled={commitIndex === commits.length - 1} onClick={() => stepCommit(1)}><ChevronRight className="size-4" /></Button>
+                </div>
+                <div role="radiogroup" aria-label="Commit scope" className="grid grid-cols-2 gap-0.5 rounded-md bg-muted p-0.5 text-[11px] font-medium">
+                  {([["commit", "This commit", "Changes made by the selected commit alone"], ["cumulative", "Up to commit", "Everything from the comparison base through the selected commit"]] as const).map(([mode, label, title]) => <button key={mode} type="button" role="radio" data-testid={`scope-${mode}`} aria-checked={scopeMode === mode} title={title} onClick={() => changeScopeMode(mode)} className={cn("rounded px-2 py-1 transition-colors", scopeMode === mode ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground")}>{label}</button>)}
+                </div>
+              </div>}
               <div className="relative"><Search className="pointer-events-none absolute left-2 top-2 size-3.5 text-muted-foreground" /><Input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Filter files" className="h-8 pl-7 text-xs" /></div>
             </CardHeader>
             <CardContent ref={sidebarContentRef} style={{ contain: "size" }} className="min-h-[240px] flex-1 overflow-hidden lg:min-h-0 rounded-b-2xl bg-card p-2">
-              {tree.length ? <SidebarTree tree={tree} treeHeight={treeHeight} rowHeight={sidebarRowHeight} indent={Math.max(9, Math.round(14 * sidebarScale))} searchTerm={deferredSearch} selected={selected} viewedFiles={viewedFiles} sidebarScale={sidebarScale} sidebarFontSize={sidebarFontSize} sidebarIconSize={sidebarIconSize} sidebarGap={sidebarGap} sidebarPadding={sidebarPadding} onSelectFile={selectFile} /> : loading ? <div className="grid h-full place-items-center p-6 text-center text-sm text-muted-foreground"><div><LoaderCircle className="mx-auto mb-3 size-6 animate-spin text-primary" /><p>Preparing changed files<span className="loading-dots text-primary" aria-hidden="true">•••</span></p><p className="mt-1 text-xs">Large pull requests can take a moment to index.</p></div></div> : <p className="p-3 text-xs text-muted-foreground">Generate a Git diff or upload a patch to populate the file tree.</p>}
+              {tree.length ? <SidebarTree tree={tree} treeHeight={treeHeight} rowHeight={sidebarRowHeight} indent={Math.max(9, Math.round(14 * sidebarScale))} searchTerm={deferredSearch} selected={selected} viewedFiles={viewedFiles} sidebarScale={sidebarScale} sidebarFontSize={sidebarFontSize} sidebarIconSize={sidebarIconSize} sidebarGap={sidebarGap} sidebarPadding={sidebarPadding} onSelectFile={selectFile} /> : loading ? <div className="grid h-full place-items-center p-6 text-center text-sm text-muted-foreground"><div><LoaderCircle className="mx-auto mb-3 size-6 animate-spin text-primary" /><p>Preparing changed files<span className="loading-dots text-primary" aria-hidden="true">•••</span></p><p className="mt-1 text-xs">Large pull requests can take a moment to index.</p></div></div> : session ? <p className="p-3 text-xs text-muted-foreground">No file changes in this commit.</p> : <p className="p-3 text-xs text-muted-foreground">Generate a Git diff or upload a patch to populate the file tree.</p>}
             </CardContent>
             <div className="flex items-center justify-between gap-3 px-4 pb-4 pt-2 text-[11px] text-muted-foreground">
               <span>{session ? `${session.files.length} ${session.files.length === 1 ? "file" : "files"}` : "No comparison loaded"}</span>
@@ -618,9 +763,9 @@ export default function App() {
                 the viewport, so the collapsed header reserves room for it and
                 keeps the viewed checkbox clickable underneath. */}
             <CardHeader className={cn("flex-row items-center justify-between gap-3 space-y-0 border-b", chromeHidden ? "h-8 py-1 pl-3 pr-[180px]" : "p-3")}>
-              {chromeHidden ? <CardTitle className="min-w-0 truncate text-xs font-medium text-muted-foreground">{selectedFile?.display_path ?? "Semantic diff"}</CardTitle> : <div className="min-w-0"><CardTitle className="break-all text-sm">{selectedFile?.display_path ?? "Semantic diff"}</CardTitle>{session?.comparison?.pull_request && <a href={session.comparison.pull_request.url} target="_blank" rel="noreferrer" className="mt-1 flex w-fit items-center gap-1 text-xs font-medium text-primary hover:underline"><GitPullRequest className="size-3.5" /> #{session.comparison.pull_request.number} · {session.comparison.pull_request.title}</a>}<p className="mt-1 text-xs text-muted-foreground">{status}</p>{session?.comparison && <p className="mt-1 text-[11px] text-muted-foreground/80">{session.comparison.description}</p>}</div>}
+              {chromeHidden ? <CardTitle className="min-w-0 truncate text-xs font-medium text-muted-foreground">{selectedFile?.display_path ?? "Semantic diff"}</CardTitle> : <div className="min-w-0"><CardTitle className="break-all text-sm">{selectedFile?.display_path ?? "Semantic diff"}</CardTitle>{rootSession?.comparison?.pull_request && <a href={rootSession.comparison.pull_request.url} target="_blank" rel="noreferrer" className="mt-1 flex w-fit items-center gap-1 text-xs font-medium text-primary hover:underline"><GitPullRequest className="size-3.5" /> #{rootSession.comparison.pull_request.number} · {rootSession.comparison.pull_request.title}</a>}<p className="mt-1 text-xs text-muted-foreground">{status}</p>{session?.comparison && <p className="mt-1 text-[11px] text-muted-foreground/80">{session.comparison.description}</p>}</div>}
               <div className="flex shrink-0 items-center gap-2">
-                {loading && <LoaderCircle className="size-3.5 animate-spin text-muted-foreground" />}
+                {(loading || scopeLoading) && <LoaderCircle className="size-3.5 animate-spin text-muted-foreground" />}
                 {selectedFile && <label className={cn("flex shrink-0 cursor-pointer select-none items-center gap-1.5 whitespace-nowrap text-xs font-medium transition-colors", selectedViewed ? "text-emerald-600" : "text-muted-foreground hover:text-foreground", loading && "cursor-default opacity-50")} title={selectedViewed ? "Mark as unviewed" : "Mark as viewed"}>
                   <input type="checkbox" data-testid="mark-as-viewed" className="size-3.5 shrink-0 cursor-pointer accent-emerald-600" checked={selectedViewed} disabled={loading} onChange={toggleViewed} />
                   Viewed
@@ -641,7 +786,7 @@ export default function App() {
             <button type="button" onClick={() => runOverlayCommand("d")} className={cn("rounded-lg border p-3 text-left transition-colors hover:bg-accent", activeRegion === "diff" && "border-primary bg-primary/5")}><kbd className="mr-2 rounded bg-foreground px-1.5 py-0.5 font-mono text-xs text-background">D</kbd><span className="font-medium">Diff panel</span><span className="mt-1 block text-xs text-muted-foreground">Focus the SemanticDiff view</span></button>
             <button type="button" onClick={() => runOverlayCommand("v")} className="rounded-lg border p-3 text-left transition-colors hover:bg-accent"><kbd className="mr-2 rounded bg-foreground px-1.5 py-0.5 font-mono text-xs text-background">V</kbd><span className="font-medium">Focus view</span><span className="mt-1 block text-xs text-muted-foreground">Hide controls and enter the diff</span></button>
           </div>
-          <div className="mt-2 flex items-center gap-4 rounded-lg bg-muted px-3 py-2 text-xs text-muted-foreground"><span><kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">J</kbd> {activeRegion === "diff" ? "scroll down" : "next file"}</span><span><kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">K</kbd> {activeRegion === "diff" ? "scroll up" : "previous file"}</span><span className="ml-auto">{activeRegion === "sidebar" ? "Files sidebar active" : "Diff panel active"}</span></div>
+          <div className="mt-2 flex items-center gap-4 rounded-lg bg-muted px-3 py-2 text-xs text-muted-foreground"><span><kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">J</kbd> {activeRegion === "diff" ? "scroll down" : "next file"}</span><span><kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">K</kbd> {activeRegion === "diff" ? "scroll up" : "previous file"}</span>{commits.length > 0 && <span><kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">[</kbd><kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">]</kbd> previous / next commit</span>}<span className="ml-auto">{activeRegion === "sidebar" ? "Files sidebar active" : "Diff panel active"}</span></div>
         </> : <button type="button" onClick={showKeyboardHelp} className="flex items-center gap-2 text-xs text-muted-foreground hover:text-foreground"><Keyboard className="size-3.5 text-primary" /><span>{activeRegion === "diff" ? "J/K scroll diff" : "J/K files"}</span><kbd className="rounded border bg-muted px-1.5 py-0.5 font-mono text-foreground">?</kbd><span>keys</span></button>}
       </aside>}
     </div>
