@@ -28,11 +28,13 @@ mod commits;
 mod domain;
 mod http;
 mod ports;
+mod stacks;
 mod storage;
 #[cfg(test)]
 mod test_support;
 use commits::{CommitInfo, CommitLog, ScopeMode};
 use domain::{FileEntry, SemanticResponse};
+use stacks::{Stack, StackMember, StackMode};
 
 static WEB_ASSETS: Dir<'_> = include_dir!("$OUT_DIR/embedded/web");
 static SEMANTICDIFF_WEBVIEW: Dir<'_> = include_dir!("$OUT_DIR/embedded/semanticdiff-webview");
@@ -41,6 +43,9 @@ static SEMANTICDIFF_RUNTIME: Dir<'_> = include_dir!("$OUT_DIR/embedded/semanticd
 // `gh` is already required for GitHub PR metadata. Reuse its active token for
 // the cache clone rather than relying on this machine's SSH key configuration.
 const GITHUB_GIT_CREDENTIAL_HELPER: &str = "credential.helper=!gh auth git-credential";
+
+// Branch names link stacked PRs; OIDs and the fork flag keep stacks honest.
+const OPEN_PR_FIELDS: &str = "number,title,url,state,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,isCrossRepository,author,updatedAt";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -79,6 +84,8 @@ struct Session {
     files: Vec<FileEntry>,
     /// First-parent commits of a full comparison; empty for commit scopes.
     commits: Vec<CommitInfo>,
+    /// The PR stack this comparison belongs to, shared by its members' sessions.
+    stack: Option<Arc<Stack>>,
 }
 
 #[derive(Serialize)]
@@ -121,6 +128,14 @@ struct CommitScopeRequest {
 }
 
 #[derive(Deserialize)]
+struct StackScopeRequest {
+    /// Any session of the stack; the stack it owns lists the allowed PRs.
+    id: String,
+    number: u64,
+    mode: StackMode,
+}
+
+#[derive(Deserialize)]
 struct GitHubPullsRequest {
     repo: String,
     #[serde(default)]
@@ -152,8 +167,10 @@ struct PullRequestInfo {
     head_ref_name: String,
     #[serde(rename = "headRefOid", default)]
     head_ref_oid: String,
-    #[serde(default)]
+    #[serde(rename = "isDraft", default)]
     is_draft: bool,
+    #[serde(rename = "isCrossRepository", default)]
+    is_cross_repository: bool,
     #[serde(default)]
     author: Option<PullRequestAuthor>,
     #[serde(rename = "updatedAt", default)]
@@ -184,6 +201,15 @@ struct StartResponse {
     comparison: Option<ComparisonInfo>,
     commits: Vec<CommitInfo>,
     commits_truncated: bool,
+    stack: Option<StackView>,
+}
+
+#[derive(Serialize)]
+struct StackView {
+    trunk: String,
+    current: u64,
+    mode: StackMode,
+    members: Vec<StackMember>,
 }
 
 #[derive(Debug)]
@@ -246,6 +272,7 @@ async fn main() {
         .route("/api/github/compare", post(github_compare_pr))
         .route("/api/github/open-url", post(github_open_url))
         .route("/api/commit-scope", post(commit_scope))
+        .route("/api/stack-scope", post(stack_scope))
         .route("/api/semantic/{id}/{index}", post(semantic_file))
         .route("/api/diff/{id}/{index}", get(http::text_diff))
         .route("/semanticdiff-view/{id}/{index}", get(semanticdiff_view))
@@ -386,6 +413,7 @@ async fn start_session(
         files,
         None,
         CommitLog::default(),
+        None,
     ))
 }
 
@@ -404,6 +432,7 @@ async fn start_git_diff(
         target,
         None,
         "Committed snapshots only; uncommitted working-tree changes are excluded.".into(),
+        None,
     )
     .await
 }
@@ -415,6 +444,7 @@ async fn create_git_comparison(
     target: String,
     pull_request: Option<PullRequestInfo>,
     description: String,
+    stack: Option<StackSelection>,
 ) -> Result<Json<StartResponse>, ApiError> {
     let (base_commit, target_commit) =
         tokio::try_join!(git_commit(&repo, &base), git_commit(&repo, &target),)?;
@@ -422,7 +452,11 @@ async fn create_git_comparison(
         comparison_files(&repo, &base_commit, &target_commit),
         commits::commit_log(&repo, &base_commit, &target_commit),
     )?;
-    require_files(&files)?;
+    // A stack member may legitimately add nothing on top of its parent; the
+    // review still opens so the rest of the stack stays reachable.
+    if stack.is_none() {
+        require_files(&files)?;
+    }
     let comparison = comparison_info(
         RevisionInfo {
             revision: base,
@@ -444,6 +478,7 @@ async fn create_git_comparison(
         files,
         Some(comparison),
         log,
+        stack,
     ))
 }
 
@@ -516,6 +551,7 @@ async fn commit_scope(
         files,
         Some(comparison),
         CommitLog::default(),
+        None,
     ))
 }
 
@@ -574,7 +610,7 @@ async fn github_open_prs(
                     "--limit",
                     "100",
                     "--json",
-                    "number,title,url,state,baseRefName,headRefName,isDraft,author,updatedAt",
+                    OPEN_PR_FIELDS,
                 ],
             )
             .await?;
@@ -680,7 +716,7 @@ async fn github_pr_info(
             "--repo",
             github_repo,
             "--json",
-            "number,title,url,state,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,author,updatedAt",
+            "number,title,url,state,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,isCrossRepository,author,updatedAt",
         ],
     )
     .await?;
@@ -694,7 +730,16 @@ async fn start_github_pr_session(
     github_repo: String,
     number: u64,
 ) -> Result<Json<StartResponse>, ApiError> {
-    let pull = github_pr_info(&state.cache_dir, &repo, &github_repo, number, false).await?;
+    let (pull, open) = tokio::join!(
+        github_pr_info(&state.cache_dir, &repo, &github_repo, number, false),
+        open_pulls(&state.cache_dir, &repo, &github_repo),
+    );
+    let pull = pull?;
+    let members = stacks::stack_members(&open, &pull);
+    if !members.is_empty() {
+        let stack = Arc::new(stacks::resolve(&repo, members).await?);
+        return open_stack_member(state, repo, stack, number, StackMode::Pr).await;
+    }
     fetch_github_pr(&repo, &pull, false).await?;
     let base = git_commit(&repo, &pull.base_ref_oid).await?;
     let head = git_commit(&repo, &format!("refs/local-diffe/pr/{}", pull.number)).await?;
@@ -706,8 +751,134 @@ async fn start_github_pr_session(
         head,
         Some(pull),
         "PR comparison uses the fetched PR head and its Git merge-base; uncommitted working-tree changes are excluded.".into(),
+        None,
     )
     .await
+}
+
+/// Open another PR of a session's stack. Like commit scopes, the PR must come
+/// from the stack the session owns, so no client-supplied revision reaches Git.
+async fn stack_scope(
+    State(state): State<AppState>,
+    Json(request): Json<StackScopeRequest>,
+) -> Result<Json<StartResponse>, ApiError> {
+    let (repo, stack) = {
+        let sessions = state.sessions.lock().unwrap();
+        let session = sessions.get(&request.id).ok_or_else(|| {
+            ApiError::bad_request("This session has expired. Reload the comparison.")
+        })?;
+        let stack = session
+            .stack
+            .clone()
+            .ok_or_else(|| ApiError::bad_request("This comparison is not part of a PR stack."))?;
+        (session.repo.clone(), stack)
+    };
+    open_stack_member(state, repo, stack, request.number, request.mode).await
+}
+
+struct StackSelection {
+    stack: Arc<Stack>,
+    number: u64,
+    mode: StackMode,
+}
+
+async fn open_stack_member(
+    state: AppState,
+    repo: PathBuf,
+    stack: Arc<Stack>,
+    number: u64,
+    mode: StackMode,
+) -> Result<Json<StartResponse>, ApiError> {
+    let position = stack
+        .position(number)
+        .ok_or_else(|| ApiError::bad_request("That pull request is not part of this stack."))?;
+    let member = &stack.members[position];
+    let total = stack.members.len();
+    let ordinal = position + 1;
+    let parent = member.member.parent;
+    let (base, description) = match (mode, parent) {
+        (StackMode::Pr, Some(parent)) => (
+            member.base.clone(),
+            format!("Stacked PR {ordinal} of {total}: compared with PR #{parent}'s current head, so only this PR's own changes are shown."),
+        ),
+        (StackMode::Pr, None) => (
+            member.base.clone(),
+            format!("Stacked PR {ordinal} of {total}: the bottom of the stack, compared with its merge-base on `{}`.", stack.trunk),
+        ),
+        (StackMode::Cumulative, _) => (
+            member.cumulative_base.clone(),
+            format!("Stack through PR #{number}: everything from `{}` up to and including this PR.", stack.trunk),
+        ),
+    };
+    let base_label = match (mode, parent) {
+        (StackMode::Pr, Some(parent)) => format!("#{parent}"),
+        _ => stack.trunk.clone(),
+    };
+    let head = member.head.clone();
+    let pull = member.member.pull.clone();
+    let response = create_git_comparison(
+        state,
+        repo,
+        base,
+        head,
+        Some(pull),
+        description,
+        Some(StackSelection {
+            stack: stack.clone(),
+            number,
+            mode,
+        }),
+    )
+    .await?;
+    // Commits read better against a PR or branch name than a bare SHA.
+    let Json(mut response) = response;
+    if let Some(comparison) = response.comparison.as_mut() {
+        comparison.base.revision = base_label;
+        comparison.target.revision = format!("#{number}");
+    }
+    Ok(Json(response))
+}
+
+/// The open PRs used to find a stack. The cached list is reused (the PR list's
+/// Refresh rewrites it); a failure only means the PR opens without its stack.
+async fn open_pulls(cache_dir: &FsPath, repo: &FsPath, github_repo: &str) -> Vec<PullRequestInfo> {
+    if let Some(pulls) = read_pr_list_cache(cache_dir, github_repo) {
+        return pulls;
+    }
+    match gh_json::<Vec<PullRequestInfo>>(
+        Some(repo),
+        &[
+            "pr",
+            "list",
+            "--repo",
+            github_repo,
+            "--state",
+            "open",
+            "--limit",
+            "100",
+            "--json",
+            OPEN_PR_FIELDS,
+        ],
+    )
+    .await
+    {
+        Ok(pulls) => {
+            if let Err(error) = write_pr_list_cache(cache_dir, github_repo, &pulls) {
+                eprintln!(
+                    "Could not cache open PRs for {github_repo}: {}",
+                    error.message
+                );
+            }
+            pulls
+        }
+        Err(error) => {
+            eprintln!(
+                "Could not list open PRs for {github_repo}; opening without its stack: {}",
+                error.message
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// A full comparison with nothing to show is an error; a single commit may
@@ -729,6 +900,7 @@ fn create_session(
     files: Vec<FileEntry>,
     comparison: Option<ComparisonInfo>,
     log: CommitLog,
+    stack: Option<StackSelection>,
 ) -> Json<StartResponse> {
     let id = Uuid::new_v4().to_string();
     let session = Session {
@@ -737,6 +909,7 @@ fn create_session(
         target: target.trim().to_owned(),
         files: files.clone(),
         commits: log.commits.clone(),
+        stack: stack.as_ref().map(|selection| selection.stack.clone()),
     };
     state.sessions.lock().unwrap().insert(id.clone(), session);
     Json(StartResponse {
@@ -745,6 +918,17 @@ fn create_session(
         comparison,
         commits: log.commits,
         commits_truncated: log.truncated,
+        stack: stack.map(|selection| StackView {
+            trunk: selection.stack.trunk.clone(),
+            current: selection.number,
+            mode: selection.mode,
+            members: selection
+                .stack
+                .members
+                .iter()
+                .map(|member| member.member.clone())
+                .collect(),
+        }),
     })
 }
 
@@ -1266,7 +1450,7 @@ async fn semanticdiff_view(
     let bridge = r#"<style>:root{color-scheme:dark;--vscode-font-family:ui-sans-serif,system-ui,sans-serif;--vscode-font-size:13px;--vscode-editor-font-family:ui-monospace,SFMono-Regular,Menlo,monospace;--vscode-editor-font-size:12px;--vscode-editor-background:#0d1117;--vscode-editor-foreground:#e6edf3;--vscode-breadcrumb-background:#161b22;--vscode-breadcrumb-foreground:#c9d1d9;--vscode-breadcrumb-focusForeground:#58a6ff;--vscode-editorWidget-border:#30363d;--vscode-scrollbar-shadow:#010409;--vscode-focusBorder:#58a6ff;--vscode-button-background:#238636;--vscode-button-foreground:#fff;--vscode-button-hoverBackground:#2ea043;--vscode-input-background:#0d1117;--vscode-input-foreground:#e6edf3;--vscode-list-activeSelectionBackground:#1f6feb;--vscode-list-hoverBackground:#21262d;--vscode-diffEditor-insertedLineBackground:#0c281a;--vscode-diffEditor-removedLineBackground:#2a171d;--vscode-diffEditor-insertedTextBackground:#10351f;--vscode-diffEditor-removedTextBackground:#43212a;--vscode-diffEditor-diagonalFill:#30363d;--vscode-minimapSlider-background:#8b949e99;--vscode-peekViewResult-background:#161b22;--vscode-editorOverviewRuler-modifiedForeground:#58a6ff;--vscode-editorOverviewRuler-deletedForeground:#f85149;--vscode-editorOverviewRuler-addedForeground:#3fb950;--vscode-editorLineNumber-foreground:#8b949e;--vscode-editorUnicodeHighlight-background:#6e40c933;--vscode-editorUnicodeHighlight-border:#6e40c9;--vscode-editor-selectionBackground:#264f78;--vscode-notifications-background:#161b22;--vscode-notifications-border:#30363d;--vscode-notifications-foreground:#c9d1d9;--vscode-notificationsErrorIcon-foreground:#f85149;--vscode-disabledForeground:#8b949e;--vscode-icon-foreground:#c9d1d9;--vscode-editorCodeLens-foreground:#8b949e;--vscode-editorGhostText-foreground:#8b949e;--vscode-editorHint-foreground:#8b949e;--vscode-editorInlayHint-background:#21262d;--vscode-editorLink-activeForeground:#58a6ff;--vscode-editorSuggestWidget-foreground:#c9d1d9;--vscode-editorSuggestWidget-selectedForeground:#fff;--vscode-editorWidget-background:#161b22;--vscode-menu-selectionBackground:#1f6feb;--vscode-menu-selectionForeground:#fff;--vscode-statusBar-background:#161b22;--vscode-statusBar-foreground:#c9d1d9;--vscode-statusBarItem-hoverBackground:#21262d;--vscode-statusBarItem-hoverForeground:#fff;--vscode-toolbar-activeBackground:#30363d;--vscode-toolbar-hoverBackground:#21262d;--vscode-tree-tableColumnsBorder:#30363d;--vscode-tree-tableOddRowsBackground:#161b22}html,body{background:#0d1117!important;color:#e6edf3!important}.patch,.patch .line,.patch .code-fg,.patch .line .content,.patch .header{color:#c9d1d9!important}.patch .line .line-number,.patch .line .number{color:#8b949e!important}.patch .code-bg.added+.code-fg span[style*="rgb(139, 148, 158)"],.patch .code-bg.removed+.code-fg span[style*="rgb(139, 148, 158)"]{color:#d0d7de!important}.patch .line.added,.patch .mark.added{color:#b7dfc2!important}.patch .line.removed,.patch .mark.removed{color:#f0c8cf!important}</style><script>window.acquireVsCodeApi=()=>({getState:()=>undefined,setState:()=>{},postMessage:(message)=>window.parent!==window&&window.parent.postMessage({source:'semanticdiff',message},'*')});</script><script src="script.js"></script>"#;
     // The renderer lives in an iframe, so relay the outer app's keyboard-overlay
     // keys to its parent. Local Diffe decides whether a relayed key is active.
-    let keyboard_bridge = r#"<script>window.addEventListener('keydown',(event)=>{if(['-','?','Escape','f','d','v','j','k','F','D','V','J','K','[',']'].includes(event.key)){window.parent.postMessage({source:'local-diffe-keyboard',key:event.key},'*')}});</script>"#;
+    let keyboard_bridge = r#"<script>window.addEventListener('keydown',(event)=>{if(['-','?','Escape','f','d','v','j','k','F','D','V','J','K','[',']','{','}','n','m','N','M'].includes(event.key)){window.parent.postMessage({source:'local-diffe-keyboard',key:event.key},'*')}});</script>"#;
     let readiness_bridge = format!("<script>{}</script>", include_str!("semantic-bridge.js"));
     let html = template
         .replace("${webview.cspSource}", "'self'")

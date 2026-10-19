@@ -43,6 +43,39 @@ not a misleading whole-branch snapshot. Pasted links work for open, closed,
 and merged PRs; if the selected repository is different, Local Diffe clones a
 private cache copy under its application cache directory and reuses it later.
 
+## Review stacked pull requests
+
+A PR is part of a stack when its base branch is another open PR's head branch
+(Graphite, git-town, spr and ghstack stacks all work this way). The PR picker
+groups each stack under one heading, with stacked PRs indented under the PR
+they build on.
+
+Opening any PR in a stack fetches every member's current head, together with
+the trunk, in a single `git fetch`. The **Stack** panel above the file list
+shows the whole stack, bottom first; click a PR, or step with ⌃ ⌄ (or `{` /
+`}` with the keyboard overlay on). Two views are available:
+
+- **This PR** compares the PR with the merge-base of its parent PR's *current*
+  head. You see only that PR's own changes, even after its parent has been
+  pushed again.
+- **Through here** compares the PR with its merge-base on the trunk. This shows
+  everything that lands once the stack is merged up to and including this PR.
+
+A stack always opens in **Semantic** diff. Switching to Text applies until you
+move to another PR in the stack, and does not change the mode saved for other
+reviews. Each stacked PR has its own commit rail and its own viewed marks.
+Fork PRs are never linked into a stack, because branch names are not unique
+across forks. If a parent PR was merged and its child retargeted to the trunk
+without a rebase, the child is reviewed as a standalone PR.
+
+## Review faster
+
+Press `-` to turn on the keyboard overlay. Then `J` / `K` moves between files,
+`N` jumps to the next file you have not marked as viewed, and `M` toggles
+**Viewed**. The review header shows how many files have been viewed. When you
+open a review, or move to another PR or commit, its first file opens
+automatically.
+
 ## Review commit by commit
 
 Any Git or PR comparison lists its commits above the file filter, oldest first.

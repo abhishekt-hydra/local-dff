@@ -5,14 +5,22 @@ import { ROW_HEIGHT, visibleRange, type DiffRow, type ParsedDiff } from "../lib/
 import type { DiffWorkerMessage } from "../diff.worker"
 import { PERFORMANCE_BUILD_ENABLED, mark, measure, onRender, recordPerformance } from "../lib/performance"
 
-type DiffMode = "text" | "semantic"
+export type DiffMode = "text" | "semantic"
 const MODE_STORAGE_KEY = "local-diffe:diff-mode"
 
-function preferredMode(): DiffMode {
+export function preferredMode(): DiffMode {
   try {
     return localStorage.getItem(MODE_STORAGE_KEY) === "text" ? "text" : "semantic"
   } catch {
     return "semantic"
+  }
+}
+
+export function rememberMode(mode: DiffMode) {
+  try {
+    localStorage.setItem(MODE_STORAGE_KEY, mode)
+  } catch {
+    // The viewer remains usable when browser storage is unavailable.
   }
 }
 
@@ -172,10 +180,13 @@ const DiffRowView = memo(function DiffRowView({ row, index }: { row: DiffRow; in
   </div>
 })
 
-function DiffViewerContent({ sessionId, index, path, frameRef }: {
-  sessionId: string; index: number; path: string; frameRef: RefObject<HTMLIFrameElement | null>
-}) {
-  const [mode, setMode] = useState<DiffMode>(preferredMode)
+type DiffViewerProps = {
+  sessionId: string; index: number; path: string; mode: DiffMode; frameRef: RefObject<HTMLIFrameElement | null>
+}
+
+// The mode is owned by the app: a PR stack always opens in Semantic diff, while
+// other reviews follow the last mode chosen.
+function DiffViewerContent({ sessionId, index, path, mode, frameRef }: DiffViewerProps) {
   const [attempt, setAttempt] = useState(0)
   const url = `/api/diff/${sessionId}/${index}`
   const semanticUrl = `/semanticdiff-view/${sessionId}/${index}`
@@ -185,14 +196,6 @@ function DiffViewerContent({ sessionId, index, path, frameRef }: {
   const [loading, setLoading] = useState(() => !initialResult)
   const [complete, setComplete] = useState(() => Boolean(initialResult))
   const [error, setError] = useState("")
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(MODE_STORAGE_KEY, mode)
-    } catch {
-      // The viewer remains usable when browser storage is unavailable.
-    }
-  }, [mode])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -209,7 +212,7 @@ function DiffViewerContent({ sessionId, index, path, frameRef }: {
     if (hit) setLoading(false)
     const timer = window.setTimeout(() => {
       if (!active) return
-      fail(new Error("The viewer timed out. Retry or switch to Text diff."))
+      fail(new Error(mode === "semantic" ? "The semantic viewer timed out. Retry or switch to Text." : "The viewer timed out. Retry loading this file."))
     }, 45_000)
     const fail = (reason: unknown) => {
       if (!active) return
@@ -328,10 +331,6 @@ function DiffViewerContent({ sessionId, index, path, frameRef }: {
     ? <Profiler id="DiffViewer.TextDiff" onRender={onRender}><TextDiff result={result} path={path} /></Profiler>
     : <TextDiff result={result} path={path} />)
   return <div className="flex h-full min-h-0 flex-col" data-diff-complete={mode === "text" ? complete : true} data-diff-row-count={mode === "text" ? result?.rows.length ?? 0 : 0}>
-    <div className="flex shrink-0 flex-wrap items-center gap-2 border-b px-3 py-2">
-      <Button size="sm" variant={mode === "text" ? "secondary" : "ghost"} aria-pressed={mode === "text"} onClick={() => setMode("text")}>Text diff</Button>
-      <Button size="sm" variant={mode === "semantic" ? "secondary" : "ghost"} aria-pressed={mode === "semantic"} onClick={() => setMode("semantic")}>Semantic diff</Button>
-    </div>
     {result?.truncated && mode === "text" && <p className="shrink-0 px-3 py-1 text-xs text-muted-foreground">Long lines are shortened to 2,000 characters.</p>}
     {result?.limited && mode === "text" && <p className="shrink-0 px-3 py-1 text-xs text-muted-foreground">Showing the first 200,000 diff rows of this file.</p>}
     <div className="relative min-h-0 flex-1">
@@ -343,7 +342,7 @@ function DiffViewerContent({ sessionId, index, path, frameRef }: {
   </div>
 }
 
-export const DiffViewer = memo(function DiffViewer(props: { sessionId: string; index: number; path: string; frameRef: RefObject<HTMLIFrameElement | null> }) {
+export const DiffViewer = memo(function DiffViewer(props: DiffViewerProps) {
   const content = <DiffViewerContent {...props} />
   return PERFORMANCE_BUILD_ENABLED ? <Profiler id="DiffViewer" onRender={onRender}>{content}</Profiler> : content
 })

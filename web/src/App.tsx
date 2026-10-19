@@ -7,6 +7,12 @@ import {
   ChevronUp,
   ChevronsUpDown,
   Check,
+  FileUp,
+  FolderGit2,
+  GitCompareArrows,
+  Layers,
+  RefreshCw,
+  SkipForward,
   FileCode2,
   FileDiff,
   Folder,
@@ -30,20 +36,28 @@ import { Input } from "@/components/ui/input"
 import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from "@/components/ui/command"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { cn } from "@/lib/utils"
-import { DiffViewer } from "@/components/DiffViewer"
+import { DiffViewer, preferredMode, rememberMode, type DiffMode } from "@/components/DiffViewer"
 import { buildFileNavigation, makeTree, type TreeItem } from "./sidebarTree"
+import { groupPulls, type PullRequest } from "./stacks"
 import { PERFORMANCE_BUILD_ENABLED, onRender } from "./lib/performance"
 
 type PatchFile = { old_path: string | null; new_path: string | null; display_path: string; renderable: boolean }
 type Revision = { revision: string; commit: string }
-type PullRequest = { number: number; title: string; url: string; state: string; baseRefName: string; headRefName: string; isDraft: boolean; author?: { login: string } | null; updatedAt: string }
 type Comparison = { base: Revision; target: Revision; changed_paths: number; semantic_paths: number; description: string; pull_request?: PullRequest | null }
 type Commit = { sha: string; short: string; parents: string[]; author: string; date: string; subject: string; files_changed: number }
-type Session = { id: string; files: PatchFile[]; comparison?: Comparison | null; commits?: Commit[]; commits_truncated?: boolean }
+type StackMode = "pr" | "cumulative"
+type StackMember = { pull: PullRequest; parent: number | null; depth: number }
+type Stack = { trunk: string; current: number; mode: StackMode; members: StackMember[] }
+type Session = { id: string; files: PatchFile[]; comparison?: Comparison | null; commits?: Commit[]; commits_truncated?: boolean; stack?: Stack | null }
 type ScopeMode = "commit" | "cumulative"
+type SourceTab = "pr" | "branches" | "patch"
 const EMPTY_FILES: PatchFile[] = []
 const EMPTY_COMMITS: Commit[] = []
-const OVERLAY_KEYS = ["f", "d", "v", "j", "k", "[", "]"]
+const OVERLAY_KEYS = ["f", "d", "v", "j", "k", "[", "]", "{", "}", "n", "m"]
+const SOURCE_TABS = [["pr", "Pull request", GitPullRequest], ["branches", "Branches", GitCompareArrows], ["patch", "Patch file", FileUp]] as const
+const STACK_MODES = [["pr", "This PR", "Only this PR's changes, compared with the PR below it"], ["cumulative", "Through here", "Everything from the trunk through this PR"]] as const
+const COMMIT_MODES = [["commit", "This commit", "Changes made by the selected commit alone"], ["cumulative", "Up to commit", "Everything from the comparison base through the selected commit"]] as const
+const DIFF_MODES = [["semantic", "Semantic", "SemanticDiff: hides moves and formatting-only changes"], ["text", "Text", "Plain unified text diff"]] as const
 const NO_VIEWED: ReadonlySet<number> = new Set()
 
 type ReviewRegion = "sidebar" | "diff"
@@ -83,6 +97,31 @@ function scopeStatus(scoped: Session, commits: Commit[], index: number, mode: Sc
   const position = mode === "commit" ? `Commit ${index + 1} of ${commits.length}` : `Commits 1–${index + 1} of ${commits.length}`
   const changed = scoped.comparison?.changed_paths ?? scoped.files.length
   return `${position} · ${commit.short} ${commit.subject} · ${changed ? `${changed} changed paths · ${scoped.comparison?.semantic_paths ?? 0} content diffs` : "no file changes"}`
+}
+
+function Segmented<T extends string>({ value, options, onChange, label, testId, className }: {
+  value: T
+  options: readonly (readonly [T, string, string])[]
+  onChange: (value: T) => void
+  label: string
+  testId: string
+  className?: string
+}) {
+  return <div role="radiogroup" aria-label={label} className={cn("grid auto-cols-fr grid-flow-col gap-0.5 rounded-full bg-muted p-0.5 text-[11px] font-medium", className)}>
+    {options.map(([option, text, title]) => <button key={option} type="button" role="radio" data-testid={`${testId}-${option}`} aria-checked={value === option} title={title} onClick={() => onChange(option)} className={cn("whitespace-nowrap rounded-full px-2.5 py-1 transition-colors", value === option ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground")}>{text}</button>)}
+  </div>
+}
+
+function BranchChip({ name }: { name: string }) {
+  return <span className="max-w-[16rem] truncate rounded-md bg-muted px-1.5 py-0.5 font-mono text-[11px] text-foreground/80" title={name}>{name}</span>
+}
+
+function FilePath({ path }: { path: string }) {
+  const slash = path.lastIndexOf("/")
+  return <span className="flex min-w-0 items-baseline font-mono text-xs" title={path}>
+    {slash !== -1 && <span className="min-w-0 truncate text-muted-foreground">{path.slice(0, slash + 1)}</span>}
+    <span className="shrink-0 font-semibold text-foreground">{path.slice(slash + 1)}</span>
+  </span>
 }
 
 function formatCommitDate(iso: string) {
@@ -217,6 +256,9 @@ export default function App() {
   const [pulls, setPulls] = useState<PullRequest[]>([])
   const [prNumber, setPrNumber] = useState("")
   const [prPickerOpen, setPrPickerOpen] = useState(false)
+  const [sourceTab, setSourceTab] = useState<SourceTab>("pr")
+  const [diffMode, setDiffMode] = useState<DiffMode>(preferredMode)
+  const [stackLoading, setStackLoading] = useState(false)
   const [chromeHidden, setChromeHidden] = useState(false)
   const [keyboardOverlay, setKeyboardOverlay] = useState(false)
   const [keyboardOverlayExpanded, setKeyboardOverlayExpanded] = useState(false)
@@ -251,6 +293,8 @@ export default function App() {
   const semanticScrollCacheRef = useRef<{ document: Document; target: HTMLElement | null } | undefined>(undefined)
   const scopeCacheRef = useRef(new Map<string, Session>())
   const scopeRequestRef = useRef(0)
+  const stackCacheRef = useRef(new Map<string, Session>())
+  const stackRequestRef = useRef(0)
   const shownCommitIndexRef = useRef<number | null>(null)
   const selectionRef = useRef({ session, selected })
   selectionRef.current = { session, selected }
@@ -260,7 +304,10 @@ export default function App() {
   const fileNavigation = useMemo(() => buildFileNavigation(files), [files])
   const deferredSearch = useDeferredValue(search)
   const selectedPull = useMemo(() => pulls.find((pull) => String(pull.number) === prNumber), [pulls, prNumber])
+  const pullGroups = useMemo(() => groupPulls(pulls), [pulls])
   const commits = rootSession?.commits ?? EMPTY_COMMITS
+  const stack = rootSession?.stack ?? null
+  const stackPosition = stack ? stack.members.findIndex((member) => member.pull.number === stack.current) : -1
   const viewedKey = useMemo(() => viewedStorageKey(session, rootSession), [rootSession, session])
   const viewedFiles = viewedState.key === viewedKey && viewedState.files === files ? viewedState.indices : NO_VIEWED
   const sidebarScale = sidebarFontSize / 12
@@ -353,21 +400,34 @@ export default function App() {
     semanticScrollCacheRef.current = undefined
   }, [selected, session?.id])
 
+  // Show a full comparison (a review, or one PR of a stack), dropping any
+  // in-flight commit scope of the previous one. The reviewed file stays
+  // selected when the new comparison has it; otherwise its first file opens.
+  const showRoot = useCallback((next: Session, keepPath: string | null) => {
+    scopeRequestRef.current += 1
+    scopeCacheRef.current = new Map()
+    shownCommitIndexRef.current = null
+    setScopeLoading(false)
+    setCommitIndex(null)
+    setRootSession(next)
+    setSession(next)
+    const keep = keepPath ? next.files.findIndex((file) => file.renderable && file.display_path === keepPath) : -1
+    setSelected(keep === -1 ? (buildFileNavigation(next.files).indices[0] ?? null) : keep)
+    setStatus(comparisonStatus(next))
+  }, [])
+
   const loadSession = async (endpoint: string, payload: unknown, progress: string) => {
     setLoading(true)
     setStatus(progress)
     try {
       const next = await api<Session>(endpoint, payload)
-      // Drop any in-flight commit scope of the previous comparison.
-      scopeRequestRef.current += 1
-      scopeCacheRef.current = new Map()
-      shownCommitIndexRef.current = null
-      setScopeLoading(false)
-      setCommitIndex(null)
-      setRootSession(next)
-      setSession(next)
-      setSelected(null)
-      setStatus(comparisonStatus(next))
+      stackRequestRef.current += 1
+      stackCacheRef.current = new Map()
+      if (next.stack) stackCacheRef.current.set(`${next.stack.current}:${next.stack.mode}`, next)
+      setStackLoading(false)
+      // A stack always opens in Semantic diff; other reviews keep the last mode.
+      setDiffMode(next.stack ? "semantic" : preferredMode())
+      showRoot(next, null)
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Unable to create comparison")
     } finally {
@@ -455,6 +515,42 @@ export default function App() {
     if (next !== commitIndex) void selectScope(next, scopeMode)
   }, [commitIndex, commits.length, scopeMode, selectScope])
 
+  // Open another PR of the stack, or the same PR in the other stack mode.
+  const selectStack = useCallback(async (number: number, mode: StackMode) => {
+    if (!rootSession?.stack) return
+    const request = ++stackRequestRef.current
+    const cacheKey = `${number}:${mode}`
+    let next = stackCacheRef.current.get(cacheKey)
+    if (!next) {
+      setStackLoading(true)
+      try {
+        next = await api<Session>("/api/stack-scope", { id: rootSession.id, number, mode })
+        stackCacheRef.current.set(cacheKey, next)
+      } catch (error) {
+        if (request !== stackRequestRef.current) return
+        setStackLoading(false)
+        setStatus(error instanceof Error ? error.message : "Unable to open this pull request")
+        return
+      }
+    }
+    if (request !== stackRequestRef.current) return
+    setStackLoading(false)
+    if (number !== rootSession.stack.current) setDiffMode("semantic")
+    const { session: current, selected: currentSelected } = selectionRef.current
+    showRoot(next, currentSelected === null ? null : current?.files[currentSelected]?.display_path ?? null)
+  }, [rootSession, showRoot])
+
+  const stepStack = useCallback((direction: 1 | -1) => {
+    if (!stack) return
+    const next = stack.members[stackPosition + direction]
+    if (next) void selectStack(next.pull.number, stack.mode)
+  }, [selectStack, stack, stackPosition])
+
+  const changeDiffMode = (mode: DiffMode) => {
+    setDiffMode(mode)
+    if (!rootSession?.stack) rememberMode(mode)
+  }
+
   const changeScopeMode = (mode: ScopeMode) => {
     if (mode === scopeMode) return
     setScopeMode(mode)
@@ -514,6 +610,30 @@ export default function App() {
     else viewport.scrollBy({ top: distance, behavior: "smooth" })
   }, [])
 
+  const toggleViewed = useCallback(() => {
+    if (selected === null || !files[selected]) return
+    setViewedState((current) => {
+      if (current.key !== viewedKey || current.files !== files) return current
+      const indices = new Set(current.indices)
+      if (indices.has(selected)) indices.delete(selected)
+      else indices.add(selected)
+      return { ...current, indices }
+    })
+  }, [files, selected, viewedKey])
+
+  const nextUnviewed = useCallback(() => {
+    const { indices, positions } = fileNavigation
+    const start = selected === null ? -1 : (positions.get(selected) ?? -1)
+    for (let step = 1; step <= indices.length; step++) {
+      const candidate = indices[(start + step) % indices.length]
+      if (!viewedFiles.has(candidate)) {
+        setSelected(candidate)
+        return
+      }
+    }
+    if (indices.length) setStatus("Every file in this view is marked as viewed.")
+  }, [fileNavigation, selected, viewedFiles])
+
   const toggleKeyboardOverlay = useCallback(() => {
     setKeyboardOverlay((open) => {
       const next = !open
@@ -553,8 +673,20 @@ export default function App() {
       case "]":
         stepCommit(1)
         break
+      case "{":
+        stepStack(-1)
+        break
+      case "}":
+        stepStack(1)
+        break
+      case "n":
+        nextUnviewed()
+        break
+      case "m":
+        toggleViewed()
+        break
     }
-  }, [activeRegion, focusDiff, focusSidebar, moveFile, scrollDiff, stepCommit])
+  }, [activeRegion, focusDiff, focusSidebar, moveFile, nextUnviewed, scrollDiff, stepCommit, stepStack, toggleViewed])
 
   useEffect(() => {
     if (activeRegion !== "diff") return
@@ -618,88 +750,143 @@ export default function App() {
 
   const selectedFile = selected === null ? null : session?.files[selected]
   const selectedViewed = selected !== null && viewedFiles.has(selected)
-  const toggleViewed = () => {
-    if (selected === null || !selectedFile) return
-    setViewedState((current) => {
-      if (current.key !== viewedKey || current.files !== files) return current
-      const indices = new Set(current.indices)
-      if (indices.has(selected)) indices.delete(selected)
-      else indices.add(selected)
-      return { ...current, indices }
-    })
-  }
+  const reviewable = fileNavigation.indices.length
+  const viewedCount = fileNavigation.indices.filter((index) => viewedFiles.has(index)).length
+  const selectedPosition = selected === null ? null : fileNavigation.positions.get(selected)
+  const pullRequest = rootSession?.comparison?.pull_request ?? null
+  const renderPullItem = (pull: PullRequest, depth = 0) => <CommandItem key={pull.number} value={`${pull.number} ${pull.title} ${pull.author?.login ?? ""} ${pull.headRefName}`} onSelect={() => { setPrNumber(String(pull.number)); setPrPickerOpen(false) }}>
+    <Check className={cn("mr-1 size-4 shrink-0", prNumber === String(pull.number) ? "opacity-100" : "opacity-0")} />
+    <span className="flex min-w-0 flex-1 items-center gap-1.5" style={{ paddingLeft: depth * 14 }}>
+      {depth > 0 && <span className="shrink-0 text-muted-foreground" aria-hidden="true">↳</span>}
+      <span className="shrink-0 font-medium tabular-nums">#{pull.number}</span>
+      <span className="min-w-0 truncate">{pull.title}</span>
+    </span>
+    {pull.isDraft && <span className="ml-2 shrink-0 rounded bg-muted px-1.5 text-[10px] font-medium uppercase text-muted-foreground">Draft</span>}
+  </CommandItem>
   return (
     <div className="min-h-screen bg-muted/40">
       {loading && <div className="fixed inset-x-0 top-0 z-[60] h-1 overflow-hidden bg-primary/10" role="progressbar" aria-label="Loading comparison"><div className="loading-sheen h-full w-1/3 bg-primary" /></div>}
       {!chromeHidden && <header className="border-b bg-background">
-        <div className="flex h-14 w-full items-center gap-3 px-4">
+        <div className="flex h-12 w-full items-center gap-3 px-4">
           <div className="flex items-center gap-2 font-semibold"><FileDiff className="size-5 text-primary" /> Local Diffe</div>
           <span className="hidden text-sm text-muted-foreground md:inline">GitHub-style review, SemanticDiff display engine</span>
-          <div className="ml-auto flex items-center gap-2"><div className="flex items-center gap-1.5 text-xs text-muted-foreground"><Sparkles className="size-3.5" /> local only</div><Button data-testid="keyboard-overlay-toggle" size="sm" variant={keyboardOverlay ? "secondary" : "outline"} onClick={toggleKeyboardOverlay} aria-pressed={keyboardOverlay} title="Toggle keyboard overlay (-)"><Keyboard className="size-4" /> Keys</Button><Button data-testid="hide-chrome" size="sm" variant="outline" onClick={() => setChromeHidden(true)}><ChevronUp className="size-4" /> Focus view</Button></div>
+          <div className="ml-auto flex items-center gap-2"><div className="hidden items-center gap-1.5 text-xs text-muted-foreground sm:flex"><Sparkles className="size-3.5" /> local only</div><Button data-testid="keyboard-overlay-toggle" size="sm" variant={keyboardOverlay ? "secondary" : "outline"} onClick={toggleKeyboardOverlay} aria-pressed={keyboardOverlay} title="Toggle keyboard overlay (-)"><Keyboard className="size-4" /> Keys</Button><Button data-testid="hide-chrome" size="sm" variant="outline" onClick={() => setChromeHidden(true)}><ChevronUp className="size-4" /> Focus view</Button></div>
         </div>
       </header>}
 
-      <main className="flex w-full flex-col gap-4 p-4">
+      <main className="flex w-full flex-col gap-3 p-4">
         {loading && <div className="flex items-center gap-3 rounded-2xl bg-primary/[.07] px-4 py-3 text-sm text-foreground shadow-[0_12px_32px_-28px_rgba(0,113,227,0.8)]" role="status" aria-live="polite">
           <LoaderCircle className="size-4 shrink-0 animate-spin text-primary" />
           <span className="min-w-0 truncate">{status}</span>
           <span className="loading-dots shrink-0 text-primary" aria-hidden="true">•••</span>
         </div>}
         {chromeHidden && <Button data-testid="show-chrome" size="sm" variant="outline" className="fixed right-4 top-4 z-20 shadow-md" onClick={() => setChromeHidden(false)}><ChevronDown className="size-4" /> Show controls</Button>}
-        {!chromeHidden && <><Card>
-          <CardContent className="grid gap-3 p-4 lg:grid-cols-[minmax(340px,1fr)_150px_150px_auto_auto] lg:items-end">
-            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Repository
-              <Input data-testid="repo" value={repo} onChange={(event) => setRepo(event.target.value)} />
-            </label>
-            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Base
-              <Input data-testid="base" value={base} onChange={(event) => setBase(event.target.value)} />
-            </label>
-            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">Compare
-              <Input data-testid="target" value={target} onChange={(event) => setTarget(event.target.value)} />
-            </label>
-            <Button data-testid="generate-diff" onClick={generate} disabled={loading}>{loading ? <LoaderCircle className="size-4 animate-spin" /> : <GitBranch className="size-4" />} {loading ? "Generating…" : "Generate diff"}</Button>
-            <Button asChild variant="outline" disabled={loading}><label className="cursor-pointer">{loading ? <LoaderCircle className="size-4 animate-spin" /> : <Upload className="size-4" />} {loading ? "Loading…" : "Upload patch"}<input className="hidden" type="file" accept=".diff,.patch,text/plain" onChange={(event) => upload(event.target.files?.[0])} /></label></Button>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="grid gap-3 p-4 lg:grid-cols-[minmax(360px,1fr)_auto_minmax(280px,1fr)_auto] lg:items-end">
-            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">GitHub pull-request URL
-              <Input data-testid="pr-url" value={prUrl} onChange={(event) => setPrUrl(event.target.value)} placeholder="https://github.com/owner/repo/pull/123" />
-            </label>
-            <Button data-testid="open-pr-url" variant="secondary" onClick={openPrUrl} disabled={loading}>{loading ? <LoaderCircle className="size-4 animate-spin" /> : <Link className="size-4" />} {loading ? "Opening…" : "Open PR"}</Button>
-            <div className="grid gap-1.5 text-xs font-medium text-muted-foreground">
-              <span id="pr-picker-label">Open PRs for repository</span>
+        {!chromeHidden && <Card data-testid="source-card">
+          <CardContent className="grid gap-3 p-3">
+            <div className="flex flex-wrap items-center gap-3">
+              <div role="tablist" aria-label="Review source" className="flex rounded-full bg-muted p-0.5 text-xs font-medium">
+                {SOURCE_TABS.map(([tab, label, Icon]) => <button key={tab} type="button" role="tab" data-testid={`source-${tab}`} aria-selected={sourceTab === tab} onClick={() => setSourceTab(tab)} className={cn("flex items-center gap-1.5 rounded-full px-3 py-1.5 transition-colors", sourceTab === tab ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground")}><Icon className="size-3.5" />{label}</button>)}
+              </div>
+              <label className="flex min-w-[260px] flex-1 items-center gap-2 text-xs font-medium text-muted-foreground lg:ml-auto lg:max-w-[560px]" title="Local repository: used to list its PRs and to generate branch diffs">
+                <FolderGit2 className="size-3.5 shrink-0" /><span className="shrink-0">Repository</span>
+                <Input data-testid="repo" value={repo} onChange={(event) => setRepo(event.target.value)} className="h-8 font-mono text-xs" />
+              </label>
+            </div>
+            {sourceTab === "pr" && <div className="grid gap-2 lg:grid-cols-[minmax(0,1fr)_auto_minmax(0,1.25fr)_auto] lg:items-center">
+              <Input data-testid="pr-url" aria-label="GitHub pull-request URL" value={prUrl} onChange={(event) => setPrUrl(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") openPrUrl() }} placeholder="Paste a PR link — https://github.com/owner/repo/pull/123" className="h-9" />
+              <Button data-testid="open-pr-url" variant="secondary" onClick={openPrUrl} disabled={loading}><Link className="size-4" /> Open</Button>
               <Popover open={prPickerOpen} onOpenChange={setPrPickerOpen}>
                 <PopoverTrigger asChild>
-                  <Button data-testid="pr-select" variant="outline" role="combobox" aria-labelledby="pr-picker-label" aria-expanded={prPickerOpen} disabled={!pulls.length || loading} className="h-9 w-full justify-between font-normal">
-                    <span className="truncate">{selectedPull ? `#${selectedPull.number} · ${selectedPull.title}` : "List open PRs first"}</span><ChevronsUpDown className="ml-2 size-4 shrink-0 opacity-50" />
+                  <Button data-testid="pr-select" variant="outline" role="combobox" aria-label="Open pull requests" aria-expanded={prPickerOpen} disabled={!pulls.length || loading} className="h-9 w-full min-w-0 justify-between font-normal">
+                    <span className="min-w-0 truncate">{selectedPull ? <><span className="font-medium tabular-nums">#{selectedPull.number}</span> · {selectedPull.title}</> : pulls.length ? "Choose an open PR" : "or list this repository's open PRs →"}</span><ChevronsUpDown className="ml-2 size-4 shrink-0 opacity-50" />
                   </Button>
                 </PopoverTrigger>
-                <PopoverContent align="start" className="w-[var(--radix-popover-trigger-width)]">
+                <PopoverContent align="start" className="w-[max(var(--radix-popover-trigger-width),420px)]">
                   <Command>
-                    <CommandInput placeholder="Search by PR number or title…" />
-                    <CommandList>
+                    <CommandInput placeholder="Search by PR number, title, author or branch…" />
+                    <CommandList className="max-h-96">
                       <CommandEmpty>No matching pull request.</CommandEmpty>
-                      <CommandGroup heading={`${pulls.length} open pull requests`}>
-                        {pulls.map((pull) => <CommandItem key={pull.number} value={`${pull.number} ${pull.title} ${pull.author?.login ?? ""}`} onSelect={() => { setPrNumber(String(pull.number)); setPrPickerOpen(false) }}>
-                          <Check className={cn("mr-2 size-4", prNumber === String(pull.number) ? "opacity-100" : "opacity-0")} />
-                          <span className="min-w-0 truncate"><span className="font-medium">#{pull.number}</span> · {pull.title}</span>
-                        </CommandItem>)}
-                      </CommandGroup>
+                      {pullGroups.stacks.map((rows) => <CommandGroup key={rows[0].pull.number} heading={`Stack on ${rows[0].pull.baseRefName} · ${rows.length} PRs`}>
+                        {rows.map(({ pull, depth }) => renderPullItem(pull, depth))}
+                      </CommandGroup>)}
+                      {pullGroups.standalone.length > 0 && <CommandGroup heading={pullGroups.stacks.length ? `Other open PRs · ${pullGroups.standalone.length}` : `${pulls.length} open pull requests`}>
+                        {pullGroups.standalone.map((pull) => renderPullItem(pull))}
+                      </CommandGroup>}
                     </CommandList>
                   </Command>
                 </PopoverContent>
               </Popover>
-            </div>
-            <div className="flex gap-2"><Button data-testid="list-prs" variant="outline" onClick={() => void listPulls()} disabled={loading}>{loading ? <LoaderCircle className="size-4 animate-spin" /> : <GitPullRequest className="size-4" />} {loading ? "Loading…" : "List"}</Button><Button data-testid="refresh-prs" variant="outline" onClick={() => void listPulls(true)} disabled={loading}><GitPullRequest className="size-4" /> Refresh</Button><Button data-testid="open-selected-pr" onClick={openPull} disabled={loading || !prNumber}>{loading ? <LoaderCircle className="size-4 animate-spin" /> : <GitBranch className="size-4" />} {loading ? "Reviewing…" : "Review"}</Button></div>
+              <div className="flex gap-2">
+                <Button data-testid="list-prs" variant="outline" onClick={() => void listPulls()} disabled={loading}><GitPullRequest className="size-4" /> List</Button>
+                <Button data-testid="refresh-prs" size="icon" variant="outline" onClick={() => void listPulls(true)} disabled={loading} title="Refresh open PRs from GitHub" aria-label="Refresh open PRs"><RefreshCw className="size-4" /></Button>
+                <Button data-testid="open-selected-pr" onClick={openPull} disabled={loading || !prNumber}>{loading ? <LoaderCircle className="size-4 animate-spin" /> : <GitBranch className="size-4" />} Review</Button>
+              </div>
+            </div>}
+            {sourceTab !== "pr" && <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] sm:items-center">
+              <label className="flex items-center gap-2 text-xs font-medium text-muted-foreground"><span className="w-14 shrink-0">Base</span><Input data-testid="base" value={base} onChange={(event) => setBase(event.target.value)} className="h-9 font-mono text-xs" /></label>
+              <label className="flex items-center gap-2 text-xs font-medium text-muted-foreground"><span className="w-14 shrink-0">Compare</span><Input data-testid="target" value={target} onChange={(event) => setTarget(event.target.value)} className="h-9 font-mono text-xs" /></label>
+              {sourceTab === "branches"
+                ? <Button data-testid="generate-diff" onClick={generate} disabled={loading}>{loading ? <LoaderCircle className="size-4 animate-spin" /> : <GitBranch className="size-4" />} Generate diff</Button>
+                : <Button asChild variant="outline" disabled={loading}><label className="cursor-pointer">{loading ? <LoaderCircle className="size-4 animate-spin" /> : <Upload className="size-4" />} Upload patch<input className="hidden" type="file" accept=".diff,.patch,text/plain" onChange={(event) => upload(event.target.files?.[0])} /></label></Button>}
+            </div>}
+            {!loading && <p data-testid="status" className="truncate px-1 text-xs text-muted-foreground" title={status}>{status}</p>}
           </CardContent>
-        </Card></>}
+        </Card>}
 
-        <div ref={reviewGrid} aria-busy={loading} style={{ "--sidebar-width": `${sidebarWidth}px` } as React.CSSProperties} className={cn("grid min-h-[calc(100vh-150px)] gap-4 lg:grid-cols-[minmax(220px,var(--sidebar-width))_minmax(0,1fr)]", chromeHidden && "min-h-[calc(100vh-2rem)]")}>
+        {rootSession && !chromeHidden && <Card data-testid="review-summary" className="flex flex-wrap items-center gap-x-6 gap-y-2 px-4 py-3">
+          <div className="min-w-0 flex-1">
+            <div className="flex min-w-0 items-center gap-2">
+              {pullRequest ? <GitPullRequest className="size-4 shrink-0 text-primary" /> : <GitCompareArrows className="size-4 shrink-0 text-primary" />}
+              {pullRequest
+                ? <a href={pullRequest.url} target="_blank" rel="noreferrer" className="min-w-0 truncate text-sm font-semibold hover:underline">{pullRequest.title}</a>
+                : <span className="min-w-0 truncate font-mono text-sm font-semibold">{rootSession.comparison ? `${rootSession.comparison.base.revision} → ${rootSession.comparison.target.revision}` : "Uploaded patch"}</span>}
+              {pullRequest && <span className="shrink-0 text-sm tabular-nums text-muted-foreground">#{pullRequest.number}</span>}
+              {pullRequest?.isDraft && <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium uppercase text-muted-foreground">Draft</span>}
+              {stack && <span className="flex shrink-0 items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary"><Layers className="size-3" /> {stackPosition + 1} of {stack.members.length} in stack</span>}
+            </div>
+            <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+              {pullRequest && <span className="flex min-w-0 items-center gap-1.5"><BranchChip name={pullRequest.baseRefName} /><span aria-label="from">←</span><BranchChip name={pullRequest.headRefName} /></span>}
+              {pullRequest?.author && <span>by {pullRequest.author.login}</span>}
+              {session?.comparison && <span className="min-w-0 truncate" title={session.comparison.description}>{session.comparison.description}</span>}
+            </div>
+          </div>
+          <dl className="flex shrink-0 items-center gap-5 text-xs">
+            <div><dt className="text-muted-foreground">Files</dt><dd className="font-semibold tabular-nums">{session?.comparison?.changed_paths ?? session?.files.length ?? 0}</dd></div>
+            {commits.length > 0 && <div><dt className="text-muted-foreground">Commits</dt><dd className="font-semibold tabular-nums">{commits.length}</dd></div>}
+            <div className="w-36"><dt className="flex justify-between text-muted-foreground"><span>Viewed</span><span className="tabular-nums">{viewedCount}/{reviewable}</span></dt><dd className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-muted"><div className="h-full rounded-full bg-emerald-500 transition-[width] duration-300" style={{ width: `${reviewable ? (viewedCount / reviewable) * 100 : 0}%` }} /></dd></div>
+          </dl>
+        </Card>}
+
+        <div ref={reviewGrid} aria-busy={loading} style={{ "--sidebar-width": `${sidebarWidth}px` } as React.CSSProperties} className={cn("grid min-h-[calc(100vh-150px)] gap-3 lg:grid-cols-[minmax(220px,var(--sidebar-width))_minmax(0,1fr)]", chromeHidden && "min-h-[calc(100vh-2rem)]")}>
           <SidebarProfilerBoundary>
           <Card ref={sidebarRef} tabIndex={-1} aria-label="Changed files sidebar" className={cn("relative flex min-h-0 flex-col overflow-visible outline-none", activeRegion === "sidebar" && keyboardOverlay && "ring-2 ring-primary ring-offset-2")}>
-            <CardHeader className="gap-3 rounded-t-lg border-b bg-card p-3"><div className="flex items-center justify-between gap-2"><CardTitle className="text-sm">Changed files {session && <span className="font-normal text-muted-foreground">({session.comparison?.changed_paths ?? session.files.length})</span>}</CardTitle><div className="flex items-center gap-0.5"><Button type="button" size="icon" variant="ghost" className="size-7" title="Smaller file text" onClick={() => setSidebarFontSize((size) => Math.max(10, size - 1))}><Minus className="size-3.5" /></Button><span className="w-7 text-center text-[10px] text-muted-foreground" title="File sidebar font size">{sidebarFontSize}px</span><Button type="button" size="icon" variant="ghost" className="size-7" title="Larger file text" onClick={() => setSidebarFontSize((size) => Math.min(18, size + 1))}><Plus className="size-3.5" /></Button><span className="mx-1 h-4 border-l" /><Button type="button" size="icon" variant="ghost" className="size-7" title="Make file sidebar narrower" onClick={() => setSidebarWidth((width) => Math.max(220, width - 40))}><Minus className="size-3.5" /></Button><Button type="button" size="icon" variant="ghost" className="size-7" title="Make file sidebar wider" onClick={() => setSidebarWidth((width) => Math.min(760, width + 40))}><Plus className="size-3.5" /></Button></div></div>
+            <CardHeader className="gap-3 rounded-t-lg bg-card p-3">
+              {stack && <section data-testid="stack-rail" aria-label="Pull-request stack" className="grid gap-1.5 rounded-xl bg-muted/55 p-2">
+                <div className="flex items-center justify-between gap-2 pl-1">
+                  <span className="flex items-center gap-1.5 text-xs font-semibold"><Layers className="size-3.5 text-primary" /> Stack <span className="font-normal tabular-nums text-muted-foreground">{stackPosition + 1}/{stack.members.length}</span></span>
+                  <div className="flex items-center gap-0.5">
+                    {stackLoading && <LoaderCircle className="mr-1 size-3.5 animate-spin text-primary" />}
+                    <Button type="button" data-testid="previous-stack-pr" size="icon" variant="ghost" className="size-7" title="PR below in the stack ({)" aria-label="PR below in the stack" disabled={stackPosition <= 0} onClick={() => stepStack(-1)}><ChevronUp className="size-4" /></Button>
+                    <Button type="button" data-testid="next-stack-pr" size="icon" variant="ghost" className="size-7" title="PR above in the stack (})" aria-label="PR above in the stack" disabled={stackPosition >= stack.members.length - 1} onClick={() => stepStack(1)}><ChevronDown className="size-4" /></Button>
+                  </div>
+                </div>
+                <ol className="grid max-h-48 gap-0.5 overflow-auto">
+                  <li className="flex items-center gap-2 px-1.5 py-0.5 text-[11px] text-muted-foreground"><GitBranch className="size-3 shrink-0" /><span className="truncate font-mono">{stack.trunk}</span></li>
+                  {stack.members.map((member, index) => {
+                    const current = member.pull.number === stack.current
+                    return <li key={member.pull.number}>
+                      <button type="button" data-testid={`stack-pr-${member.pull.number}`} aria-current={current ? "true" : undefined} title={`#${member.pull.number} ${member.pull.title} · ${member.pull.headRefName}`} onClick={() => { if (!current) void selectStack(member.pull.number, stack.mode) }} style={{ paddingLeft: 6 + (member.depth + 1) * 10 }} className={cn("flex w-full items-center gap-2 rounded-lg py-1 pr-2 text-left text-xs transition-colors", current ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:bg-background/60 hover:text-foreground")}>
+                        <span className={cn("size-1.5 shrink-0 rounded-full", current ? "bg-primary" : index < stackPosition ? "bg-muted-foreground/60" : "bg-muted-foreground/25")} />
+                        <span className="shrink-0 font-medium tabular-nums">#{member.pull.number}</span>
+                        <span className="min-w-0 truncate">{member.pull.title}</span>
+                        {member.pull.isDraft && <span className="ml-auto shrink-0 text-[10px] font-medium uppercase opacity-70">Draft</span>}
+                      </button>
+                    </li>
+                  })}
+                </ol>
+                <Segmented value={stack.mode} options={STACK_MODES} onChange={(mode) => { if (mode !== stack.mode) void selectStack(stack.current, mode) }} label="Stack scope" testId="stack-scope" />
+              </section>}
+              <div className="flex items-center justify-between gap-2"><CardTitle className="text-sm">Changed files {session && <span className="font-normal text-muted-foreground">({session.comparison?.changed_paths ?? session.files.length})</span>}</CardTitle><div className="flex items-center gap-0.5"><Button type="button" size="icon" variant="ghost" className="size-7" title="Smaller file text" onClick={() => setSidebarFontSize((size) => Math.max(10, size - 1))}><Minus className="size-3.5" /></Button><span className="w-7 text-center text-[10px] text-muted-foreground" title="File sidebar font size">{sidebarFontSize}px</span><Button type="button" size="icon" variant="ghost" className="size-7" title="Larger file text" onClick={() => setSidebarFontSize((size) => Math.min(18, size + 1))}><Plus className="size-3.5" /></Button><span className="mx-1 h-4 border-l" /><Button type="button" size="icon" variant="ghost" className="size-7" title="Make file sidebar narrower" onClick={() => setSidebarWidth((width) => Math.max(220, width - 40))}><Minus className="size-3.5" /></Button><Button type="button" size="icon" variant="ghost" className="size-7" title="Make file sidebar wider" onClick={() => setSidebarWidth((width) => Math.min(760, width + 40))}><Plus className="size-3.5" /></Button></div></div>
               {commits.length > 0 && <div data-testid="commit-rail" className="grid grid-cols-[minmax(0,1fr)] gap-1.5">
                 <div className="flex items-center gap-1">
                   <Button type="button" data-testid="previous-commit" size="icon" variant="outline" className="size-8 shrink-0" title="Previous commit ([)" disabled={commitIndex === null} onClick={() => stepCommit(-1)}><ChevronLeft className="size-4" /></Button>
@@ -741,39 +928,46 @@ export default function App() {
                   </Popover>
                   <Button type="button" data-testid="next-commit" size="icon" variant="outline" className="size-8 shrink-0" title="Next commit (])" disabled={commitIndex === commits.length - 1} onClick={() => stepCommit(1)}><ChevronRight className="size-4" /></Button>
                 </div>
-                <div role="radiogroup" aria-label="Commit scope" className="grid grid-cols-2 gap-0.5 rounded-md bg-muted p-0.5 text-[11px] font-medium">
-                  {([["commit", "This commit", "Changes made by the selected commit alone"], ["cumulative", "Up to commit", "Everything from the comparison base through the selected commit"]] as const).map(([mode, label, title]) => <button key={mode} type="button" role="radio" data-testid={`scope-${mode}`} aria-checked={scopeMode === mode} title={title} onClick={() => changeScopeMode(mode)} className={cn("rounded px-2 py-1 transition-colors", scopeMode === mode ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground")}>{label}</button>)}
-                </div>
+                {commitIndex !== null && <Segmented value={scopeMode} options={COMMIT_MODES} onChange={changeScopeMode} label="Commit scope" testId="scope" />}
               </div>}
               <div className="relative"><Search className="pointer-events-none absolute left-2 top-2 size-3.5 text-muted-foreground" /><Input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Filter files" className="h-8 pl-7 text-xs" /></div>
             </CardHeader>
             <CardContent ref={sidebarContentRef} style={{ contain: "size" }} className="min-h-[240px] flex-1 overflow-hidden lg:min-h-0 rounded-b-2xl bg-card p-2">
-              {tree.length ? <SidebarTree tree={tree} treeHeight={treeHeight} rowHeight={sidebarRowHeight} indent={Math.max(9, Math.round(14 * sidebarScale))} searchTerm={deferredSearch} selected={selected} viewedFiles={viewedFiles} sidebarScale={sidebarScale} sidebarFontSize={sidebarFontSize} sidebarIconSize={sidebarIconSize} sidebarGap={sidebarGap} sidebarPadding={sidebarPadding} onSelectFile={selectFile} /> : loading ? <div className="grid h-full place-items-center p-6 text-center text-sm text-muted-foreground"><div><LoaderCircle className="mx-auto mb-3 size-6 animate-spin text-primary" /><p>Preparing changed files<span className="loading-dots text-primary" aria-hidden="true">•••</span></p><p className="mt-1 text-xs">Large pull requests can take a moment to index.</p></div></div> : session ? <p className="p-3 text-xs text-muted-foreground">No file changes in this commit.</p> : <p className="p-3 text-xs text-muted-foreground">Generate a Git diff or upload a patch to populate the file tree.</p>}
+              {tree.length ? <SidebarTree tree={tree} treeHeight={treeHeight} rowHeight={sidebarRowHeight} indent={Math.max(9, Math.round(14 * sidebarScale))} searchTerm={deferredSearch} selected={selected} viewedFiles={viewedFiles} sidebarScale={sidebarScale} sidebarFontSize={sidebarFontSize} sidebarIconSize={sidebarIconSize} sidebarGap={sidebarGap} sidebarPadding={sidebarPadding} onSelectFile={selectFile} /> : loading ? <div className="grid h-full place-items-center p-6 text-center text-sm text-muted-foreground"><div><LoaderCircle className="mx-auto mb-3 size-6 animate-spin text-primary" /><p>Preparing changed files<span className="loading-dots text-primary" aria-hidden="true">•••</span></p><p className="mt-1 text-xs">Large pull requests can take a moment to index.</p></div></div> : session ? <p className="p-3 text-xs text-muted-foreground">{commitIndex !== null ? "No file changes in this commit." : "No file changes in this view."}</p> : <p className="p-3 text-xs text-muted-foreground">Open a pull request, compare branches, or upload a patch to populate the file tree.</p>}
             </CardContent>
-            <div className="flex items-center justify-between gap-3 px-4 pb-4 pt-2 text-[11px] text-muted-foreground">
-              <span>{session ? `${session.files.length} ${session.files.length === 1 ? "file" : "files"}` : "No comparison loaded"}</span>
-              {session && <span>{viewedFiles.size} viewed</span>}
+            <div className="grid gap-1.5 px-4 pb-4 pt-2 text-[11px] text-muted-foreground">
+              <div className="flex items-center justify-between gap-3">
+                <span>{session ? `${session.files.length} ${session.files.length === 1 ? "file" : "files"}` : "No comparison loaded"}</span>
+                {session && <span className="tabular-nums">{viewedCount} of {reviewable} viewed</span>}
+              </div>
+              {session && <div className="h-1 overflow-hidden rounded-full bg-muted"><div className="h-full rounded-full bg-emerald-500 transition-[width] duration-300" style={{ width: `${reviewable ? (viewedCount / reviewable) * 100 : 0}%` }} /></div>}
             </div>
             <button type="button" aria-label="Resize file sidebar" title="Drag to resize the file sidebar" onPointerDown={startSidebarResize} className={cn("absolute -right-3 top-0 z-10 hidden h-full w-6 cursor-col-resize touch-none items-center justify-center lg:flex", resizingSidebar && "bg-primary/5")}><span className="grid h-12 w-3 place-items-center rounded-full border bg-background text-muted-foreground shadow-sm"><GripVertical className="size-3" /></span></button>
           </Card>
           </SidebarProfilerBoundary>
 
-          <Card ref={diffPanelRef} tabIndex={-1} aria-label="Semantic diff panel" className={cn("min-h-0 overflow-hidden outline-none", activeRegion === "diff" && keyboardOverlay && "ring-2 ring-primary ring-offset-2")}>
+          <Card ref={diffPanelRef} tabIndex={-1} aria-label="Diff panel" className={cn("flex min-h-0 flex-col overflow-hidden outline-none", activeRegion === "diff" && keyboardOverlay && "ring-2 ring-primary ring-offset-2")}>
             {/* The floating "Show controls" button is fixed at the top-right of
                 the viewport, so the collapsed header reserves room for it and
                 keeps the viewed checkbox clickable underneath. */}
-            <CardHeader className={cn("flex-row items-center justify-between gap-3 space-y-0 border-b", chromeHidden ? "h-8 py-1 pl-3 pr-[180px]" : "p-3")}>
-              {chromeHidden ? <CardTitle className="min-w-0 truncate text-xs font-medium text-muted-foreground">{selectedFile?.display_path ?? "Semantic diff"}</CardTitle> : <div className="min-w-0"><CardTitle className="break-all text-sm">{selectedFile?.display_path ?? "Semantic diff"}</CardTitle>{rootSession?.comparison?.pull_request && <a href={rootSession.comparison.pull_request.url} target="_blank" rel="noreferrer" className="mt-1 flex w-fit items-center gap-1 text-xs font-medium text-primary hover:underline"><GitPullRequest className="size-3.5" /> #{rootSession.comparison.pull_request.number} · {rootSession.comparison.pull_request.title}</a>}<p className="mt-1 text-xs text-muted-foreground">{status}</p>{session?.comparison && <p className="mt-1 text-[11px] text-muted-foreground/80">{session.comparison.description}</p>}</div>}
+            <CardHeader className={cn("flex-row flex-wrap items-center gap-x-3 gap-y-2 space-y-0 border-b px-3", chromeHidden ? "py-1 pr-[180px]" : "py-2")}>
+              <div className="flex min-w-0 flex-1 items-center gap-1">
+                <Button type="button" data-testid="previous-file" size="icon" variant="ghost" className="size-7 shrink-0" title="Previous file (K)" aria-label="Previous file" disabled={!reviewable} onClick={() => moveFile(-1)}><ChevronLeft className="size-4" /></Button>
+                <Button type="button" data-testid="next-file" size="icon" variant="ghost" className="size-7 shrink-0" title="Next file (J)" aria-label="Next file" disabled={!reviewable} onClick={() => moveFile(1)}><ChevronRight className="size-4" /></Button>
+                {selectedFile ? <CardTitle className="ml-1 flex min-w-0 items-center gap-2 font-normal"><FilePath path={selectedFile.display_path} />{selectedPosition !== undefined && selectedPosition !== null && <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">{selectedPosition + 1}/{reviewable}</span>}</CardTitle> : <CardTitle className="ml-1 text-xs font-medium text-muted-foreground">{session ? "Pick a file to review" : "No comparison loaded"}</CardTitle>}
+              </div>
               <div className="flex shrink-0 items-center gap-2">
-                {(loading || scopeLoading) && <LoaderCircle className="size-3.5 animate-spin text-muted-foreground" />}
-                {selectedFile && <label className={cn("flex shrink-0 cursor-pointer select-none items-center gap-1.5 whitespace-nowrap text-xs font-medium transition-colors", selectedViewed ? "text-emerald-600" : "text-muted-foreground hover:text-foreground", loading && "cursor-default opacity-50")} title={selectedViewed ? "Mark as unviewed" : "Mark as viewed"}>
+                {(loading || scopeLoading || stackLoading) && <LoaderCircle className="size-3.5 animate-spin text-muted-foreground" />}
+                <Segmented value={diffMode} options={DIFF_MODES} onChange={changeDiffMode} label="Diff view" testId="diff-mode" />
+                {session && <Button type="button" data-testid="next-unviewed" size="sm" variant="ghost" className="h-7 px-2" title="Next unviewed file (N)" disabled={!reviewable || viewedCount === reviewable} onClick={nextUnviewed}><SkipForward className="size-3.5" /> Next unviewed</Button>}
+                {selectedFile && <label className={cn("flex shrink-0 cursor-pointer select-none items-center gap-1.5 whitespace-nowrap rounded-full px-2 py-1 text-xs font-medium transition-colors", selectedViewed ? "bg-emerald-500/10 text-emerald-600" : "text-muted-foreground hover:text-foreground", loading && "cursor-default opacity-50")} title={selectedViewed ? "Mark as unviewed (M)" : "Mark as viewed (M)"}>
                   <input type="checkbox" data-testid="mark-as-viewed" className="size-3.5 shrink-0 cursor-pointer accent-emerald-600" checked={selectedViewed} disabled={loading} onChange={toggleViewed} />
                   Viewed
                 </label>}
               </div>
             </CardHeader>
-            <CardContent className={cn("min-h-[580px] p-0", chromeHidden ? "h-[calc(100vh-4.5rem)]" : "h-[calc(100vh-260px)]")}>
-              {selectedFile && session && selected !== null ? <DiffViewer key={`${session.id}:${selected}`} sessionId={session.id} index={selected} path={selectedFile.display_path} frameRef={diffFrameRef} /> : <div className="grid h-full place-items-center p-8 text-center text-sm text-muted-foreground"><div>{loading ? <LoaderCircle className="mx-auto mb-3 size-8 animate-spin text-primary" /> : <FileDiff className="mx-auto mb-3 size-8 opacity-40" />}<p>{loading ? "Building your review" : "Pick a file from the tree."}<span className={cn("loading-dots text-primary", !loading && "hidden")} aria-hidden="true">•••</span></p><p className="mt-1 text-xs">{loading ? "Fetching the pull request and preparing diffs." : "Select a file to review its text or semantic diff."}</p></div></div>}
+            <CardContent className={cn("min-h-[580px] p-0", chromeHidden ? "h-[calc(100vh-4.5rem)]" : "h-[calc(100vh-240px)]")}>
+              {selectedFile && session && selected !== null ? <DiffViewer key={`${session.id}:${selected}`} sessionId={session.id} index={selected} path={selectedFile.display_path} mode={diffMode} frameRef={diffFrameRef} /> : <div className="grid h-full place-items-center p-8 text-center text-sm text-muted-foreground"><div>{loading ? <LoaderCircle className="mx-auto mb-3 size-8 animate-spin text-primary" /> : <FileDiff className="mx-auto mb-3 size-8 opacity-40" />}<p>{loading ? "Building your review" : session ? "Pick a file from the tree." : "Nothing to review yet."}{loading && <span className="loading-dots text-primary" aria-hidden="true">•••</span>}</p><p className="mt-1 text-xs">{loading ? "Fetching the pull request and preparing diffs." : session ? <>Or press <kbd className="rounded border bg-muted px-1 font-mono">-</kbd> then <kbd className="rounded border bg-muted px-1 font-mono">N</kbd> to jump to the next unviewed file.</> : "Open a pull request above to start."}</p></div></div>}
             </CardContent>
           </Card>
         </div>
@@ -786,8 +980,8 @@ export default function App() {
             <button type="button" onClick={() => runOverlayCommand("d")} className={cn("rounded-lg border p-3 text-left transition-colors hover:bg-accent", activeRegion === "diff" && "border-primary bg-primary/5")}><kbd className="mr-2 rounded bg-foreground px-1.5 py-0.5 font-mono text-xs text-background">D</kbd><span className="font-medium">Diff panel</span><span className="mt-1 block text-xs text-muted-foreground">Focus the SemanticDiff view</span></button>
             <button type="button" onClick={() => runOverlayCommand("v")} className="rounded-lg border p-3 text-left transition-colors hover:bg-accent"><kbd className="mr-2 rounded bg-foreground px-1.5 py-0.5 font-mono text-xs text-background">V</kbd><span className="font-medium">Focus view</span><span className="mt-1 block text-xs text-muted-foreground">Hide controls and enter the diff</span></button>
           </div>
-          <div className="mt-2 flex items-center gap-4 rounded-lg bg-muted px-3 py-2 text-xs text-muted-foreground"><span><kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">J</kbd> {activeRegion === "diff" ? "scroll down" : "next file"}</span><span><kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">K</kbd> {activeRegion === "diff" ? "scroll up" : "previous file"}</span>{commits.length > 0 && <span><kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">[</kbd><kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">]</kbd> previous / next commit</span>}<span className="ml-auto">{activeRegion === "sidebar" ? "Files sidebar active" : "Diff panel active"}</span></div>
-        </> : <button type="button" onClick={showKeyboardHelp} className="flex items-center gap-2 text-xs text-muted-foreground hover:text-foreground"><Keyboard className="size-3.5 text-primary" /><span>{activeRegion === "diff" ? "J/K scroll diff" : "J/K files"}</span><kbd className="rounded border bg-muted px-1.5 py-0.5 font-mono text-foreground">?</kbd><span>keys</span></button>}
+          <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1.5 rounded-lg bg-muted px-3 py-2 text-xs text-muted-foreground"><span><kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">J</kbd><kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">K</kbd> {activeRegion === "diff" ? "scroll" : "next / previous file"}</span><span><kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">N</kbd> next unviewed</span><span><kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">M</kbd> mark viewed</span>{commits.length > 0 && <span><kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">[</kbd><kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">]</kbd> commit</span>}{stack && <span><kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">{"{"}</kbd><kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">{"}"}</kbd> stacked PR</span>}<span className="ml-auto">{activeRegion === "sidebar" ? "Files sidebar active" : "Diff panel active"}</span></div>
+        </> : <button type="button" onClick={showKeyboardHelp} className="flex items-center gap-2 text-xs text-muted-foreground hover:text-foreground"><Keyboard className="size-3.5 text-primary" /><span>{activeRegion === "diff" ? "J/K scroll diff" : "J/K files"} · N next unviewed</span><kbd className="rounded border bg-muted px-1.5 py-0.5 font-mono text-foreground">?</kbd><span>keys</span></button>}
       </aside>}
     </div>
   )
