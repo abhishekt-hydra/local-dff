@@ -29,6 +29,14 @@ version: build
 test:
     sysroot="$(rustc +{{rust_toolchain}} --print sysroot)"; DYLD_LIBRARY_PATH="$sysroot/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" RUSTC="$sysroot/bin/rustc" "$sysroot/bin/cargo" test --target-dir .build
 
+# Run frontend URL parsing and construction tests.
+test-frontend:
+    cd web && bun run test
+
+# Verify URL-driven review flows in Chrome, against built and development React.
+test-browser: frontend
+    cd web && bun run test:browser
+
 # Check Rust formatting.
 fmt-check:
     cargo +{{rust_toolchain}} fmt --check

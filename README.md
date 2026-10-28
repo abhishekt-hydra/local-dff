@@ -47,6 +47,35 @@ not a misleading whole-branch snapshot. Pasted links work for open, closed,
 and merged PRs; if the selected repository is different, Local Diffe clones a
 private cache copy under its application cache directory and reuses it later.
 
+### Share or redirect to a review
+
+Pass the GitHub PR URL in the `pr` query parameter to open it automatically,
+without entering a local repository path:
+
+```text
+http://localhost:3333/?pr=https://github.com/hydra-db/hydradb-application/pull/3006/
+```
+
+Trailing slashes are accepted. For a redirect integration, let `URLSearchParams`
+encode the GitHub link, especially when it contains query parameters or a hash:
+
+```js
+const review = new URL("http://localhost:3333/")
+review.searchParams.set("pr", githubPrUrl)
+// Redirect to review.href.
+```
+
+The address bar updates after manual PR opens and stack navigation. Reload and
+Back/Forward reopen the linked PR; returning to the bare app URL clears the
+review. Links identify the PR, not a transient session or selected commit/file.
+Invalid links stay in the form with an error and never trigger a download.
+GitHub CLI authentication and a running Local Diffe server are still required.
+
+URL parsing tests: `just test-frontend`. Browser flows: `just test-browser`
+(requires Chrome/Chromium; set `RUSTWRIGHT_CHROMIUM` if needed). The browser suite
+uses local API fixtures in both the production build and development StrictMode;
+it does not contact GitHub or clone repositories.
+
 ## Review stacked pull requests
 
 A PR is part of a stack when its base branch is another open PR's head branch

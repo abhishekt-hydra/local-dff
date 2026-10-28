@@ -40,6 +40,8 @@ import { DiffViewer, preferredMode, rememberMode, type DiffMode } from "@/compon
 import { buildFileNavigation, makeTree, type TreeItem } from "./sidebarTree"
 import { groupPulls, type PullRequest } from "./stacks"
 import { PERFORMANCE_BUILD_ENABLED, onRender } from "./lib/performance"
+import { normalizePrUrl, type ReviewLocation } from "./lib/review-location"
+import { useReviewNavigation, writeReviewLocation, type ReviewHistory } from "./lib/use-review-navigation"
 
 type PatchFile = { old_path: string | null; new_path: string | null; display_path: string; renderable: boolean }
 type Revision = { revision: string; commit: string }
@@ -67,6 +69,8 @@ function isEditableTarget(target: EventTarget | null) {
 }
 
 const initialRepo = "/Users/abhishek/hydradb/hydradb-application"
+const INITIAL_STATUS = "Ready to compare origin/staging with the checked-out branch."
+type SessionLoadOptions = { signal?: AbortSignal; history?: ReviewHistory }
 
 // Session ids are fresh UUIDs per comparison, so viewed state is keyed by the
 // revisions under review and stored as display paths: both survive a reload and
@@ -237,11 +241,12 @@ const SidebarTree = memo(function SidebarTree({
   return <SidebarTreeContext.Provider value={context}><Tree<TreeItem> data={tree} width="100%" height={treeHeight} rowHeight={rowHeight} indent={indent} openByDefault disableDrag disableDrop searchTerm={searchTerm}>{SidebarTreeRow}</Tree></SidebarTreeContext.Provider>
 })
 
-async function api<T>(path: string, payload: unknown): Promise<T> {
+async function api<T>(path: string, payload: unknown, signal?: AbortSignal): Promise<T> {
   const response = await fetch(path, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(payload),
+    signal,
   })
   const body = await response.json()
   if (!response.ok) throw new Error(body.error || "Request failed")
@@ -252,7 +257,7 @@ export default function App() {
   const [repo, setRepo] = useState(initialRepo)
   const [base, setBase] = useState("origin/staging")
   const [target, setTarget] = useState("HEAD")
-  const [prUrl, setPrUrl] = useState("")
+  const [prUrl, setPrUrl] = useState(() => new URLSearchParams(window.location.search).get("pr") ?? "")
   const [pulls, setPulls] = useState<PullRequest[]>([])
   const [prNumber, setPrNumber] = useState("")
   const [prPickerOpen, setPrPickerOpen] = useState(false)
@@ -279,7 +284,7 @@ export default function App() {
   // for, so a scope switch never shows or persists another scope's marks.
   const [viewedState, setViewedState] = useState<{ key: string | null; files: PatchFile[]; indices: ReadonlySet<number> }>({ key: null, files: EMPTY_FILES, indices: NO_VIEWED })
   const [search, setSearch] = useState("")
-  const [status, setStatus] = useState("Ready to compare origin/staging with the checked-out branch.")
+  const [status, setStatus] = useState(INITIAL_STATUS)
   const [loading, setLoading] = useState(false)
   const reviewGrid = useRef<HTMLDivElement>(null)
   const sidebarRef = useRef<HTMLDivElement>(null)
@@ -295,6 +300,7 @@ export default function App() {
   const scopeRequestRef = useRef(0)
   const stackCacheRef = useRef(new Map<string, Session>())
   const stackRequestRef = useRef(0)
+  const sourceRequestRef = useRef<AbortController | null>(null)
   const shownCommitIndexRef = useRef<number | null>(null)
   const selectionRef = useRef({ session, selected })
   selectionRef.current = { session, selected }
@@ -416,24 +422,73 @@ export default function App() {
     setStatus(comparisonStatus(next))
   }, [])
 
-  const loadSession = async (endpoint: string, payload: unknown, progress: string) => {
+  const loadSession = useCallback(async (endpoint: string, payload: unknown, progress: string, options: SessionLoadOptions = {}) => {
+    sourceRequestRef.current?.abort()
+    const controller = new AbortController()
+    sourceRequestRef.current = controller
+    const signal = options.signal ? AbortSignal.any([controller.signal, options.signal]) : controller.signal
+    // Invalidate old scope responses as soon as a new review starts, not only
+    // when it finishes. A slow old request must never replace a newer review.
+    scopeRequestRef.current += 1
+    stackRequestRef.current += 1
+    setScopeLoading(false)
+    setStackLoading(false)
     setLoading(true)
     setStatus(progress)
     try {
-      const next = await api<Session>(endpoint, payload)
-      stackRequestRef.current += 1
+      // Let synchronous effect cleanup cancel StrictMode's first setup before
+      // sending a potentially expensive clone/fetch request to the backend.
+      await Promise.resolve()
+      if (signal.aborted) return
+      const next = await api<Session>(endpoint, payload, signal)
+      if (signal.aborted || sourceRequestRef.current !== controller) return
+      const pullUrl = next.comparison?.pull_request?.url ?? null
+      writeReviewLocation(pullUrl, options.history)
+      if (pullUrl) setPrUrl(normalizePrUrl(pullUrl))
       stackCacheRef.current = new Map()
       if (next.stack) stackCacheRef.current.set(`${next.stack.current}:${next.stack.mode}`, next)
-      setStackLoading(false)
       // A stack always opens in Semantic diff; other reviews keep the last mode.
       setDiffMode(next.stack ? "semantic" : preferredMode())
       showRoot(next, null)
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Unable to create comparison")
+      if (!signal.aborted && sourceRequestRef.current === controller) {
+        setStatus(error instanceof Error ? error.message : "Unable to create comparison")
+      }
     } finally {
-      setLoading(false)
+      if (!signal.aborted && sourceRequestRef.current === controller) setLoading(false)
     }
-  }
+  }, [showRoot])
+
+  const navigateReview = useCallback((location: ReviewLocation, signal: AbortSignal) => {
+    setSourceTab("pr")
+    if (location.kind === "pr") {
+      // Do not leave another PR visible under this URL if navigation fails.
+      setRootSession(null)
+      setSession(null)
+      setSelected(null)
+      setCommitIndex(null)
+      setPrUrl(location.url)
+      void loadSession("/api/github/open-url", { url: location.url }, "Downloading the GitHub pull request if needed and generating its merge-base diff…", { signal, history: "replace" })
+      return
+    }
+    sourceRequestRef.current?.abort()
+    scopeRequestRef.current += 1
+    stackRequestRef.current += 1
+    scopeCacheRef.current = new Map()
+    stackCacheRef.current = new Map()
+    shownCommitIndexRef.current = null
+    setLoading(false)
+    setScopeLoading(false)
+    setStackLoading(false)
+    setRootSession(null)
+    setSession(null)
+    setSelected(null)
+    setCommitIndex(null)
+    setPrUrl(location.kind === "invalid" ? location.input : "")
+    setStatus(location.kind === "invalid" ? location.message : INITIAL_STATUS)
+  }, [loadSession])
+  useReviewNavigation(navigateReview)
+  useEffect(() => () => sourceRequestRef.current?.abort(), [])
 
   const generate = () => loadSession("/api/git-diff", { repo, base, target }, `Generating ${base} → ${target}…`)
   const upload = async (file?: File) => {
@@ -441,17 +496,23 @@ export default function App() {
     await loadSession("/api/patch", { repo, base, target, patch: await file.text() }, `Reading ${file.name}…`)
   }
   const listPulls = async (refresh = false) => {
+    sourceRequestRef.current?.abort()
+    const controller = new AbortController()
+    sourceRequestRef.current = controller
     setLoading(true)
     setStatus(refresh ? "Refreshing open pull requests from GitHub…" : "Checking GitHub for open pull requests…")
     try {
-      const next = await api<PullRequest[]>("/api/github/open-prs", { repo, refresh })
+      const next = await api<PullRequest[]>("/api/github/open-prs", { repo, refresh }, controller.signal)
+      if (controller.signal.aborted || sourceRequestRef.current !== controller) return
       setPulls(next)
       setPrNumber(next[0] ? String(next[0].number) : "")
       setStatus(next.length ? `${next.length} open pull requests found; downloading them into the PR cache in the background.` : "No open pull requests found for this repository.")
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Unable to list pull requests")
+      if (!controller.signal.aborted && sourceRequestRef.current === controller) {
+        setStatus(error instanceof Error ? error.message : "Unable to list pull requests")
+      }
     } finally {
-      setLoading(false)
+      if (!controller.signal.aborted && sourceRequestRef.current === controller) setLoading(false)
     }
   }
   const openPull = () => {
@@ -466,13 +527,19 @@ export default function App() {
       setStatus("Paste a GitHub pull-request URL first.")
       return
     }
-    void loadSession("/api/github/open-url", { url: prUrl }, "Downloading the GitHub pull request if needed and generating its merge-base diff…")
+    try {
+      const url = normalizePrUrl(prUrl)
+      setPrUrl(url)
+      void loadSession("/api/github/open-url", { url }, "Downloading the GitHub pull request if needed and generating its merge-base diff…")
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Invalid GitHub pull-request URL")
+    }
   }
 
   // Show one commit (or `null` for all changes). Scopes are cached per commit
   // and mode, and the reviewed file stays selected when the next scope has it.
   const selectScope = useCallback(async (index: number | null, mode: ScopeMode) => {
-    if (!rootSession) return
+    if (!rootSession || loading) return
     const request = ++scopeRequestRef.current
     setCommitIndex(index)
     let next: Session | undefined = rootSession
@@ -485,6 +552,7 @@ export default function App() {
         setScopeLoading(true)
         try {
           next = await api<Session>("/api/commit-scope", { id: rootSession.id, sha: commit.sha, mode })
+          if (request !== scopeRequestRef.current) return
           scopeCacheRef.current.set(cacheKey, next)
         } catch (error) {
           if (request !== scopeRequestRef.current) return
@@ -504,7 +572,7 @@ export default function App() {
     setSession(next)
     setSelected(keep === -1 ? null : keep)
     setStatus(index === null ? comparisonStatus(next) : scopeStatus(next, rootSession.commits ?? EMPTY_COMMITS, index, mode))
-  }, [rootSession])
+  }, [rootSession, loading])
 
   // `[` from the first commit returns to all changes; neither end wraps.
   const stepCommit = useCallback((direction: 1 | -1) => {
@@ -517,7 +585,7 @@ export default function App() {
 
   // Open another PR of the stack, or the same PR in the other stack mode.
   const selectStack = useCallback(async (number: number, mode: StackMode) => {
-    if (!rootSession?.stack) return
+    if (!rootSession?.stack || loading) return
     const request = ++stackRequestRef.current
     const cacheKey = `${number}:${mode}`
     let next = stackCacheRef.current.get(cacheKey)
@@ -525,6 +593,7 @@ export default function App() {
       setStackLoading(true)
       try {
         next = await api<Session>("/api/stack-scope", { id: rootSession.id, number, mode })
+        if (request !== stackRequestRef.current) return
         stackCacheRef.current.set(cacheKey, next)
       } catch (error) {
         if (request !== stackRequestRef.current) return
@@ -535,10 +604,15 @@ export default function App() {
     }
     if (request !== stackRequestRef.current) return
     setStackLoading(false)
+    const pullUrl = next.comparison?.pull_request?.url
+    if (pullUrl) {
+      writeReviewLocation(pullUrl)
+      setPrUrl(normalizePrUrl(pullUrl))
+    }
     if (number !== rootSession.stack.current) setDiffMode("semantic")
     const { session: current, selected: currentSelected } = selectionRef.current
     showRoot(next, currentSelected === null ? null : current?.files[currentSelected]?.display_path ?? null)
-  }, [rootSession, showRoot])
+  }, [rootSession, showRoot, loading])
 
   const stepStack = useCallback((direction: 1 | -1) => {
     if (!stack) return
@@ -829,7 +903,7 @@ export default function App() {
                 ? <Button data-testid="generate-diff" onClick={generate} disabled={loading}>{loading ? <LoaderCircle className="size-4 animate-spin" /> : <GitBranch className="size-4" />} Generate diff</Button>
                 : <Button asChild variant="outline" disabled={loading}><label className="cursor-pointer">{loading ? <LoaderCircle className="size-4 animate-spin" /> : <Upload className="size-4" />} Upload patch<input className="hidden" type="file" accept=".diff,.patch,text/plain" onChange={(event) => upload(event.target.files?.[0])} /></label></Button>}
             </div>}
-            {!loading && <p data-testid="status" className="truncate px-1 text-xs text-muted-foreground" title={status}>{status}</p>}
+            {!loading && <p data-testid="status" role="status" className="truncate px-1 text-xs text-muted-foreground" title={status}>{status}</p>}
           </CardContent>
         </Card>}
 

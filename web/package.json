@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "test:browser": "node tests/review-navigation.browser.mjs",
     "build": "tsc -b && vite build",
     "build:profile": "tsc -b && vite build --mode profile",
     "preview": "vite preview",
@@ -33,6 +35,7 @@
     "@types/node": "latest",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
+    "rustwright": "0.3.0",
     "typescript": "latest",
     "vite": "8.3.0"
   }
