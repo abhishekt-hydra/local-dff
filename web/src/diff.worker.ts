@@ -2,11 +2,18 @@ import { parseDiffBatches, type DiffBatch } from "./lib/diff"
 
 export type DiffWorkerMessage =
   | ({ type: "batch" } & DiffBatch)
-  | { type: "done"; width: number; truncated: boolean; limited: boolean; profile?: { startedAt: number; parseDurationMs: number; firstBatchDurationMs: number } }
+  | {
+      type: "done"
+      width: number
+      truncated: boolean
+      limited: boolean
+      profile?: { startedAt: number; parseDurationMs: number; firstBatchDurationMs: number }
+    }
   | { type: "error"; error: string }
 
 declare const __LOCAL_DIFFE_PROFILE_BUILD__: boolean | undefined
-const PROFILE_BUILD_ENABLED = typeof __LOCAL_DIFFE_PROFILE_BUILD__ !== "undefined" && __LOCAL_DIFFE_PROFILE_BUILD__
+const PROFILE_BUILD_ENABLED =
+  typeof __LOCAL_DIFFE_PROFILE_BUILD__ !== "undefined" && __LOCAL_DIFFE_PROFILE_BUILD__
 
 self.onmessage = (event: MessageEvent<string | { patch: string }>) => {
   try {
@@ -28,9 +35,20 @@ self.onmessage = (event: MessageEvent<string | { patch: string }>) => {
       width: result.width,
       truncated: result.truncated,
       limited: result.limited,
-      ...(PROFILE_BUILD_ENABLED ? { profile: { startedAt: performance.timeOrigin + startedAt, parseDurationMs: performance.now() - startedAt, firstBatchDurationMs } } : {}),
+      ...(PROFILE_BUILD_ENABLED
+        ? {
+            profile: {
+              startedAt: performance.timeOrigin + startedAt,
+              parseDurationMs: performance.now() - startedAt,
+              firstBatchDurationMs,
+            },
+          }
+        : {}),
     } satisfies DiffWorkerMessage)
   } catch (error) {
-    self.postMessage({ type: "error", error: error instanceof Error ? error.message : "Could not parse diff." } satisfies DiffWorkerMessage)
+    self.postMessage({
+      type: "error",
+      error: error instanceof Error ? error.message : "Could not parse diff.",
+    } satisfies DiffWorkerMessage)
   }
 }

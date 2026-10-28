@@ -5,7 +5,9 @@ export type ReviewHistory = "push" | "replace"
 
 // Opening a review is an effect of navigation, not of every PR input keystroke.
 // Cleanup also handles React StrictMode's setup/cleanup/setup cycle.
-export function useReviewNavigation(onNavigate: (location: ReviewLocation, signal: AbortSignal) => void) {
+export function useReviewNavigation(
+  onNavigate: (location: ReviewLocation, signal: AbortSignal) => void,
+) {
   useEffect(() => {
     let navigation: AbortController | undefined
     const navigate = () => {

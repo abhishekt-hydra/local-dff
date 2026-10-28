@@ -1,4 +1,9 @@
-export type DiffRow = { kind: "meta" | "hunk" | "add" | "remove" | "context"; text: string; old?: number; next?: number }
+export type DiffRow = {
+  kind: "meta" | "hunk" | "add" | "remove" | "context"
+  text: string
+  old?: number
+  next?: number
+}
 export type ParsedDiff = { rows: DiffRow[]; width: number; truncated: boolean; limited: boolean }
 export type DiffBatch = { rows: DiffRow[]; width: number; truncated: boolean }
 
@@ -16,8 +21,13 @@ export const DIFF_BATCH_SIZE = 1024
 function parseDiffInternal(patch: string, onBatch?: (batch: DiffBatch) => void): ParsedDiff {
   const rows: DiffRow[] | undefined = onBatch ? undefined : []
   let batch: DiffRow[] = []
-  let old = 0, next = 0, inHunk = false, width = 0, truncated = false
-  let cursor = 0, rowCount = 0
+  let old = 0,
+    next = 0,
+    inHunk = false,
+    width = 0,
+    truncated = false
+  let cursor = 0,
+    rowCount = 0
 
   const push = (row: DiffRow) => {
     if (onBatch) {
@@ -39,7 +49,9 @@ function parseDiffInternal(patch: string, onBatch?: (batch: DiffBatch) => void):
     const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line)
     let row: DiffRow
     if (hunk) {
-      old = Number(hunk[1]); next = Number(hunk[2]); inHunk = true
+      old = Number(hunk[1])
+      next = Number(hunk[2])
+      inHunk = true
       row = { kind: "hunk", text: line }
     } else if (inHunk && line.startsWith("+")) {
       row = { kind: "add", text: line.slice(1), next: next++ }

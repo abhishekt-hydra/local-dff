@@ -29,13 +29,25 @@ version: build
 test:
     sysroot="$(rustc +{{rust_toolchain}} --print sysroot)"; DYLD_LIBRARY_PATH="$sysroot/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" RUSTC="$sysroot/bin/rustc" "$sysroot/bin/cargo" test --target-dir .build
 
-# Run frontend URL parsing and construction tests.
+# Run frontend unit and lint-policy regression tests.
 test-frontend:
     cd web && bun run test
 
 # Verify URL-driven review flows in Chrome, against built and development React.
 test-browser: frontend
     cd web && bun run test:browser
+
+# Enforce frontend correctness, React, accessibility, and vendored anti-slop rules.
+lint-frontend:
+    cd web && bun run lint
+
+# Format owned frontend files; leave vendored sources unchanged.
+fmt-frontend:
+    cd web && bun run format
+
+# Check frontend lint, formatting, types, and unit tests.
+check-frontend:
+    cd web && bun run check
 
 # Check Rust formatting.
 fmt-check:

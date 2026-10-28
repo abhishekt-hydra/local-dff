@@ -1,20 +1,52 @@
 import { createHighlighterCore } from "shiki/core"
-import type { BundledLanguage } from "shiki"
+import type { BundledLanguage, LanguageRegistration } from "shiki"
 import { createJavaScriptRegexEngine } from "shiki/engine/javascript"
 
 type ShikiToken = { content: string; color?: string; fontStyle?: number }
-export type SemanticToken = { start: number; end: number; priority?: number; foreground?: string; background?: string; fontStyle?: number }
+export type SemanticToken = {
+  start: number
+  end: number
+  priority?: number
+  foreground?: string
+  background?: string
+  fontStyle?: number
+}
 export type SemanticLine = { line: number; content: string; tokens?: SemanticToken[] }
 export type SemanticBlock = { old_column?: SemanticLine[]; new_column?: SemanticLine[] }
 export type SemanticPatch = { type?: string; blocks?: SemanticBlock[] }
 
-const languageForExtension: Record<string, BundledLanguage> = {
-  go: "go", rs: "rust", ts: "typescript", tsx: "tsx", js: "javascript", jsx: "jsx",
-  json: "json", yaml: "yaml", yml: "yaml", md: "markdown", py: "python", rb: "ruby",
-  java: "java", kt: "kotlin", swift: "swift", cs: "csharp", cpp: "cpp", cc: "cpp",
-  c: "c", h: "c", hpp: "cpp", html: "html", css: "css", scss: "scss", sql: "sql",
-  sh: "shellscript", bash: "shellscript", zsh: "shellscript", toml: "toml", xml: "xml",
-}
+const languageForExtension = new Map<string, BundledLanguage>([
+  ["go", "go"],
+  ["rs", "rust"],
+  ["ts", "typescript"],
+  ["tsx", "tsx"],
+  ["js", "javascript"],
+  ["jsx", "jsx"],
+  ["json", "json"],
+  ["yaml", "yaml"],
+  ["yml", "yaml"],
+  ["md", "markdown"],
+  ["py", "python"],
+  ["rb", "ruby"],
+  ["java", "java"],
+  ["kt", "kotlin"],
+  ["swift", "swift"],
+  ["cs", "csharp"],
+  ["cpp", "cpp"],
+  ["cc", "cpp"],
+  ["c", "c"],
+  ["h", "c"],
+  ["hpp", "cpp"],
+  ["html", "html"],
+  ["css", "css"],
+  ["scss", "scss"],
+  ["sql", "sql"],
+  ["sh", "shellscript"],
+  ["bash", "shellscript"],
+  ["zsh", "shellscript"],
+  ["toml", "toml"],
+  ["xml", "xml"],
+])
 
 const highlighter = createHighlighterCore({
   // Keep the bootstrap/worker entry small. Grammars are loaded as separate
@@ -25,7 +57,7 @@ const highlighter = createHighlighterCore({
 })
 const loadedLanguages = new Set<string>()
 
-type LanguageModule = { default: unknown }
+type LanguageModule = { default: LanguageRegistration[] }
 const languageLoaders: Partial<Record<BundledLanguage, () => Promise<LanguageModule>>> = {
   go: () => import("shiki/langs/go.mjs"),
   rust: () => import("shiki/langs/rust.mjs"),
@@ -55,7 +87,7 @@ const languageLoaders: Partial<Record<BundledLanguage, () => Promise<LanguageMod
 
 function languageFromPath(path: string) {
   const extension = path.split(".").at(-1)?.toLowerCase() ?? ""
-  return languageForExtension[extension]
+  return languageForExtension.get(extension)
 }
 
 async function tokenize(source: string, path: string): Promise<ShikiToken[][]> {
@@ -66,7 +98,7 @@ async function tokenize(source: string, path: string): Promise<ShikiToken[][]> {
     const loader = languageLoaders[language]
     if (!loader) return []
     const module = await loader()
-    await instance.loadLanguage(module.default as never)
+    await instance.loadLanguage(module.default)
     loadedLanguages.add(language)
   }
   return instance.codeToTokens(source, { lang: language, theme: "github-dark-default" }).tokens
@@ -102,12 +134,19 @@ function decorateColumn(column: SemanticLine[] | undefined, lines: ShikiToken[][
       // shape.
       const start = offsets[Math.min(utf16Start, line.content.length)] ?? 0
       const end = offsets[Math.min(utf16End, line.content.length)] ?? start
-      const highlight = token.content.length && (token.color || token.fontStyle)
-        // Keep the vendor's diff background classes authoritative. Shiki's
-        // foreground/font style are safe inline additions; token backgrounds
-        // would cover added/removed line colors.
-        ? { start, end, priority: 0, ...(token.color ? { foreground: token.color } : {}), ...(token.fontStyle ? { fontStyle: token.fontStyle } : {}) }
-        : null
+      const highlight =
+        token.content.length && (token.color || token.fontStyle)
+          ? // Keep the vendor's diff background classes authoritative. Shiki's
+            // foreground/font style are safe inline additions; token backgrounds
+            // would cover added/removed line colors.
+            {
+              start,
+              end,
+              priority: 0,
+              ...(token.color ? { foreground: token.color } : {}),
+              ...(token.fontStyle ? { fontStyle: token.fontStyle } : {}),
+            }
+          : null
       utf16Start = utf16End
       return highlight ? [highlight] : []
     })

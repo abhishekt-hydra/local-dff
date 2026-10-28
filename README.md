@@ -160,9 +160,34 @@ cargo run -- --cache-dir /path/to/local-diffe-cache
 LOCAL_DIFFE_CACHE_DIR=/path/to/local-diffe-cache just run
 ```
 
-For frontend iteration, run `cargo run` in one terminal and `npm run dev` from
+For frontend iteration, run `cargo run` in one terminal and `bun run dev` from
 `web/` in another. Vite proxies the API and SemanticDiff routes to the Rust
 server.
+
+### Frontend quality checks
+
+Use Bun (the version is recorded in `web/package.json`) and the single
+`web/bun.lock`; install with `cd web && bun ci`. Node 22.18+ is also required
+for the TypeScript unit tests and vendored TypeScript lint plugin.
+
+```bash
+just lint-frontend   # Oxlint: correctness, React hooks, accessibility, anti-slop
+just fmt-frontend    # Oxfmt: format owned frontend files
+just check-frontend  # Lint, format check, app/test/plugin types, unit tests
+just test-browser   # Build and run Chrome production + StrictMode regressions
+```
+
+Oxlint and its plugin adapter are pinned together. The generic anti-slop rules
+are vendored in `web/tools/oxlint/anti-slop/`, with upstream revision and licenses;
+no sibling checkout is needed. See [local lint policy](web/tools/oxlint/anti-slop/UPSTREAM.md)
+for enabled rules and deliberate exceptions. Lint runs over the full owned
+frontend and rejects warnings and unused suppressions. Oxfmt excludes the
+unchanged vendored sources and generated `dist/` and `dist-profile/` outputs.
+
+Tests exercise the actual lint CLI against accepted/rejected fixtures so a
+broken plugin load or accidentally disabled core guardrail fails the check.
+API JSON is validated before it enters review state, and iframe keyboard
+messages require the current viewer frame, matching origin, and a typed payload.
 
 ## Browser performance profiling
 
@@ -177,8 +202,8 @@ Build the profiling renderer explicitly, then serve the separate `dist-profile/`
 
 ```bash
 cd web
-npm run build:profile
-npm run preview:profile -- --host 127.0.0.1 --port 4173
+bun run build:profile
+bun run preview:profile -- --host 127.0.0.1 --port 4173
 ```
 
 The reproducible Rustwright benchmark prepares source-shaped 10,000, 100,000,

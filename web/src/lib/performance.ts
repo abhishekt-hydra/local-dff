@@ -43,7 +43,12 @@ function enabledValue(value: unknown) {
 function buildOptInState() {
   if (typeof window !== "undefined") {
     const query = new URLSearchParams(window.location.search)
-    if (enabledValue(query.get("perf")) || enabledValue(query.get("performance")) || enabledValue(query.get("local-diffe-perf"))) return true
+    if (
+      enabledValue(query.get("perf")) ||
+      enabledValue(query.get("performance")) ||
+      enabledValue(query.get("local-diffe-perf"))
+    )
+      return true
   }
   // Vite replaces this constant for profile builds. `typeof` keeps importing
   // this module safe in tests and in non-Vite tooling.
@@ -71,11 +76,15 @@ export function isPerformanceProfilingEnabled() {
 }
 
 /** True only for `vite build --mode profile`/`LOCAL_DIFFE_PROFILE_BUILD=1`. */
-export const PERFORMANCE_BUILD_ENABLED: boolean = typeof __LOCAL_DIFFE_PROFILE_BUILD__ !== "undefined" ? __LOCAL_DIFFE_PROFILE_BUILD__ : false
+export const PERFORMANCE_BUILD_ENABLED: boolean =
+  typeof __LOCAL_DIFFE_PROFILE_BUILD__ !== "undefined" ? __LOCAL_DIFFE_PROFILE_BUILD__ : false
 
 export function createPerformanceProfiler(options: PerformanceProfilerOptions = {}) {
   const enabled = options.enabled ?? buildOptInState()
-  const maxSamples = Math.max(1, Math.min(MAX_MAX_SAMPLES, Math.floor(options.maxSamples ?? DEFAULT_MAX_SAMPLES)))
+  const maxSamples = Math.max(
+    1,
+    Math.min(MAX_MAX_SAMPLES, Math.floor(options.maxSamples ?? DEFAULT_MAX_SAMPLES)),
+  )
   const samples: PerformanceSample[] = []
   const marks = new Map<string, { time: number; detail?: PerformanceDetail }>()
   let callback = options.onSample
@@ -112,7 +121,13 @@ export function createPerformanceProfiler(options: PerformanceProfilerOptions = 
     const endTimeMs = clock()
     const markValue = startMark ? marks.get(boundedName(startMark)) : undefined
     const startTimeMs = markValue?.time ?? endTimeMs
-    const sample = record({ name, durationMs: endTimeMs - startTimeMs, startTimeMs, endTimeMs, detail: { ...markValue?.detail, ...detail } })
+    const sample = record({
+      name,
+      durationMs: endTimeMs - startTimeMs,
+      startTimeMs,
+      endTimeMs,
+      detail: { ...markValue?.detail, ...detail },
+    })
     if (startMark) marks.delete(boundedName(startMark))
     return sample?.durationMs
   }
@@ -124,8 +139,13 @@ export function createPerformanceProfiler(options: PerformanceProfilerOptions = 
     measure,
     record,
     getSamples: () => samples.slice(),
-    clear: () => { samples.length = 0; marks.clear() },
-    setCallback: (next: PerformanceSampleCallback | undefined) => { callback = next },
+    clear: () => {
+      samples.length = 0
+      marks.clear()
+    },
+    setCallback: (next: PerformanceSampleCallback | undefined) => {
+      callback = next
+    },
   }
 }
 
@@ -165,7 +185,11 @@ declare global {
 // A local, bounded inspection handle is useful to the browser benchmark. It
 // is created only after the same opt-in check as the in-memory profiler.
 if (PERFORMANCE_BUILD_ENABLED && typeof window !== "undefined" && profiler.enabled) {
-  const handle = { enabled: profiler.enabled, getSamples: profiler.getSamples, clear: profiler.clear }
+  const handle = {
+    enabled: profiler.enabled,
+    getSamples: profiler.getSamples,
+    clear: profiler.clear,
+  }
   window.__LOCAL_DIFFE_PERF__ = handle
   window.__localDiffePerformance = handle
 }
@@ -204,7 +228,14 @@ export type ReactProfilerCallback = (
   interactions?: unknown,
 ) => void
 
-export const onRender: ReactProfilerCallback = (id, phase, actualDuration, baseDuration, startTime, commitTime) => {
+export const onRender: ReactProfilerCallback = (
+  id,
+  phase,
+  actualDuration,
+  baseDuration,
+  startTime,
+  commitTime,
+) => {
   profiler.record({
     name: `react:${id}`,
     durationMs: actualDuration,
@@ -221,7 +252,9 @@ export const onRender: ReactProfilerCallback = (id, phase, actualDuration, baseD
 
 // Convenience factory for consumers that want to fan out React samples while
 // keeping the shared profiler's bounded storage and opt-in behavior.
-export function createReactProfilerCallback(callback?: PerformanceSampleCallback): ReactProfilerCallback {
+export function createReactProfilerCallback(
+  callback?: PerformanceSampleCallback,
+): ReactProfilerCallback {
   return (id, phase, actualDuration, baseDuration, startTime, commitTime) => {
     const sample = profiler.record({
       name: `react:${id}`,

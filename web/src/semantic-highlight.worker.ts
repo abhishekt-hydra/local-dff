@@ -9,6 +9,9 @@ self.onmessage = async (event: MessageEvent<HighlightRequest>) => {
     await decorateSemanticPatch(patch, input)
     self.postMessage({ id, patch })
   } catch (error) {
-    self.postMessage({ id: event.data?.id, error: error instanceof Error ? error.message : "Semantic highlighting failed." })
+    self.postMessage({
+      id: event.data?.id,
+      error: error instanceof Error ? error.message : "Semantic highlighting failed.",
+    })
   }
 }

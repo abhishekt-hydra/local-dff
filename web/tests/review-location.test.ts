@@ -5,21 +5,51 @@ import { normalizePrUrl, readReviewLocation, withReviewPr } from "../src/lib/rev
 const pr = "https://github.com/hydra-db/hydradb-application/pull/3006"
 
 test("normalizes GitHub PR links, trailing slashes, and GitHub query/hash fragments", () => {
-  for (const input of [pr, `${pr}/`, ` ${pr}/ `, `${pr}/?diff=split#discussion`, pr.replace("https://", ""), pr.replace("https:", "http:"), pr.replace("3006", "003006")]) {
+  for (const input of [
+    pr,
+    `${pr}/`,
+    ` ${pr}/ `,
+    `${pr}/?diff=split#discussion`,
+    pr.replace("https://", ""),
+    pr.replace("https:", "http:"),
+    pr.replace("3006", "003006"),
+  ]) {
     assert.equal(normalizePrUrl(input), pr)
   }
 })
 
 test("rejects malformed, non-GitHub, credential-bearing, and non-PR URLs", () => {
-  for (const input of ["", "not a url", "/owner/repo/pull/1", "javascript:alert(1)", pr.replace("github.com", "github.com.evil.test"), pr.replace("github.com", "evil.test"), pr.replace("https://", "https://user:password@"), pr.replace("github.com", "github.com:444"), pr.replace("/pull/", "/issues/"), `${pr}/files`, pr.replace("3006", "0"), pr.replace("3006", "-1"), pr.replace("3006", "1.5"), pr.replace("3006", "18446744073709551616"), pr.replace("hydra-db", "bad%2Fowner")]) {
+  for (const input of [
+    "",
+    "not a url",
+    "/owner/repo/pull/1",
+    "javascript:alert(1)",
+    pr.replace("github.com", "github.com.evil.test"),
+    pr.replace("github.com", "evil.test"),
+    pr.replace("https://", "https://user:password@"),
+    pr.replace("github.com", "github.com:444"),
+    pr.replace("/pull/", "/issues/"),
+    `${pr}/files`,
+    pr.replace("3006", "0"),
+    pr.replace("3006", "-1"),
+    pr.replace("3006", "1.5"),
+    pr.replace("3006", "18446744073709551616"),
+    pr.replace("hydra-db", "bad%2Fowner"),
+  ]) {
     assert.throws(() => normalizePrUrl(input), Error, input)
   }
-  assert.equal(normalizePrUrl(pr.replace("3006", "18446744073709551615")), pr.replace("3006", "18446744073709551615"))
+  assert.equal(
+    normalizePrUrl(pr.replace("3006", "18446744073709551615")),
+    pr.replace("3006", "18446744073709551615"),
+  )
 })
 
 test("reads both encoded and readable redirect URLs without requiring a repository field", () => {
   for (const value of [pr, `${pr}/`, encodeURIComponent(`${pr}/`)]) {
-    assert.deepEqual(readReviewLocation(new URL(`http://localhost:3333/?pr=${value}`)), { kind: "pr", url: pr })
+    assert.deepEqual(readReviewLocation(new URL(`http://localhost:3333/?pr=${value}`)), {
+      kind: "pr",
+      url: pr,
+    })
   }
   assert.deepEqual(readReviewLocation(new URL("http://localhost:3333/?perf=1")), { kind: "empty" })
 })

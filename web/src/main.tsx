@@ -6,6 +6,12 @@ import "./index.css"
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    {PERFORMANCE_BUILD_ENABLED ? <Profiler id="App" onRender={onRender}><App /></Profiler> : <App />}
+    {PERFORMANCE_BUILD_ENABLED ? (
+      <Profiler id="App" onRender={onRender}>
+        <App />
+      </Profiler>
+    ) : (
+      <App />
+    )}
   </StrictMode>,
 )

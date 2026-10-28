@@ -21,7 +21,8 @@ export type PullGroups = { stacks: PullRow[][]; standalone: PullRequest[] }
 export function groupPulls(pulls: PullRequest[]): PullGroups {
   const local = pulls.filter((pull) => !pull.isCrossRepository)
   const byHead = new Map<string, PullRequest[]>()
-  for (const pull of local) byHead.set(pull.headRefName, [...(byHead.get(pull.headRefName) ?? []), pull])
+  for (const pull of local)
+    byHead.set(pull.headRefName, [...(byHead.get(pull.headRefName) ?? []), pull])
   // An ambiguous head branch (several open PRs from it) links nothing.
   const parentOf = (pull: PullRequest) => {
     const parents = byHead.get(pull.baseRefName)

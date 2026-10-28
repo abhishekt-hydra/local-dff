@@ -1,0 +1,11 @@
+{
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  "semi": false,
+  "ignorePatterns": [
+    "node_modules/**",
+    "dist/**",
+    "dist-profile/**",
+    "tools/oxlint/anti-slop/**",
+    "bun.lock"
+  ]
+}

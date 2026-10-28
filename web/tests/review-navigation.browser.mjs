@@ -8,24 +8,68 @@ import { chromium } from "rustwright"
 import { createServer as createViteServer } from "vite"
 
 const github = (number) => `https://github.com/hydra-db/hydradb-application/pull/${number}`
-const pull = (number) => ({ number, url: github(number), title: `Fixture PR ${number}`, state: "OPEN", baseRefName: number === 3007 ? "pr-3006" : "main", headRefName: `pr-${number}`, isDraft: false, updatedAt: "2026-10-01T00:00:00Z" })
+const pull = (number) => ({
+  number,
+  url: github(number),
+  title: `Fixture PR ${number}`,
+  state: "OPEN",
+  baseRefName: number === 3007 ? "pr-3006" : "main",
+  headRefName: `pr-${number}`,
+  isDraft: false,
+  updatedAt: "2026-10-01T00:00:00Z",
+})
 function session(number, mode = "pr") {
   return {
-    id: `fixture-${number}-${mode}`, files: [], commits: [], commits_truncated: false,
+    id: `fixture-${number}-${mode}`,
+    files:
+      number === 3020
+        ? [{ old_path: "main.go", new_path: "main.go", display_path: "main.go", renderable: true }]
+        : [],
+    commits:
+      number === 3020
+        ? [
+            {
+              sha: "c".repeat(40),
+              short: "ccccccc",
+              parents: ["a".repeat(40)],
+              author: "Fixture",
+              date: "2026-10-01",
+              subject: "Fixture commit",
+              files_changed: 1,
+            },
+          ]
+        : [],
+    commits_truncated: false,
     comparison: {
       base: { revision: "main", commit: "a".repeat(40) },
       target: { revision: `#${number}`, commit: "b".repeat(40) },
-      changed_paths: 0, semantic_paths: 0, description: "Fixture comparison", pull_request: number ? pull(number) : null,
+      changed_paths: number === 3020 ? 1 : 0,
+      semantic_paths: number === 3020 ? 1 : 0,
+      description: "Fixture comparison",
+      pull_request: number ? pull(number) : null,
     },
-    stack: [3006, 3007].includes(number) ? {
-      trunk: "main", current: number, mode,
-      members: [3006, 3007].map((number, index) => ({ pull: pull(number), parent: index ? 3006 : null, depth: index })),
-    } : null,
+    stack: [3006, 3007].includes(number)
+      ? {
+          trunk: "main",
+          current: number,
+          mode,
+          members: [3006, 3007].map((number, index) => ({
+            pull: pull(number),
+            parent: index ? 3006 : null,
+            depth: index,
+          })),
+        }
+      : null,
   }
 }
 
 const dist = fileURLToPath(new URL("../dist/", import.meta.url))
-const types = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml" }
+const types = {
+  ".html": "text/html",
+  ".js": "text/javascript",
+  ".css": "text/css",
+  ".svg": "image/svg+xml",
+}
 let opened = []
 let failOnce = true
 const fixture = createHttpServer(async (request, response) => {
@@ -47,8 +91,9 @@ const fixture = createHttpServer(async (request, response) => {
           response.end(JSON.stringify({ error: "Fixture GitHub failure; retry opening the PR." }))
           return
         }
-        result = session(number)
+        result = number === 3012 ? { id: "malformed", files: "not an array" } : session(number)
       } else if (url.pathname === "/api/stack-scope") result = session(input.number, input.mode)
+      else if (url.pathname === "/api/github/open-prs") result = [pull(3006), pull(3007)]
       else if (url.pathname === "/api/git-diff") result = session(null)
       else throw new Error(`Unexpected API call: ${url.pathname}`)
       if (!response.destroyed) {
@@ -57,8 +102,27 @@ const fixture = createHttpServer(async (request, response) => {
       }
       return
     }
-    const path = resolve(dist, `.${url.pathname === "/" ? "/index.html" : decodeURIComponent(url.pathname)}`)
-    if (!path.startsWith(dist.endsWith(sep) ? dist : `${dist}${sep}`)) throw new Error("Invalid asset path")
+    if (url.pathname === "/semanticdiff-view/fixture-3020-pr/0") {
+      response.writeHead(200, { "content-type": "text/html" })
+      response.end(`<!doctype html><html><body data-fixture-viewer>
+        <script>
+          const origin = new URL(document.baseURI).origin;
+          parent.postMessage({ source: "local-diffe-viewer", ready: true }, origin);
+          addEventListener("message", (event) => {
+            if (event.source === parent && event.data?.testKey) {
+              parent.postMessage({ source: "local-diffe-keyboard", key: event.data.testKey }, origin);
+            }
+          });
+        </script>
+      </body></html>`)
+      return
+    }
+    const path = resolve(
+      dist,
+      `.${url.pathname === "/" ? "/index.html" : decodeURIComponent(url.pathname)}`,
+    )
+    if (!path.startsWith(dist.endsWith(sep) ? dist : `${dist}${sep}`))
+      throw new Error("Invalid asset path")
     const content = await readFile(path)
     response.writeHead(200, { "content-type": types[extname(path)] || "application/octet-stream" })
     response.end(content)
@@ -76,33 +140,94 @@ const browser = await chromium.launch({
 })
 let vite
 try {
-  vite = await createViteServer({ server: { host: "127.0.0.1", port: 0, proxy: { "/api": { target: fixtureUrl } } } })
+  vite = await createViteServer({
+    server: {
+      host: "127.0.0.1",
+      port: 0,
+      proxy: { "/api": { target: fixtureUrl }, "/semanticdiff-view": { target: fixtureUrl } },
+    },
+  })
   await vite.listen()
   const devUrl = vite.resolvedUrls.local[0].replace(/\/$/, "")
-  for (const [mode, app] of [["built", fixtureUrl], ["development StrictMode", devUrl]]) {
+  for (const [mode, app] of [
+    ["built", fixtureUrl],
+    ["development StrictMode", devUrl],
+  ]) {
     opened = []
     failOnce = true
     const page = await browser.newPage()
     async function waitStatus(fragment) {
-      await page.evaluate((fragment) => new Promise((resolve, reject) => {
-        const deadline = performance.now() + 10_000
-        const check = () => {
-          const status = document.querySelector('[data-testid="status"]')?.textContent ?? ""
-          if (status.includes(String(fragment))) return resolve()
-          if (performance.now() > deadline) return reject(new Error(`Expected status ${fragment}; got ${status}`))
-          requestAnimationFrame(check)
-        }
-        check()
-      }), fragment)
+      await page.evaluate(
+        (fragment) =>
+          new Promise((resolve, reject) => {
+            const deadline = performance.now() + 10_000
+            const check = () => {
+              const status = document.querySelector('[data-testid="status"]')?.textContent ?? ""
+              if (status.includes(String(fragment))) return resolve()
+              if (performance.now() > deadline)
+                return reject(new Error(`Expected status ${fragment}; got ${status}`))
+              requestAnimationFrame(check)
+            }
+            check()
+          }),
+        fragment,
+      )
     }
     const review = (number) => waitStatus(`PR #${number} ·`)
     const location = () => page.evaluate(() => window.location.href)
     const currentPr = async () => new URL(await location()).searchParams.get("pr")
     const count = (number) => opened.filter((url) => url === github(number)).length
-    const navigate = (url) => page.evaluate((url) => {
-      history.pushState(null, "", String(url))
-      window.dispatchEvent(new PopStateEvent("popstate"))
-    }, url)
+    async function checkPicker(selector) {
+      await page.click(selector)
+      const relationships = await page.evaluate(
+        (selector) =>
+          new Promise((resolve, reject) => {
+            const deadline = performance.now() + 10_000
+            const check = () => {
+              const trigger = document.querySelector(selector)
+              const popup = document.getElementById(trigger.getAttribute("aria-controls"))
+              const input = popup?.querySelector("[cmdk-input]")
+              const list = input && document.getElementById(input.getAttribute("aria-controls"))
+              if (popup && input && list)
+                return resolve({
+                  triggerTag: trigger.tagName,
+                  triggerRole: trigger.getAttribute("role"),
+                  popupRole: popup.getAttribute("role"),
+                  popupNamed: Boolean(popup.getAttribute("aria-label")),
+                  inputNamed: Boolean(
+                    document
+                      .getElementById(input.getAttribute("aria-labelledby"))
+                      ?.textContent.trim(),
+                  ),
+                  inputRole: input.getAttribute("role"),
+                  listRole: list.getAttribute("role"),
+                  listInsidePopup: popup.contains(list),
+                })
+              if (performance.now() > deadline)
+                return reject(new Error(`Broken picker ARIA relationships: ${selector}`))
+              requestAnimationFrame(check)
+            }
+            check()
+          }),
+        selector,
+      )
+      assert.deepEqual(relationships, {
+        triggerTag: "BUTTON",
+        triggerRole: null,
+        popupRole: "dialog",
+        popupNamed: true,
+        inputNamed: true,
+        inputRole: "combobox",
+        listRole: "listbox",
+        listInsidePopup: true,
+      })
+      await page.click(selector)
+    }
+    const navigate = (url) =>
+      page.evaluate((url) => {
+        history.pushState(null, "", String(url))
+        window.dispatchEvent(new PopStateEvent("popstate"))
+      }, url)
     try {
       // First load, trailing slash normalization, reload, no StrictMode double POST.
       await page.goto(`${app}/?perf=1&pr=${github(3006)}/`)
@@ -168,7 +293,98 @@ try {
       await page.evaluate(() => history.back())
       await waitStatus("Ready to compare")
       assert.equal(await currentPr(), null)
-      console.log(`Review URL browser checks passed (${mode}): deep link, reload, manual open, stack, Back/Forward, validation, retry, races, landing.`)
+      // A 200 response is not a type contract: malformed data remains retryable.
+      await page.goto(`${app}/?pr=${encodeURIComponent(github(3012))}`)
+      await waitStatus("The server returned an invalid response")
+      assert.equal(
+        await page.evaluate(() => document.querySelector('[data-testid="stack-rail"]') !== null),
+        false,
+      )
+
+      // Only the current same-origin viewer may send keyboard commands.
+      await page.goto(`${app}/?pr=${encodeURIComponent(github(3020))}`)
+      await review(3020)
+      await checkPicker('[data-testid="commit-select"]')
+      await page.click('[data-testid="list-prs"]')
+      await waitStatus("open pull requests found")
+      await checkPicker('[data-testid="pr-select"]')
+      await page.evaluate(
+        () =>
+          new Promise((resolve, reject) => {
+            const deadline = performance.now() + 10_000
+            const check = () => {
+              const frame = document.querySelector("iframe")
+              if (frame?.contentDocument?.querySelector("[data-fixture-viewer]")) return resolve()
+              if (performance.now() > deadline)
+                return reject(new Error("Fixture viewer did not load"))
+              requestAnimationFrame(check)
+            }
+            check()
+          }),
+      )
+      const overlay = () =>
+        page.evaluate(() => document.querySelector('[data-testid="keyboard-overlay"]') !== null)
+      assert.equal(await overlay(), false)
+      await page.evaluate(
+        () =>
+          new Promise((resolve) => {
+            window.addEventListener(
+              "message",
+              () => requestAnimationFrame(() => requestAnimationFrame(resolve)),
+              { once: true },
+            )
+            window.postMessage({ source: "local-diffe-keyboard", key: "-" }, location.origin)
+          }),
+      )
+      assert.equal(
+        await overlay(),
+        false,
+        "same-origin messages from the host must not act as viewer commands",
+      )
+      await page.evaluate(() => {
+        const source = document.querySelector("iframe").contentWindow
+        window.dispatchEvent(
+          new MessageEvent("message", {
+            source,
+            origin: "https://evil.test",
+            data: { source: "local-diffe-keyboard", key: "-" },
+          }),
+        )
+        window.dispatchEvent(
+          new MessageEvent("message", {
+            source,
+            origin: location.origin,
+            data: { source: "local-diffe-keyboard", key: 123 },
+          }),
+        )
+      })
+      assert.equal(
+        await overlay(),
+        false,
+        "foreign-origin and malformed viewer messages must be ignored",
+      )
+      await page.evaluate(
+        () =>
+          new Promise((resolve, reject) => {
+            document
+              .querySelector("iframe")
+              .contentWindow.postMessage({ testKey: "-" }, location.origin)
+            const deadline = performance.now() + 10_000
+            const check = () => {
+              if (document.querySelector('[data-testid="keyboard-overlay"]')) return resolve()
+              if (performance.now() > deadline)
+                return reject(
+                  new Error("Trusted viewer command did not toggle the keyboard overlay"),
+                )
+              requestAnimationFrame(check)
+            }
+            check()
+          }),
+      )
+      assert.equal(await overlay(), true)
+      console.log(
+        `Review browser checks passed (${mode}): URL navigation, validation, retry, races, API contract, picker accessibility, viewer message boundaries.`,
+      )
     } finally {
       await page.close()
     }
