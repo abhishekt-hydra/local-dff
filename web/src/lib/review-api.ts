@@ -14,16 +14,18 @@ const pullRequestSchema = z.object({
   headRefName: z.string(),
   isDraft: z.boolean(),
   isCrossRepository: z.optional(z.boolean()),
+  isStackTrunkBase: z.optional(z.boolean()),
   author: z.nullish(z.object({ login: z.string() })),
   updatedAt: z.string(),
 }) satisfies z.ZodMiniType<PullRequest>
 
 export const pullsSchema = z.array(pullRequestSchema)
-const patchFileSchema = z.object({
+export const patchFileSchema = z.object({
   old_path: z.nullable(z.string()),
   new_path: z.nullable(z.string()),
   display_path: z.string(),
   renderable: z.boolean(),
+  change_kind: z.optional(z.string()),
 })
 const revisionSchema = z.object({ revision: z.string(), commit: z.string() })
 const comparisonSchema = z.object({
@@ -33,6 +35,7 @@ const comparisonSchema = z.object({
   semantic_paths: count,
   description: z.string(),
   pull_request: z.nullish(pullRequestSchema),
+  kind: z.optional(z.string()),
 })
 const commitSchema = z.object({
   sha: z.string(),
@@ -58,6 +61,7 @@ const stackSchema = z.object({
 })
 export const sessionSchema = z.object({
   id: z.string().check(z.minLength(1)),
+  repository: z.optional(z.string()),
   files: z.array(patchFileSchema),
   comparison: z.nullish(comparisonSchema),
   commits: z.optional(z.array(commitSchema)),
@@ -68,6 +72,45 @@ export type Session = z.infer<typeof sessionSchema>
 export type PatchFile = z.infer<typeof patchFileSchema>
 export type Commit = z.infer<typeof commitSchema>
 export type StackMode = z.infer<typeof stackModeSchema>
+
+export const stackHistorySchema = z.object({
+  repository: z.string(),
+  members: z.array(
+    z.object({
+      number: positiveInt,
+      parent: z.nullable(positiveInt),
+      depth: count,
+      base: z.string(),
+      target: z.string(),
+      state: z.enum(["ready", "pending", "failed"]),
+      files: z.array(patchFileSchema),
+      error: z.nullish(z.string()),
+    }),
+  ),
+})
+export type StackHistory = z.infer<typeof stackHistorySchema>
+export const reviewSnapshotSchema = z.object({ snapshot_id: z.string() })
+export const stackSymbolsSchema = z.object({
+  state: z.enum(["ready", "unsupported", "ambiguous"]),
+  policy: z.string(),
+  message: z.nullish(z.string()),
+  symbols: z.array(
+    z.object({
+      key: z.string(),
+      name: z.string(),
+      status: z.enum(["added", "removed", "changed", "unchanged", "ambiguous"]),
+      old_start: z.nullish(positiveInt),
+      old_end: z.nullish(positiveInt),
+      new_start: z.nullish(positiveInt),
+      new_end: z.nullish(positiveInt),
+      old_hash: z.nullish(z.string()),
+      new_hash: z.nullish(z.string()),
+      old_source: z.nullish(z.string()),
+      new_source: z.nullish(z.string()),
+    }),
+  ),
+})
+export type StackSymbols = z.infer<typeof stackSymbolsSchema>
 
 const apiErrorSchema = z.object({ error: z.string().check(z.minLength(1)) })
 

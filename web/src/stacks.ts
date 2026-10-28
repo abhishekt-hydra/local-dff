@@ -11,6 +11,7 @@ export type PullRequest = {
   headRefName: string
   isDraft: boolean
   isCrossRepository?: boolean
+  isStackTrunkBase?: boolean
   author?: { login: string } | null
   updatedAt: string
 }
@@ -25,6 +26,9 @@ export function groupPulls(pulls: PullRequest[]): PullGroups {
     byHead.set(pull.headRefName, [...(byHead.get(pull.headRefName) ?? []), pull])
   // An ambiguous head branch (several open PRs from it) links nothing.
   const parentOf = (pull: PullRequest) => {
+    // The repository default branch is an authoritative integration boundary,
+    // even when an open release PR happens to use that branch as its head.
+    if (pull.isStackTrunkBase) return undefined
     const parents = byHead.get(pull.baseRefName)
     return parents?.length === 1 && parents[0].number !== pull.number ? parents[0] : undefined
   }

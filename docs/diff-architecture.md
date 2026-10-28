@@ -71,6 +71,51 @@ background preparation has a 120-second timeout. Dropping a preparation kills
 its Git subprocesses. Prepared comparison metadata lives with the stack;
 semantic artifacts use the shared, bounded Foyer cache.
 
+## Stack review boundaries
+
+The browser keeps the selected PR as a workspace anchor and resolves Final stack
+through an explicit descendant leaf's cumulative comparison. Ancestor lanes
+exclude sibling branches. URL coordinates represent the anchor, scope/tip,
+rendering mode, layout, watched path/folder and symbol; no backend session UUID or
+untrusted OID enters a shareable link. Failed/stale requests do not relabel the
+displayed comparison. Snapshot-local metadata is read through
+`POST /api/stack-history`; `stack_history.rs` returns ready/pending/failed members
+without waiting for every Git operation. Its sequential worker shares the
+existing OnceCells; failed members require explicit retry and cancelled workers
+can restart. UI Ready here means metadata-ready, not that every semantic artifact
+or browser renderer has finished.
+
+`review-evidence.ts` isolates explicit local records by canonical repository,
+scope/PR/tip, base/target commits and old/new/display paths. It retains at most
+512 newest records within an estimated 1 MiB UTF-16 serialization budget.
+Legacy marks missing identity are explained rather than promoted. File, final
+result, commit and explicit symbol evidence remain separate; storage failures
+fall back to memory. Earlier comparison records remain visible as outdated.
+
+`POST /api/review-snapshot` retains a server-owned target/path/topology identity;
+`POST /api/since-review` compares that reviewed target with the current target.
+Browser-supplied revisions cannot choose arbitrary Git content. The server holds
+at most 128 deduplicated FIFO identities in memory. It does not pin old blobs.
+Eviction, restart or missing objects gives an explicit unavailable response.
+Cross-repository/unrelated/copied path continuity is rejected; cross-path matches
+require Git rename evidence. The response kind is `since-review`, not a full PR
+or commit contribution. Base/topology changes are disclosed.
+
+`POST /api/stack-symbols` is a bounded Go declaration pilot, not general symbol
+identity. Same-path qualified declaration keys, lexical comments/strings/braces
+and exact source ranges support a read-only preview. Unsupported syntax,
+generics, unicode identifiers, bodyless/complex signatures, renamed/copied files,
+duplicate declarations and possible split/merge edits fail closed. In particular,
+mixed existing declaration edits with additions/removals are unsupported.
+Limits: existing 1 MiB combined source cap, 100,000 tokens, 512 declarations and
+16 KiB per declaration preview. FNV hashes are content cues, not stable IDs or a
+security proof. Review evidence is never automatically propagated.
+
+The file/folder UI uses the lane's PR-local metadata, supported rename aliases
+and component-boundary folder filtering. Matching selectors/tree are bounded to
+200 paths with an explicit filter; later-edit folder rollups are linear in
+metadata size. Selecting a path never renders every diff eagerly.
+
 ## Browser limits and behavior
 
 - Text patches: at most 16 MiB from Git; larger patches return an explicit error.
@@ -101,7 +146,8 @@ as needed. Removing it also removes locally cached PR metadata and cloned repos.
 Rust 1.99.0 is pinned in `rust-toolchain.toml` and selected explicitly by the
 `Justfile`. Its macOS LLVM loader workaround is local to Just build/test commands.
 Run `just test` for service, storage, background cancellation/admission, blobless
-stack hydration/offline reuse, and subprocess contract tests, and
+stack hydration/offline reuse, branched final results, review retention and Go
+symbol safety, and subprocess contract tests, and
 `node --experimental-strip-types --test local-debug/diff.test.ts` for parsing and
 virtual-window tests. Build with `npm run build` in `web/`.
 

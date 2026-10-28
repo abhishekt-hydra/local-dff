@@ -1,5 +1,10 @@
 import { useEffect } from "react"
-import { readReviewLocation, withReviewPr, type ReviewLocation } from "./review-location"
+import {
+  readReviewLocation,
+  withReviewCoordinates,
+  type ReviewLocation,
+  type ReviewCoordinates,
+} from "./review-location"
 
 export type ReviewHistory = "push" | "replace"
 
@@ -24,8 +29,12 @@ export function useReviewNavigation(
   }, [onNavigate])
 }
 
-export function writeReviewLocation(pr: string | null, history: ReviewHistory = "push") {
-  const next = withReviewPr(new URL(window.location.href), pr)
+export function writeReviewLocation(
+  pr: string | null,
+  history: ReviewHistory = "push",
+  coordinates?: ReviewCoordinates,
+) {
+  const next = withReviewCoordinates(new URL(window.location.href), pr, coordinates)
   if (next.href === window.location.href) return
   // Successful in-app opens already have their data: do not dispatch popstate
   // and issue a second request. Actual Back/Forward navigation loads the URL.

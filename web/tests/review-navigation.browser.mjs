@@ -26,6 +26,7 @@ const pull = (number) => ({
   updatedAt: "2026-10-01T00:00:00Z",
 })
 function session(number, mode = "pr") {
+  if ([3100, 3101, 3102, 3200, 3201, 3202].includes(number)) return advancedSession(number, mode)
   const files =
     number === 3006
       ? [file("bottom.go"), file("shared.go")]
@@ -38,6 +39,7 @@ function session(number, mode = "pr") {
             : []
   return {
     id: `fixture-${number}-${mode}`,
+    repository: "https://github.com/hydra-db/hydradb-application",
     files,
     commits: [3006, 3007, 3020].includes(number)
       ? [
@@ -73,6 +75,84 @@ function session(number, mode = "pr") {
           })),
         }
       : null,
+  }
+}
+
+const oid = (number) => number.toString(16).padEnd(40, "0")
+let pushed = false
+let historyPendingOnce = false
+let historyFailed = false
+let ambiguousSymbols = false
+let largeHistory = false
+const snapshots = new Map()
+let lastSincePair
+function advancedSession(number, mode = "pr") {
+  const branch = number < 3200
+  const numbers = branch ? [3100, 3101, 3102] : [3200, 3201, 3202]
+  const index = numbers.indexOf(number)
+  const parent = index ? (branch ? numbers[0] : numbers[index - 1]) : null
+  const ownFiles = branch
+    ? number === 3100
+      ? [file("src/store/value.go")]
+      : number === 3101
+        ? [file("branch-a.go")]
+        : [file("sibling-b.go")]
+    : number === 3200
+      ? [file("src/store/value.go"), file("reverted.go")]
+      : number === 3201
+        ? [
+            file("src/storehouse/noise.go"),
+            ...(largeHistory
+              ? Array.from({ length: 5000 }, (_, index) =>
+                  file(`bulk/file-${String(index).padStart(5, "0")}.go`),
+                )
+              : []),
+          ]
+        : [
+            file("src/store/value.go"),
+            file("reverted.go"),
+            { ...file("src/new.go"), old_path: "src/old.go", change_kind: "renamed" },
+            { ...file("src/deleted.go"), new_path: null, change_kind: "deleted" },
+            file("binary.dat", false),
+          ]
+  const files =
+    mode === "cumulative" && index
+      ? branch
+        ? [file("src/store/value.go"), ...ownFiles]
+        : number === 3202
+          ? ownFiles
+              .filter((entry) => entry.display_path !== "reverted.go")
+              .concat(file("src/storehouse/noise.go"))
+          : [file("src/store/value.go"), file("reverted.go"), ...ownFiles]
+      : ownFiles
+  const target = oid(number + (pushed && number === 3200 ? 10000 : 0))
+  return {
+    id: `fixture-${number}-${mode}-${pushed ? "v2" : "v1"}`,
+    repository: "https://github.com/hydra-db/hydradb-application",
+    files,
+    commits: [],
+    commits_truncated: false,
+    comparison: {
+      base: {
+        revision: parent ? `#${parent}` : "main",
+        commit: mode === "cumulative" || !parent ? "a".repeat(40) : oid(parent),
+      },
+      target: { revision: `#${number}`, commit: target },
+      changed_paths: files.length,
+      semantic_paths: files.filter((entry) => entry.renderable).length,
+      description: "Immutable fixture contribution",
+      pull_request: pull(number),
+    },
+    stack: {
+      trunk: "main",
+      current: number,
+      mode,
+      members: numbers.map((number, index) => ({
+        pull: pull(number),
+        parent: index ? (branch ? numbers[0] : numbers[index - 1]) : null,
+        depth: branch && index ? 1 : index,
+      })),
+    },
   }
 }
 
@@ -144,6 +224,99 @@ const fixture = createHttpServer(async (request, response) => {
             description: "Commit 1 of 1, compared with its parent.",
           },
         }
+      } else if (url.pathname === "/api/stack-history") {
+        const root = session(Number(input.id.split("-")[1]))
+        if (input.retry) historyFailed = false
+        result = {
+          repository: root.repository,
+          members: root.stack.members.map((entry, index) => {
+            const data = session(entry.pull.number)
+            const state =
+              index === root.stack.members.length - 1 && historyFailed
+                ? "failed"
+                : index === root.stack.members.length - 1 && historyPendingOnce
+                  ? "pending"
+                  : "ready"
+            return {
+              number: entry.pull.number,
+              parent: entry.parent,
+              depth: entry.depth,
+              base: data.comparison.base.commit,
+              target: data.comparison.target.commit,
+              state,
+              files: state === "ready" ? data.files : [],
+              ...(state === "failed" ? { error: "Fixture member unavailable" } : {}),
+            }
+          }),
+        }
+        historyPendingOnce = false
+      } else if (url.pathname === "/api/review-snapshot") {
+        const data = session(Number(input.id.split("-")[1]))
+        const snapshot_id = `snapshot-${snapshots.size}`
+        snapshots.set(snapshot_id, {
+          target: data.comparison.target.commit,
+          file: data.files[input.index],
+        })
+        result = { snapshot_id, retention_limit: 128 }
+      } else if (url.pathname === "/api/since-review") {
+        const old = snapshots.get(input.snapshot_id)
+        if (!old) {
+          response.writeHead(410, { "content-type": "application/json" })
+          response.end(
+            JSON.stringify({
+              error:
+                "Reviewed snapshot unavailable after restart or eviction. Perform a fresh review.",
+            }),
+          )
+          return
+        }
+        const data = session(Number(input.id.split("-")[1]))
+        lastSincePair = [old.target, data.comparison.target.commit]
+        result = {
+          ...data,
+          id: `fixture-since-${data.id}`,
+          files: [data.files[input.index]],
+          stack: null,
+          comparison: {
+            ...data.comparison,
+            kind: "since-review",
+            base: { revision: "reviewed target", commit: old.target },
+            description:
+              "Changes since my review: retained reviewed target to current target; not the full PR contribution.",
+          },
+        }
+      } else if (url.pathname === "/api/stack-symbols") {
+        const value = input.path.endsWith("value.go") || input.path === "shared.go"
+        const ambiguous = value && ambiguousSymbols && input.number === 3202
+        result = {
+          state: !input.path.endsWith(".go") ? "unsupported" : ambiguous ? "ambiguous" : "ready",
+          policy:
+            "Exact same-file Go qualified names; no inferred rename/move identity or review carryover.",
+          ...(ambiguous
+            ? { message: "Duplicate declaration names are ambiguous; use file history." }
+            : {}),
+          symbols: value
+            ? [
+                {
+                  key: "func:Value",
+                  name: "Value",
+                  status: ambiguous ? "ambiguous" : "changed",
+                  ...(ambiguous
+                    ? {}
+                    : {
+                        old_start: 3,
+                        old_end: 5,
+                        new_start: 3,
+                        new_end: 5,
+                        old_hash: "old-body",
+                        new_hash: `body-${input.number}`,
+                        old_source: "func Value() int { return 1 }",
+                        new_source: `func Value() int { return ${input.number} }`,
+                      }),
+                },
+              ]
+            : [],
+        }
       } else if (url.pathname === "/api/github/open-prs") result = stackNumbers.map(pull)
       else if (url.pathname === "/api/git-diff") result = session(null)
       else throw new Error(`Unexpected API call: ${url.pathname}`)
@@ -209,6 +382,13 @@ try {
     failStackOnce = false
     delayCommit = false
     commitRequests = 0
+    pushed = false
+    historyPendingOnce = false
+    historyFailed = false
+    ambiguousSymbols = false
+    largeHistory = false
+    snapshots.clear()
+    lastSincePair = undefined
     const page = await browser.newPage()
     async function waitText(selector, fragment) {
       await page.evaluate(
@@ -542,6 +722,270 @@ try {
       await key("-")
       await page.evaluate(() => localStorage.removeItem("local-diffe:diff-mode"))
 
+      // Final-stack scope keeps the selected member as the URL anchor and
+      // requires an explicit lane when there are sibling leaves.
+      const choose = (selector, value) =>
+        page.evaluate(
+          ({ selector, value }) => {
+            const select = document.querySelector(selector)
+            select.value = value
+            select.dispatchEvent(new Event("change", { bubbles: true }))
+          },
+          { selector, value },
+        )
+      await page.goto(`${app}/?pr=${github(3100)}`)
+      await review(3100)
+      assert.equal(
+        await page.evaluate(() => document.querySelector('[data-testid="stack-tip"]').value),
+        "",
+      )
+      await page.click('[data-testid="stack-scope-final"]')
+      await waitStatus("Choose a descendant tip")
+      await waitContext("Reviewing #3100 against main")
+      await choose('[data-testid="stack-tip"]', "3101")
+      await page.click('[data-testid="stack-scope-final"]')
+      await waitContext("Final stack through #3101 against main")
+      assert.equal(await currentPr(), github(3100))
+      assert.equal(new URL(await location()).searchParams.get("scope"), "final")
+      assert.equal(new URL(await location()).searchParams.get("tip"), "3101")
+      await choose('[data-testid="stack-tip"]', "3102")
+      await waitContext("Final stack through #3102 against main")
+      assert.equal(
+        await page.evaluate(() =>
+          [...document.querySelectorAll("[data-file-index]")].some((entry) =>
+            entry.textContent.includes("branch-a.go"),
+          ),
+        ),
+        false,
+      )
+      await choose('[data-testid="stack-tip"]', "3101")
+      await waitContext("Final stack through #3101 against main")
+      assert.equal(
+        await page.evaluate(() =>
+          [...document.querySelectorAll("[data-file-index]")].some((entry) =>
+            entry.textContent.includes("sibling-b.go"),
+          ),
+        ),
+        false,
+      )
+      await page.click('[data-testid="diff-mode-text"]')
+      await page.goto(await location())
+      await waitContext("Final stack through #3101 against main")
+      assert.equal(await checked("diff-mode-text"), "true")
+      await page.click('[data-testid="stack-scope-pr"]')
+      await waitContext("Reviewing #3100 against main")
+      await page.evaluate(() => history.back())
+      await waitContext("Final stack through #3101 against main")
+      await page.evaluate(() => history.forward())
+      await waitContext("Reviewing #3100 against main")
+      failStackOnce = true
+      await page.click('[data-testid="stack-scope-final"]')
+      await waitStatus("Fixture stack unavailable")
+      await waitContext("Reviewing #3100 against main")
+      assert.equal(await checked("stack-scope-pr"), "true")
+      await page.click('[data-testid="stack-scope-final"]')
+      await waitContext("Final stack through #3101 against main")
+
+      await page.click('[data-testid="review-from-bottom"]')
+      await waitContext("Reviewing #3100 against main")
+      assert.equal(
+        await checked("diff-mode-semantic"),
+        "true",
+        "Starting on the same anchor must still restore Semantic",
+      )
+      await page.goto(`${app}/?pr=${github(3101)}&scope=final&tip=3102`)
+      await waitStatus("not a descendant")
+      await waitContext("Reviewing #3101 against #3100")
+      assert.notEqual(new URL(await location()).searchParams.get("scope"), "final")
+
+      // File history contains actual A/C modifications, not inherited appearances
+      // in untouched B. Metadata can be partial, failed, and explicitly retried.
+      await page.evaluate(() => localStorage.removeItem("local-diffe:review-evidence:v1"))
+      historyPendingOnce = true
+      await page.goto(
+        `${app}/?pr=${github(3200)}&layout=files&path=src%2Fstore%2Fvalue.go&tip=3202`,
+      )
+      await review(3200)
+      await waitText('[data-testid="stack-history"]', "Preparing stack metadata")
+      await waitText('[data-testid="history-pr-3202"]', "3202")
+      assert.equal(
+        await page.evaluate(() =>
+          Boolean(document.querySelector('[data-testid="history-pr-3201"]')),
+        ),
+        false,
+      )
+      await waitText('[data-testid="symbol-source-preview"]', "return 3200")
+      await page.click('[data-testid="mark-as-viewed"]')
+      await page.click('[data-testid="mark-symbol-reviewed"]')
+      await waitText('[data-testid="later-change-notice"]', "3202")
+      await waitText('[data-testid="symbol-later-notice"]', "changes later")
+      await page.screenshot({ path: `/tmp/local-diffe-all-slices-${mode.split(" ")[0]}.png` })
+      await page.click('[data-testid="next-file-change"]')
+      await review(3202)
+      await waitFile("src/store/value.go")
+      assert.equal(
+        await page.evaluate(() => document.querySelector('[data-testid="mark-as-viewed"]').checked),
+        false,
+      )
+      await page.click('[data-testid="previous-file-change"]')
+      await review(3200)
+      await waitText('[data-testid="symbol-source-preview"]', "return 3200")
+      await page.click('[data-testid="next-symbol-change"]')
+      await review(3202)
+      await waitText('[data-testid="symbol-source-preview"]', "return 3202")
+      await choose('[data-testid="history-folder"]', "src/store")
+      assert.equal(new URL(await location()).searchParams.get("pathKind"), "folder")
+      assert.deepEqual(
+        await page.evaluate(() =>
+          [...document.querySelector('[data-testid="history-file"]').options]
+            .map((option) => option.value)
+            .filter(Boolean),
+        ),
+        ["src/store/value.go"],
+      )
+      await choose('[data-testid="history-file"]', "src/store/value.go")
+      await page.goto(await location())
+      await review(3202)
+      await waitText('[data-testid="history-pr-3200"]', "3200")
+      assert.equal(new URL(await location()).searchParams.get("folder"), "src/store")
+      assert.ok(await page.textContent('[data-testid="stack-path-tree"]'))
+      await page.click('[data-testid="previous-folder-pr"]')
+      await review(3200)
+      await page.click('[data-testid="next-folder-pr"]')
+      await review(3202)
+      await choose('[data-testid="history-folder"]', "")
+      await choose('[data-testid="history-file"]', "binary.dat")
+      await waitText('[data-testid="stack-history"]', "Go-only pilot")
+      assert.equal(await checked("diff-mode-text"), "true")
+      historyFailed = true
+      await page.goto(await location())
+      await review(3202)
+      await waitText('[data-testid="stack-history"]', "Fixture member unavailable")
+      await page.click('[data-testid="retry-stack-history"]')
+      await waitText('[data-testid="history-pr-3202"]', "3202")
+      await choose('[data-testid="history-file"]', "src/new.go")
+      await waitText('[data-testid="history-pr-3202"]', "Renamed (Git)")
+      await choose('[data-testid="history-file"]', "src/store/value.go")
+      ambiguousSymbols = true
+      await page.goto(await location())
+      await review(3202)
+      await waitText('[data-testid="symbol-history"]', "Duplicate declaration names")
+      assert.equal(
+        await page.evaluate(
+          () => document.querySelector('[data-testid="next-symbol-change"]').disabled,
+        ),
+        true,
+      )
+      assert.equal(
+        await page.evaluate(
+          () => document.querySelector('[data-testid="previous-symbol-change"]').disabled,
+        ),
+        true,
+      )
+      ambiguousSymbols = false
+
+      // A many-file lane stays navigable without mounting every path or diff.
+      largeHistory = true
+      await page.goto(`${app}/?pr=${github(3200)}&layout=files&tip=3202`)
+      await review(3200)
+      await waitText('[data-testid="stack-history"]', "Showing 200 of")
+      assert.ok(
+        await page.evaluate(
+          () => document.querySelector('[data-testid="history-file"]').options.length <= 202,
+        ),
+      )
+      await page.fill('[data-testid="history-path-filter"]', "bulk/file-04999.go")
+      await waitText('[data-testid="history-file"]', "file-04999.go")
+      assert.ok(
+        await page.evaluate(
+          () => document.querySelector('[data-testid="history-file"]').options.length <= 3,
+        ),
+      )
+      largeHistory = false
+
+      // Final-result review evidence is separate from reviewing each contribution;
+      // the reverted intermediate path is absent from the final comparison.
+      await page.goto(`${app}/?pr=${github(3200)}&scope=final&tip=3202`)
+      await waitContext("Final stack through #3202 against main")
+      assert.equal(
+        await page.evaluate(() =>
+          [...document.querySelectorAll("[data-file-index]")].some((entry) =>
+            entry.textContent.includes("reverted.go"),
+          ),
+        ),
+        false,
+      )
+      assert.equal(
+        await page.evaluate(() => document.querySelector('[data-testid="mark-as-viewed"]').checked),
+        false,
+      )
+      await page.click('[data-testid="mark-as-viewed"]')
+      await page.click('[data-testid="stack-scope-pr"]')
+      await waitContext("Reviewing #3200 against main")
+      assert.equal(
+        await page.evaluate(() => document.querySelector('[data-testid="mark-as-viewed"]').checked),
+        true,
+      )
+
+      await page.goto(`${app}/?pr=${github(3200)}&scope=cumulative&diff=text`)
+      await waitContext("Reviewing through #3200 against main")
+      assert.equal(await checked("stack-scope-cumulative"), "true")
+      assert.equal(await checked("diff-mode-text"), "true")
+      await page.click('[data-testid="stack-scope-pr"]')
+      await waitContext("Reviewing #3200 against main")
+
+      // Pushes expose previous evidence as outdated, with an explicit retained
+      // target-to-target delta. Missing snapshots never substitute another base.
+      pushed = true
+      await page.goto(`${app}/?pr=${github(3200)}`)
+      await review(3200)
+      await waitText('[data-testid="outdated-review"]', "Outdated review")
+      assert.equal(
+        await page.evaluate(() => document.querySelector('[data-testid="mark-as-viewed"]').checked),
+        false,
+      )
+      await page.click('[data-testid="changes-since-review"]')
+      await waitContext("Changes since my review")
+      assert.deepEqual(lastSincePair, [oid(3200), oid(13200)])
+      assert.equal(
+        await page.evaluate(
+          () => document.querySelector('[data-testid="mark-as-viewed"]').disabled,
+        ),
+        true,
+      )
+      await page.click('[data-testid="return-current-review"]')
+      await waitContext("Reviewing #3200 against main")
+      snapshots.clear()
+      await page.click('[data-testid="hide-chrome"]')
+      await page.click('[data-testid="changes-since-review"]')
+      await waitText('[data-testid="review-error"]', "Reviewed snapshot unavailable")
+      await waitContext("Reviewing #3200 against main")
+      await page.click('[data-testid="show-chrome"]')
+      await page.click('[data-testid="mark-as-viewed"]')
+      await page.goto(await location())
+      await review(3200)
+      assert.equal(
+        await page.evaluate(() => document.querySelector('[data-testid="mark-as-viewed"]').checked),
+        true,
+      )
+      await page.evaluate(() => {
+        const original = Storage.prototype.setItem
+        window.restoreFixtureStorage = () => {
+          Storage.prototype.setItem = original
+        }
+        Storage.prototype.setItem = () => {
+          throw new DOMException("Denied", "QuotaExceededError")
+        }
+      })
+      await page.click('[data-testid="mark-as-viewed"]')
+      await page.click('[data-testid="mark-as-viewed"]')
+      await waitText('[data-testid="evidence-warning"]', "kept in memory")
+      assert.equal(
+        await page.evaluate(() => document.querySelector('[data-testid="mark-as-viewed"]').checked),
+        true,
+      )
+      await page.evaluate(() => window.restoreFixtureStorage())
+
       // Only the current same-origin viewer may send keyboard commands.
       await page.goto(`${app}/?pr=${encodeURIComponent(github(3020))}`)
       await review(3020)
@@ -624,7 +1068,7 @@ try {
       )
       assert.equal(await overlay(), true)
       console.log(
-        `Review browser checks passed (${mode}): URL navigation, semantic stack workspace, file/commit continuity, review-from-bottom, keyboard stack navigation, retry/races, API contract, picker accessibility, viewer message boundaries.`,
+        `Review browser checks passed (${mode}): URL/scope restoration, explicit final lanes, file/folder history, review evidence and updates, retained deltas, conservative Go function navigation, keyboard/focus, retries/races, API contracts and viewer boundaries.`,
       )
     } finally {
       await page.close()

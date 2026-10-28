@@ -81,9 +81,12 @@ isolation, stack keyboard commands, and late-response/error handling.
 ## Review stacked pull requests
 
 A PR is part of a stack when its base branch is another open PR's head branch
-(Graphite, git-town, spr and ghstack stacks all work this way). The PR picker
-groups each stack under one heading, with stacked PRs indented under the PR
-they build on.
+within the same repository. The repository's authoritative default branch is
+an integration boundary: an open release PR whose head is that branch does not
+pull every feature PR into one enormous stack. The PR picker groups each stack
+under one heading, with stacked PRs indented under the PR they build on.
+Tool-specific body/footer relationships are not inferred when branches do not
+express the dependency chain.
 
 Opening any PR in a stack (including a pasted URL) fetches every member's
 current head, together with the trunk, in a single metadata-only `git fetch`
@@ -106,13 +109,18 @@ commit scopes and cumulative mode without clearing viewed marks. Switching PRs
 keeps the selected file when that member also changes it; otherwise the first
 reviewable file opens. Empty members keep the stack controls available.
 
-Two views are available:
+Three comparison scopes are available:
 
 - **This PR** compares the PR with the merge-base of its parent PR's *current*
   head. You see only that PR's own changes, even after its parent has been
   pushed again.
 - **Through here** compares the PR with its merge-base on the trunk. This shows
   everything that lands once the stack is merged up to and including this PR.
+- **Final stack** compares the trunk merge-base with a chosen descendant tip.
+  A linear stack defaults to its unique leaf. Branched stacks require choosing
+  a **Stack lane tip**; sibling PRs are alternatives, not successive versions.
+  The pasted PR stays the workspace/URL anchor. **This PR** returns to that
+  member, rather than accidentally showing the tip's own contribution.
 
 A stack always opens in **Semantic** diff. Switching to Text applies until you
 move to another PR in the stack, and does not change the mode saved for other
@@ -120,6 +128,61 @@ reviews. Each stacked PR has its own commit rail and its own viewed marks.
 Fork PRs are never linked into a stack, because branch names are not unique
 across forks. If a parent PR was merged and its child retargeted to the trunk
 without a rebase, the child is reviewed as a standalone PR.
+
+### Files and folders across the stack
+
+Choose **Files across stack** to inspect the union of changed paths on the
+selected lane. Use the folder selector or native expandable **Stack path tree**;
+`src/store` does not include `src/storehouse`. Filter paths to find any file
+(the selector/tree shows at most 200 matches at once). File and folder controls
+skip untouched PRs; opening a timeline entry uses that PR's own comparison,
+not a diff against an unrelated preceding timeline entry.
+
+The timeline discloses preparing/failed members and supports retry. Only
+Git-reported one-to-one renames connect path aliases. Copies, delete/recreate,
+binary and metadata-only changes are labeled; they do not invent symbol identity.
+Watched paths can remain selected when the current comparison does not modify
+them. **Open in PR context** returns to PR-by-PR layout.
+
+Links restore `scope=pr|cumulative|final`, `tip`, `diff=semantic|text`,
+`layout=pr|files`, `path`, `pathKind=file|folder`, optional `folder`, and
+optional `symbol`. Reload and Back/Forward restore those coordinates against
+the latest resolved stack snapshot. Commit and retained-snapshot views are not
+archival deep links.
+
+### Local review evidence and updates
+
+**Viewed** is an explicit local mark, not a GitHub approval. Evidence is isolated
+by canonical repository, PR/scope/tip, immutable comparison commits and file
+paths. Reviewing a final result does not mark its individual contributions.
+Later modifications remain unreviewed, with links/notices in file history.
+New base/target revisions expose earlier evidence as **Outdated** rather than
+silently transferring a green mark.
+
+Use **Changes since my review** to compare the retained reviewed target to the
+current target. This is visibly separate from the full PR contribution; return
+to the current comparison before explicitly marking the new review. Missing
+snapshots never substitute an unrelated base. Local evidence keeps the newest
+512 records within an approximately 1 MiB budget. Server snapshot IDs retain
+at most 128 version identities in memory, not pinned archival blobs: restart,
+eviction or missing Git objects makes that historical comparison unavailable.
+Storage denial/quota failure leaves review tracking usable in memory. Older
+viewed marks without verified repository identity are not automatically migrated.
+
+### Go function-history preview
+
+A conservative Go-only pilot provides declaration ranges/source previews,
+previous/next function-change navigation and explicit function-review marks.
+Matching is restricted to exact qualified names in the same file. It does not
+infer persistent semantic IDs, cross-file moves or renames. Ambiguous duplicates,
+generics/unsupported syntax and possible splits/merges fall back to file history.
+Mixed edited declarations plus additions/removals fail closed as possible
+split/merge cases. Source previews are limited to 16 KiB per declaration.
+Function marks do not mark the file or any later revision reviewed.
+
+The polished, keyboard-first interaction/visual redesign remains a dedicated
+follow-up. Current controls preserve existing shortcuts and native Tab/Enter/
+select/details keyboard behavior; no new keyboard framework is introduced.
 
 ## Review faster
 
@@ -162,8 +225,12 @@ repositories, and GitHub PR JSON separately:
 <cache-dir>/github-prs/<owner>--<repo>/<number>.json
 ```
 
-The first request stores the open-PR list and each fetched PR; later requests
-reuse those files (invalid cache JSON is refetched). Choose a portable or
+Open-PR discovery uses complete cursor pagination, not a 100-PR subset. The
+versioned complete-list cache expires after roughly 60 seconds; old bare arrays
+and incomplete/stale cache data are refetched. Pasted PR metadata and actual heads
+are refreshed when opening a review. Discovery errors remain explicit and
+retryable instead of silently presenting an unavailable stack as standalone.
+Choose a portable or
 project-specific location with either `--cache-dir` or `LOCAL_DIFFE_CACHE_DIR`:
 
 ```bash

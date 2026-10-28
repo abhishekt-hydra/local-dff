@@ -79,8 +79,14 @@ import {
   type StackMode,
 } from "./lib/review-api"
 import { readViewerKey } from "./lib/viewer-keyboard"
-import { stackReviewContext } from "./lib/stack-review"
+import { stackReviewContext, reviewFileSelection } from "./lib/stack-review"
 import { StackRail } from "./components/StackRail"
+import { StackHistoryPanel } from "./components/StackHistoryPanel"
+import { DEFAULT_COORDINATES, type ReviewCoordinates } from "./lib/review-location"
+import { descendantTips, inFolder } from "./lib/stack-history"
+import { useStackHistory } from "./lib/use-stack-history"
+import { reviewEvidenceContext, evidenceFor } from "./lib/review-evidence"
+import { useReviewEvidence } from "./lib/use-review-evidence"
 type ScopeMode = "commit" | "cumulative"
 type SourceTab = "pr" | "branches" | "patch"
 const EMPTY_FILES: PatchFile[] = []
@@ -94,6 +100,7 @@ const SOURCE_TABS = [
 const STACK_MODES = [
   ["pr", "This PR", "Only this PR's changes, compared with the PR below it"],
   ["cumulative", "Through here", "Everything from the trunk through this PR"],
+  ["final", "Final stack", "The final result at an explicitly chosen descendant tip"],
 ] as const
 const COMMIT_MODES = [
   ["commit", "This commit", "Changes made by the selected commit alone"],
@@ -103,7 +110,6 @@ const DIFF_MODES = [
   ["semantic", "Semantic", "SemanticDiff: hides moves and formatting-only changes"],
   ["text", "Text", "Plain unified text diff"],
 ] as const
-const NO_VIEWED: ReadonlySet<number> = new Set()
 
 type ReviewRegion = "sidebar" | "diff"
 
@@ -116,24 +122,10 @@ function isEditableTarget(target: EventTarget | null) {
 
 const initialRepo = "/Users/abhishek/hydradb/hydradb-application"
 const INITIAL_STATUS = "Ready to compare origin/staging with the checked-out branch."
-type SessionLoadOptions = { signal?: AbortSignal; history?: ReviewHistory }
-
-// Session ids are fresh UUIDs per comparison, so viewed state is keyed by the
-// revisions under review and stored as display paths: both survive a reload and
-// a re-generated session whose file order changed. A commit scope is named after
-// the full comparison it belongs to, e.g. `pr-123@abc1234`.
-function viewedStorageKey(session: Session | null, root: Session | null) {
-  if (!session) return null
-  const comparison = session.comparison
-  const rootComparison = root?.comparison ?? comparison
-  if (comparison && rootComparison) {
-    const range = rootComparison.pull_request
-      ? `pr-${rootComparison.pull_request.number}`
-      : `${rootComparison.base.revision}..${rootComparison.target.revision}`
-    const scope = session === root ? range : `${range}@${comparison.target.revision}`
-    return `local-diffe:viewed:${scope}:${comparison.base.commit}:${comparison.target.commit}`
-  }
-  return `local-diffe:viewed:patch:${session.files.length}:${session.files[0]?.display_path ?? ""}`
+type SessionLoadOptions = {
+  signal?: AbortSignal
+  history?: ReviewHistory
+  coordinates?: ReviewCoordinates
 }
 
 function comparisonStatus(session: Session) {
@@ -235,19 +227,6 @@ function formatCommitDate(iso: string) {
         day: "numeric",
         year: date.getFullYear() === new Date().getFullYear() ? undefined : "numeric",
       })
-}
-
-function readViewedPaths(key: string) {
-  try {
-    const stored = JSON.parse(window.localStorage.getItem(key) ?? "[]")
-    return new Set<string>(
-      Array.isArray(stored)
-        ? stored.filter((entry): entry is string => typeof entry === "string")
-        : [],
-    )
-  } catch {
-    return new Set<string>()
-  }
 }
 
 type TreeRowProps = NodeRendererProps<TreeItem> & {
@@ -460,6 +439,9 @@ export default function App() {
   const [sourceTab, setSourceTab] = useState<SourceTab>("pr")
   const [diffMode, setDiffMode] = useState<DiffMode>(preferredMode)
   const [stackLoading, setStackLoading] = useState(false)
+  const [reviewError, setReviewError] = useState("")
+  const [coordinates, setCoordinates] = useState<ReviewCoordinates>(DEFAULT_COORDINATES)
+  const [finalReview, setFinalReview] = useState<{ anchor: Session; tip: number } | null>(null)
   const [chromeHidden, setChromeHidden] = useState(false)
   const [keyboardOverlay, setKeyboardOverlay] = useState(false)
   const [keyboardOverlayExpanded, setKeyboardOverlayExpanded] = useState(false)
@@ -476,13 +458,6 @@ export default function App() {
   const [scopeLoading, setScopeLoading] = useState(false)
   const [commitPickerOpen, setCommitPickerOpen] = useState(false)
   const [selected, setSelected] = useState<number | null>(null)
-  // Viewed indices are tagged with the storage key and file list they were read
-  // for, so a scope switch never shows or persists another scope's marks.
-  const [viewedState, setViewedState] = useState<{
-    key: string | null
-    files: PatchFile[]
-    indices: ReadonlySet<number>
-  }>({ key: null, files: EMPTY_FILES, indices: NO_VIEWED })
   const [search, setSearch] = useState("")
   const [status, setStatus] = useState(INITIAL_STATUS)
   const [loading, setLoading] = useState(false)
@@ -519,14 +494,28 @@ export default function App() {
   )
   const pullGroups = useMemo(() => groupPulls(pulls), [pulls])
   const commits = rootSession?.commits ?? EMPTY_COMMITS
-  const stack = rootSession?.stack ?? null
-  const stackContext = stackReviewContext(rootSession, session)
+  const workspaceRoot = finalReview?.anchor ?? rootSession
+  const stack = workspaceRoot?.stack ?? null
+  const stackContext = stackReviewContext(rootSession, session, finalReview?.tip ?? null)
+  const selectedStackNumber = workspaceRoot?.stack?.current
+  const laneTips = stack ? descendantTips(stack, stack.current) : []
+  const laneTip =
+    coordinates.tip !== null && laneTips.includes(coordinates.tip)
+      ? coordinates.tip
+      : coordinates.tip === null && laneTips.length === 1
+        ? laneTips[0]
+        : null
+  const historyState = useStackHistory(stack ? (workspaceRoot?.id ?? null) : null)
+  const evidenceContext = reviewEvidenceContext(rootSession, session, finalReview?.tip ?? null)
+  const {
+    records,
+    viewedFiles,
+    warning: evidenceWarning,
+    toggle: toggleEvidence,
+  } = useReviewEvidence(evidenceContext, files)
   const stackPosition = stack
     ? stack.members.findIndex((member) => member.pull.number === stack.current)
     : -1
-  const viewedKey = useMemo(() => viewedStorageKey(session, rootSession), [rootSession, session])
-  const viewedFiles =
-    viewedState.key === viewedKey && viewedState.files === files ? viewedState.indices : NO_VIEWED
   const sidebarScale = sidebarFontSize / 12
   const sidebarRowHeight = Math.max(20, Math.round(28 * sidebarScale))
   const sidebarIconSize = Math.max(11, Math.round(14 * sidebarScale))
@@ -594,32 +583,6 @@ export default function App() {
   }, [session, chromeHidden])
 
   useEffect(() => {
-    if (!viewedKey) return
-    const paths = readViewedPaths(viewedKey)
-    const restored = new Set<number>()
-    files.forEach((file, index) => {
-      if (paths.has(file.display_path)) restored.add(index)
-    })
-    // oxlint-disable-next-line react/set-state-in-effect -- Restore persisted external storage only after the review key/file list changes.
-    setViewedState({ key: viewedKey, files, indices: restored })
-  }, [files, viewedKey])
-
-  useEffect(() => {
-    // Only write a set that was read back for this key and file list, so the
-    // placeholder a fresh scope starts with never erases what was saved for it.
-    if (!viewedKey || viewedState.key !== viewedKey || viewedState.files !== files) return
-    const paths = [...viewedState.indices]
-      .map((index) => files[index]?.display_path)
-      .filter((path): path is string => Boolean(path))
-    try {
-      if (paths.length) window.localStorage.setItem(viewedKey, JSON.stringify(paths))
-      else window.localStorage.removeItem(viewedKey)
-    } catch {
-      // Private browsing or a full quota: viewed state stays in-memory only.
-    }
-  }, [files, viewedKey, viewedState])
-
-  useEffect(() => {
     // DiffViewer replaces both viewports when the selected file changes.
     // Keyboard scrolling validates connected cached nodes and retries when a
     // renderer has not mounted yet, so no subtree observer is needed here.
@@ -630,20 +593,21 @@ export default function App() {
   // Show a full comparison (a review, or one PR of a stack), dropping any
   // in-flight commit scope of the previous one. The reviewed file stays
   // selected when the new comparison has it; otherwise its first file opens.
-  const showRoot = useCallback((next: Session, keepPath: string | null) => {
-    scopeRequestRef.current += 1
-    scopeCacheRef.current = new Map()
-    shownCommitIndexRef.current = null
-    setScopeLoading(false)
-    setCommitIndex(null)
-    setRootSession(next)
-    setSession(next)
-    const keep = keepPath
-      ? next.files.findIndex((file) => file.renderable && file.display_path === keepPath)
-      : -1
-    setSelected(keep === -1 ? (buildFileNavigation(next.files).indices[0] ?? null) : keep)
-    setStatus(comparisonStatus(next))
-  }, [])
+  const showRoot = useCallback(
+    (next: Session, keepPath: string | null, strictPath = false, includeMetadata = false) => {
+      setReviewError("")
+      scopeRequestRef.current += 1
+      scopeCacheRef.current = new Map()
+      shownCommitIndexRef.current = null
+      setScopeLoading(false)
+      setCommitIndex(null)
+      setRootSession(next)
+      setSession(next)
+      setSelected(reviewFileSelection(next.files, keepPath, strictPath, includeMetadata))
+      setStatus(comparisonStatus(next))
+    },
+    [],
+  )
 
   const loadSession = useCallback(
     async (
@@ -652,6 +616,7 @@ export default function App() {
       progress: string,
       options: SessionLoadOptions = {},
     ) => {
+      setReviewError("")
       sourceRequestRef.current?.abort()
       const controller = new AbortController()
       sourceRequestRef.current = controller
@@ -673,17 +638,87 @@ export default function App() {
         if (signal.aborted) return
         const next = await api(endpoint, payload, sessionSchema, signal)
         if (signal.aborted || sourceRequestRef.current !== controller) return
+        const wanted = options.coordinates ?? { ...DEFAULT_COORDINATES }
+        let applied = wanted
+        let displayed = next
+        let final: { anchor: Session; tip: number } | null = null
+        let notice = ""
+        if (
+          next.stack &&
+          wanted.tip !== null &&
+          !descendantTips(next.stack, next.stack.current).includes(wanted.tip)
+        ) {
+          applied = { ...wanted, scope: "pr", tip: null }
+          notice = "That tip is not a descendant of the selected PR. Choose a valid stack lane."
+        } else if (wanted.scope === "final" && next.stack) {
+          const tips = descendantTips(next.stack, next.stack.current)
+          const tip =
+            wanted.tip !== null && tips.includes(wanted.tip)
+              ? wanted.tip
+              : wanted.tip === null && tips.length === 1
+                ? tips[0]
+                : null
+          if (tip !== null) {
+            displayed = await api(
+              "/api/stack-scope",
+              { id: next.id, number: tip, mode: "cumulative" },
+              sessionSchema,
+              signal,
+            )
+            final = { anchor: next, tip }
+            applied = { ...wanted, tip }
+          } else {
+            applied = { ...wanted, scope: "pr", tip: null }
+            notice =
+              "Choose a descendant tip before opening Final stack; sibling branches are alternatives."
+          }
+        } else if (wanted.scope === "final") {
+          applied = { ...wanted, scope: "pr", tip: null }
+          notice = "Final stack requires a detected PR stack."
+        } else if (wanted.scope === "cumulative" && next.stack) {
+          displayed = await api(
+            "/api/stack-scope",
+            { id: next.id, number: next.stack.current, mode: "cumulative" },
+            sessionSchema,
+            signal,
+          )
+        }
+        if (signal.aborted || sourceRequestRef.current !== controller) return
+        const keep =
+          applied.pathKind === "folder" && applied.path
+            ? (displayed.files.find(
+                (file) => file.renderable && inFolder(file.display_path, applied.path ?? ""),
+              )?.display_path ?? applied.path)
+            : applied.path
+        const selectedIndex = reviewFileSelection(
+          displayed.files,
+          keep,
+          applied.layout === "files",
+          applied.diff === "text",
+        )
+        if (applied.layout === "pr" && applied.path !== null)
+          applied = {
+            ...applied,
+            path: selectedIndex === null ? null : displayed.files[selectedIndex].display_path,
+            pathKind: "file",
+          }
         const pullUrl = next.comparison?.pull_request?.url ?? null
-        writeReviewLocation(pullUrl, options.history)
+        writeReviewLocation(pullUrl, options.history, applied)
         if (pullUrl) setPrUrl(normalizePrUrl(pullUrl))
         stackCacheRef.current = new Map()
         if (next.stack) stackCacheRef.current.set(`${next.stack.current}:${next.stack.mode}`, next)
-        // A stack always opens in Semantic diff; other reviews keep the last mode.
-        setDiffMode(next.stack ? "semantic" : preferredMode())
-        showRoot(next, null)
+        if (displayed.stack)
+          stackCacheRef.current.set(`${displayed.stack.current}:${displayed.stack.mode}`, displayed)
+        setFinalReview(final)
+        setCoordinates(applied)
+        setDiffMode(applied.diff ?? (next.stack ? "semantic" : preferredMode()))
+        showRoot(displayed, keep, applied.layout === "files", applied.diff === "text")
+        if (notice) setStatus(notice)
       } catch (error) {
         if (!signal.aborted && sourceRequestRef.current === controller) {
-          setStatus(error instanceof Error ? error.message : "Unable to create comparison")
+          const message = error instanceof Error ? error.message : "Unable to create comparison"
+          setStatus(message)
+          setReviewError(message)
         }
       } finally {
         if (!signal.aborted && sourceRequestRef.current === controller) setLoading(false)
@@ -695,6 +730,8 @@ export default function App() {
   const navigateReview = useCallback(
     (location: ReviewLocation, signal: AbortSignal) => {
       setSourceTab("pr")
+      setReviewError("")
+      setFinalReview(null)
       if (location.kind === "pr") {
         // Do not leave another PR visible under this URL if navigation fails.
         setRootSession(null)
@@ -706,7 +743,7 @@ export default function App() {
           "/api/github/open-url",
           { url: location.url },
           "Downloading the GitHub pull request if needed and generating its merge-base diff…",
-          { signal, history: "replace" },
+          { signal, history: "replace", coordinates: location.coordinates },
         )
         return
       }
@@ -723,6 +760,7 @@ export default function App() {
       setSession(null)
       setSelected(null)
       setCommitIndex(null)
+      setCoordinates(DEFAULT_COORDINATES)
       setPrUrl(location.kind === "invalid" ? location.input : "")
       setStatus(location.kind === "invalid" ? location.message : INITIAL_STATUS)
     },
@@ -808,6 +846,7 @@ export default function App() {
   const selectScope = useCallback(
     async (index: number | null, mode: ScopeMode) => {
       if (!rootSession || loading || stackLoading) return
+      setReviewError("")
       const request = ++scopeRequestRef.current
       setCommitIndex(index)
       let next: Session | undefined = rootSession
@@ -874,8 +913,16 @@ export default function App() {
 
   // Open another PR of the stack, or the same PR in the other stack mode.
   const selectStack = useCallback(
-    async (number: number, mode: StackMode) => {
+    async (
+      number: number,
+      mode: StackMode,
+      preferredPath?: string,
+      text = false,
+      layout = coordinates.layout,
+      requestedDiff?: DiffMode,
+    ) => {
       if (!rootSession?.stack || loading) return
+      setReviewError("")
       // A commit from the old PR must not land while a new member is loading.
       scopeRequestRef.current += 1
       setScopeLoading(false)
@@ -892,33 +939,174 @@ export default function App() {
         } catch (error) {
           if (request !== stackRequestRef.current) return
           setStackLoading(false)
-          setStatus(error instanceof Error ? error.message : "Unable to open this pull request")
+          const message =
+            error instanceof Error ? error.message : "Unable to open this pull request"
+          setStatus(message)
+          setReviewError(message)
           return
         }
       }
       if (request !== stackRequestRef.current) return
       setStackLoading(false)
+      const { session: current, selected: currentSelected } = selectionRef.current
+      const priorPath =
+        currentSelected === null ? null : (current?.files[currentSelected]?.display_path ?? null)
+      const keep =
+        preferredPath ??
+        (layout === "files"
+          ? coordinates.pathKind === "folder" && coordinates.path
+            ? (next.files.find(
+                (file) =>
+                  file.renderable &&
+                  inFolder(file.display_path, coordinates.folder ?? coordinates.path ?? ""),
+              )?.display_path ?? coordinates.path)
+            : coordinates.path
+          : priorPath)
+      const nextMode =
+        requestedDiff ?? (text ? "text" : number !== selectedStackNumber ? "semantic" : diffMode)
+      const chosen = reviewFileSelection(next.files, keep, layout === "files", nextMode === "text")
+      const applied: ReviewCoordinates = {
+        ...coordinates,
+        scope: mode === "cumulative" ? "cumulative" : "pr",
+        layout,
+        diff: nextMode,
+        ...(preferredPath ? { path: preferredPath, pathKind: "file" } : {}),
+        ...(layout === "pr"
+          ? { path: chosen === null ? null : next.files[chosen].display_path, pathKind: "file" }
+          : {}),
+      }
+      if (
+        applied.tip !== null &&
+        next.stack &&
+        !descendantTips(next.stack, number).includes(applied.tip)
+      )
+        applied.tip = null
       const pullUrl = next.comparison?.pull_request?.url
       if (pullUrl) {
-        writeReviewLocation(pullUrl)
+        writeReviewLocation(pullUrl, "push", applied)
         setPrUrl(normalizePrUrl(pullUrl))
       }
-      if (number !== rootSession.stack.current) setDiffMode("semantic")
-      const { session: current, selected: currentSelected } = selectionRef.current
-      showRoot(
-        next,
-        currentSelected === null ? null : (current?.files[currentSelected]?.display_path ?? null),
-      )
+      setFinalReview(null)
+      setCoordinates(applied)
+      setDiffMode(nextMode)
+      showRoot(next, keep, layout === "files", nextMode === "text")
     },
-    [rootSession, showRoot, loading],
+    [rootSession, selectedStackNumber, showRoot, loading, coordinates, diffMode],
+  )
+
+  const showFinalStack = async (requestedTip: number | null = laneTip) => {
+    const anchor = workspaceRoot
+    if (!anchor?.stack || loading) return
+    const tips = descendantTips(anchor.stack, anchor.stack.current)
+    if (requestedTip === null || !tips.includes(requestedTip)) {
+      setStatus(
+        "Choose a descendant tip before opening Final stack; sibling branches are alternatives.",
+      )
+      return
+    }
+    setReviewError("")
+    scopeRequestRef.current += 1
+    setScopeLoading(false)
+    const request = ++stackRequestRef.current
+    setStackLoading(true)
+    try {
+      const key = `${requestedTip}:cumulative`
+      const next =
+        stackCacheRef.current.get(key) ??
+        (await api(
+          "/api/stack-scope",
+          { id: anchor.id, number: requestedTip, mode: "cumulative" },
+          sessionSchema,
+        ))
+      if (request !== stackRequestRef.current) return
+      stackCacheRef.current.set(key, next)
+      const applied: ReviewCoordinates = {
+        ...coordinates,
+        scope: "final",
+        tip: requestedTip,
+        diff: diffMode,
+      }
+      const current = selectionRef.current
+      const keep =
+        coordinates.layout === "files"
+          ? coordinates.pathKind === "folder" && coordinates.path
+            ? (next.files.find(
+                (file) =>
+                  file.renderable &&
+                  inFolder(file.display_path, coordinates.folder ?? coordinates.path ?? ""),
+              )?.display_path ?? coordinates.path)
+            : coordinates.path
+          : current.selected === null
+            ? null
+            : (current.session?.files[current.selected]?.display_path ?? null)
+      const selectedIndex = reviewFileSelection(
+        next.files,
+        keep,
+        applied.layout === "files",
+        diffMode === "text",
+      )
+      const canonical =
+        applied.layout === "pr"
+          ? {
+              ...applied,
+              path: selectedIndex === null ? null : next.files[selectedIndex].display_path,
+              pathKind: "file" as const,
+            }
+          : applied
+      showRoot(next, keep, applied.layout === "files", diffMode === "text")
+      setFinalReview({ anchor, tip: requestedTip })
+      setCoordinates(canonical)
+      const url = anchor.comparison?.pull_request?.url
+      if (url) writeReviewLocation(url, "push", canonical)
+    } catch (error) {
+      if (request === stackRequestRef.current) {
+        const message = error instanceof Error ? error.message : "Final stack unavailable."
+        setStatus(message)
+        setReviewError(message)
+      }
+    } finally {
+      if (request === stackRequestRef.current) setStackLoading(false)
+    }
+  }
+
+  const updateCoordinates = useCallback(
+    (next: ReviewCoordinates) => {
+      setReviewError("")
+      const index =
+        next.layout === "files" && next.path
+          ? files.findIndex((file) =>
+              next.pathKind === "folder"
+                ? file.renderable && inFolder(file.display_path, next.folder ?? next.path ?? "")
+                : [file.display_path, file.old_path, file.new_path].includes(next.path),
+            )
+          : -1
+      const forceText = index >= 0 && !files[index].renderable
+      const applied = { ...next, diff: forceText ? ("text" as const) : (next.diff ?? diffMode) }
+      setCoordinates(applied)
+      if (next.layout === "files" && next.path) setSelected(index < 0 ? null : index)
+      if (forceText) setDiffMode("text")
+      const url = workspaceRoot?.comparison?.pull_request?.url
+      if (url) writeReviewLocation(url, "push", applied)
+    },
+    [workspaceRoot, files, diffMode],
+  )
+
+  const selectFile = useCallback(
+    (fileIndex: number) => {
+      setReviewError("")
+      setSelected(fileIndex)
+      const file = files[fileIndex]
+      if (file) updateCoordinates({ ...coordinates, path: file.display_path, pathKind: "file" })
+    },
+    [files, coordinates, updateCoordinates],
   )
 
   const reviewFromBottom = useCallback(() => {
     const bottom = stack?.members[0]
     if (!bottom || loading) return
     setDiffMode("semantic")
-    void selectStack(bottom.pull.number, "pr")
-  }, [stack, loading, selectStack])
+    void selectStack(bottom.pull.number, "pr", undefined, false, coordinates.layout, "semantic")
+  }, [stack, loading, selectStack, coordinates.layout])
 
   const stepStack = useCallback(
     (direction: 1 | -1) => {
@@ -931,6 +1119,7 @@ export default function App() {
 
   const changeDiffMode = (mode: DiffMode) => {
     setDiffMode(mode)
+    updateCoordinates({ ...coordinates, diff: mode })
     if (!rootSession?.stack) rememberMode(mode)
   }
 
@@ -947,9 +1136,9 @@ export default function App() {
 
   const focusDiff = useCallback(() => {
     const firstRenderable = fileNavigation.indices[0]
-    if (selected === null && firstRenderable !== undefined) setSelected(firstRenderable)
+    if (selected === null && firstRenderable !== undefined) selectFile(firstRenderable)
     setActiveRegion("diff")
-  }, [fileNavigation, selected])
+  }, [fileNavigation, selected, selectFile])
 
   const moveFile = useCallback(
     (direction: 1 | -1) => {
@@ -962,9 +1151,9 @@ export default function App() {
             ? 0
             : indices.length - 1
           : (current + direction + indices.length) % indices.length
-      setSelected(indices[next])
+      selectFile(indices[next])
     },
-    [fileNavigation, selected],
+    [fileNavigation, selected, selectFile],
   )
 
   const scrollDiff = useCallback((direction: 1 | -1) => {
@@ -1017,15 +1206,63 @@ export default function App() {
   }, [])
 
   const toggleViewed = useCallback(() => {
-    if (selected === null || !files[selected]) return
-    setViewedState((current) => {
-      if (current.key !== viewedKey || current.files !== files) return current
-      const indices = new Set(current.indices)
-      if (indices.has(selected)) indices.delete(selected)
-      else indices.add(selected)
-      return { ...current, indices }
-    })
-  }, [files, selected, viewedKey])
+    if (
+      selected === null ||
+      !files[selected] ||
+      !session ||
+      session.comparison?.kind === "since-review" ||
+      scopeLoading ||
+      stackLoading ||
+      loading
+    )
+      return
+    setReviewError("")
+    toggleEvidence(files[selected], session.id, selected)
+  }, [files, selected, session, toggleEvidence, scopeLoading, stackLoading, loading])
+
+  const showSinceReview = useCallback(async () => {
+    if (stackLoading || scopeLoading || loading) return
+    const file = selected === null ? undefined : files[selected]
+    const previous = evidenceFor(evidenceContext, file, records).outdated
+    if (!session || selected === null || !previous?.snapshot_id) {
+      setStatus(
+        "Reviewed snapshot unavailable. Return to the current comparison and perform a fresh review.",
+      )
+      return
+    }
+    setReviewError("")
+    const request = ++scopeRequestRef.current
+    setScopeLoading(true)
+    try {
+      const next = await api(
+        "/api/since-review",
+        { id: session.id, index: selected, snapshot_id: previous.snapshot_id },
+        sessionSchema,
+      )
+      if (
+        request !== scopeRequestRef.current ||
+        selectionRef.current.session?.id !== session.id ||
+        selectionRef.current.selected !== selected
+      )
+        return
+      setSession(next)
+      setSelected(next.files.length ? 0 : null)
+      shownCommitIndexRef.current = null
+      setCommitIndex(null)
+      setStatus(next.comparison?.description ?? "Changes since my review")
+    } catch (error) {
+      if (request === scopeRequestRef.current) {
+        const message =
+          error instanceof Error
+            ? error.message
+            : "Reviewed snapshot unavailable; perform a fresh review."
+        setStatus(message)
+        setReviewError(message)
+      }
+    } finally {
+      if (request === scopeRequestRef.current) setScopeLoading(false)
+    }
+  }, [session, selected, files, evidenceContext, records, stackLoading, scopeLoading, loading])
 
   const nextUnviewed = useCallback(() => {
     const { indices, positions } = fileNavigation
@@ -1033,12 +1270,12 @@ export default function App() {
     for (let step = 1; step <= indices.length; step++) {
       const candidate = indices[(start + step) % indices.length]
       if (!viewedFiles.has(candidate)) {
-        setSelected(candidate)
+        selectFile(candidate)
         return
       }
     }
     if (indices.length) setStatus("Every file in this view is marked as viewed.")
-  }, [fileNavigation, selected, viewedFiles])
+  }, [fileNavigation, selected, viewedFiles, selectFile])
 
   const toggleKeyboardOverlay = useCallback(() => {
     setKeyboardOverlay((open) => {
@@ -1173,10 +1410,22 @@ export default function App() {
     }
   }, [keyboardOverlay, runOverlayCommand, showKeyboardHelp, toggleKeyboardOverlay])
 
-  const selectFile = useCallback((fileIndex: number) => setSelected(fileIndex), [])
-
   const selectedFile = selected === null ? null : session?.files[selected]
+  const previousReviews = evidenceContext
+    ? records.filter(
+        (record) =>
+          !record.symbol &&
+          record.context.repository === evidenceContext.repository &&
+          record.context.pr === evidenceContext.pr &&
+          record.context.scope === evidenceContext.scope &&
+          record.context.tip === evidenceContext.tip &&
+          (record.context.base !== evidenceContext.base ||
+            record.context.target !== evidenceContext.target),
+      )
+    : []
   const selectedViewed = selected !== null && viewedFiles.has(selected)
+  const selectedEvidence = evidenceFor(evidenceContext, selectedFile, records)
+  const sinceReview = session?.comparison?.kind === "since-review"
   const reviewable = fileNavigation.indices.length
   const viewedCount = fileNavigation.indices.filter((index) => viewedFiles.has(index)).length
   const selectedPosition = selected === null ? null : fileNavigation.positions.get(selected)
@@ -1512,6 +1761,47 @@ export default function App() {
           </Card>
         )}
 
+        {reviewError && (
+          <p
+            data-testid="review-error"
+            role="alert"
+            className="rounded border border-amber-500/30 px-3 py-2 text-sm"
+          >
+            {reviewError}
+          </p>
+        )}
+        {rootSession && evidenceWarning && (
+          <p
+            data-testid="evidence-warning"
+            className="rounded border px-3 py-2 text-xs text-muted-foreground"
+          >
+            {evidenceWarning}
+          </p>
+        )}
+        {rootSession && previousReviews.length > 0 && (
+          <details
+            data-testid="previous-review-evidence"
+            className="rounded border px-3 py-2 text-xs text-muted-foreground"
+          >
+            <summary>
+              {previousReviews.length} earlier file reviews at other comparison revisions (not
+              current approval)
+            </summary>
+            <ul className="mt-1 max-h-32 overflow-auto">
+              {previousReviews.slice(0, 20).map((record) => (
+                <li key={`${record.path}:${record.context.base}:${record.context.target}`}>
+                  {record.path} · {record.context.base.slice(0, 7)} →{" "}
+                  {record.context.target.slice(0, 7)}
+                </li>
+              ))}
+            </ul>
+            <p>
+              Evidence is local and bounded to 512 records / approximately 1 MiB. Historical
+              snapshot IDs are retained by this server for at most 128 versions and become
+              unavailable after eviction, restart, or missing Git objects.
+            </p>
+          </details>
+        )}
         {rootSession && !chromeHidden && (
           <Card
             data-testid="review-summary"
@@ -1636,15 +1926,118 @@ export default function App() {
                     onStart={reviewFromBottom}
                   >
                     <Segmented
-                      value={stack.mode}
+                      value={finalReview ? "final" : stack.mode}
                       options={STACK_MODES}
                       onChange={(mode) => {
-                        if (mode !== stack.mode) void selectStack(stack.current, mode)
+                        if (mode === "final") void showFinalStack()
+                        else if (finalReview || mode !== stack.mode)
+                          void selectStack(stack.current, mode)
                       }}
                       label="Stack scope"
                       testId="stack-scope"
                     />
+                    <label className="grid gap-1 text-xs">
+                      Stack lane tip
+                      <select
+                        data-testid="stack-tip"
+                        className="min-w-0 rounded border bg-background p-1.5"
+                        value={laneTip ?? ""}
+                        onChange={(event) => {
+                          const tip = Number(event.target.value)
+                          if (!tip) return
+                          if (finalReview) void showFinalStack(tip)
+                          else updateCoordinates({ ...coordinates, tip })
+                        }}
+                      >
+                        {(laneTip === null || laneTips.length !== 1) && (
+                          <option value="">Choose a descendant tip</option>
+                        )}
+                        {laneTips.map((number) => (
+                          <option key={number} value={number}>
+                            #{number} ·{" "}
+                            {
+                              stack.members.find((member) => member.pull.number === number)?.pull
+                                .headRefName
+                            }
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <div role="group" aria-label="Review layout" className="flex gap-1">
+                      <Button
+                        data-testid="layout-pr"
+                        size="sm"
+                        variant={coordinates.layout === "pr" ? "secondary" : "ghost"}
+                        onClick={() => updateCoordinates({ ...coordinates, layout: "pr" })}
+                      >
+                        PR by PR
+                      </Button>
+                      <Button
+                        data-testid="layout-files"
+                        size="sm"
+                        variant={coordinates.layout === "files" ? "secondary" : "ghost"}
+                        onClick={() =>
+                          updateCoordinates({
+                            ...coordinates,
+                            layout: "files",
+                            path: coordinates.path ?? selectedFile?.display_path ?? null,
+                          })
+                        }
+                      >
+                        Files across stack
+                      </Button>
+                    </div>
                   </StackRail>
+                )}
+                {stack && workspaceRoot && coordinates.layout === "files" && (
+                  <StackHistoryPanel
+                    root={workspaceRoot}
+                    coordinates={coordinates}
+                    tip={laneTip}
+                    history={historyState.history}
+                    error={historyState.error}
+                    records={records}
+                    canReviewSymbols={
+                      !finalReview &&
+                      session?.id === rootSession?.id &&
+                      rootSession?.stack?.mode === "pr"
+                    }
+                    onRetry={historyState.retry}
+                    onCoordinates={updateCoordinates}
+                    onOpen={(number, file) =>
+                      void selectStack(number, "pr", file.display_path, !file.renderable)
+                    }
+                    onPrLayout={() =>
+                      void selectStack(
+                        stack.current,
+                        "pr",
+                        coordinates.path ?? undefined,
+                        false,
+                        "pr",
+                      )
+                    }
+                    onSymbolReview={(file, key, hash) => {
+                      if (
+                        !rootSession ||
+                        finalReview ||
+                        session?.id !== rootSession.id ||
+                        rootSession.stack?.mode !== "pr"
+                      ) {
+                        setStatus(
+                          "Open this declaration's own PR comparison before recording a function review.",
+                        )
+                        return
+                      }
+                      const index = rootSession.files.findIndex(
+                        (entry) => entry.display_path === file.display_path,
+                      )
+                      if (index >= 0)
+                        toggleEvidence(rootSession.files[index], rootSession.id, index, {
+                          key,
+                          hash,
+                        })
+                    }}
+                  />
                 )}
                 <div className="flex items-center justify-between gap-2">
                   <CardTitle className="text-sm">
@@ -1956,7 +2349,7 @@ export default function App() {
             tabIndex={-1}
             aria-label="Diff panel"
             className={cn(
-              "flex min-h-0 flex-col overflow-hidden outline-none",
+              "flex min-h-0 flex-col overflow-hidden outline-none lg:sticky lg:top-4 lg:self-start",
               activeRegion === "diff" && keyboardOverlay && "ring-2 ring-primary ring-offset-2",
             )}
           >
@@ -1968,12 +2361,62 @@ export default function App() {
                 className={cn("border-b bg-muted/35 px-4 py-2.5", chromeHidden && "pr-[180px]")}
               >
                 <p className="text-sm font-semibold">{stackContext.title}</p>
+                {finalReview && (
+                  <p className="text-xs text-muted-foreground">
+                    Selected member #{finalReview.anchor.stack?.current}; final lane tip #
+                    {finalReview.tip}. PR contributions and final-result reviews are separate.
+                  </p>
+                )}
                 <p className="mt-0.5 text-xs text-muted-foreground">{stackContext.description}</p>
                 {stackContext.range && (
                   <p className="mt-1 font-mono text-[11px] text-muted-foreground">
                     {stackContext.range}
                   </p>
                 )}
+              </div>
+            )}
+            {selectedEvidence.outdated && !selectedEvidence.current && !sinceReview && (
+              <div
+                data-testid="outdated-review"
+                className="flex flex-wrap items-center gap-2 border-b bg-amber-500/5 px-4 py-2 text-xs"
+              >
+                <span>
+                  Outdated review · this file's comparison base or target changed. It is not marked
+                  reviewed at this revision.
+                </span>
+                <Button
+                  data-testid="changes-since-review"
+                  size="sm"
+                  variant="outline"
+                  disabled={
+                    !selectedEvidence.outdated.snapshot_id ||
+                    scopeLoading ||
+                    stackLoading ||
+                    loading
+                  }
+                  onClick={() => void showSinceReview()}
+                >
+                  Changes since my review
+                </Button>
+                {!selectedEvidence.outdated.snapshot_id && (
+                  <span>Historical snapshot unavailable; perform a fresh review.</span>
+                )}
+              </div>
+            )}
+            {sinceReview && (
+              <div className="flex flex-wrap items-center gap-2 border-b px-4 py-2 text-xs">
+                <span>
+                  This is only the delta from your retained reviewed target, not the full PR
+                  contribution. Return before explicitly marking the new review.
+                </span>
+                <Button
+                  data-testid="return-current-review"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => void selectScope(null, scopeMode)}
+                >
+                  Return to current comparison
+                </Button>
               </div>
             )}
             {/* The floating "Show controls" button is fixed at the top-right of
@@ -2067,8 +2510,8 @@ export default function App() {
                       type="checkbox"
                       data-testid="mark-as-viewed"
                       className="size-3.5 shrink-0 cursor-pointer accent-emerald-600"
-                      checked={selectedViewed}
-                      disabled={loading}
+                      checked={!sinceReview && selectedViewed}
+                      disabled={loading || sinceReview || scopeLoading || stackLoading}
                       onChange={toggleViewed}
                     />
                     Viewed
@@ -2103,7 +2546,9 @@ export default function App() {
                       {loading
                         ? "Building your review"
                         : session
-                          ? "Pick a file from the tree."
+                          ? coordinates.layout === "files" && coordinates.path
+                            ? "This comparison does not change the watched path. Select a modifying PR from its timeline."
+                            : "Pick a file from the tree."
                           : "Nothing to review yet."}
                       {loading && (
                         <span className="loading-dots text-primary" aria-hidden="true">

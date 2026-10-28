@@ -47,7 +47,7 @@ export function StackRail({
       data-testid="stack-rail"
       aria-label="Pull-request stack"
       aria-busy={busy}
-      className="grid gap-2 rounded-xl bg-muted/55 p-2"
+      className="sticky top-2 z-10 grid gap-2 rounded-xl border bg-card p-2"
     >
       <div className="flex items-center justify-between gap-2 pl-1">
         <span className="flex items-center gap-1.5 text-xs font-semibold">
