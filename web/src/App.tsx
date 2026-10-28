@@ -79,6 +79,8 @@ import {
   type StackMode,
 } from "./lib/review-api"
 import { readViewerKey } from "./lib/viewer-keyboard"
+import { stackReviewContext } from "./lib/stack-review"
+import { StackRail } from "./components/StackRail"
 type ScopeMode = "commit" | "cumulative"
 type SourceTab = "pr" | "branches" | "patch"
 const EMPTY_FILES: PatchFile[] = []
@@ -518,6 +520,7 @@ export default function App() {
   const pullGroups = useMemo(() => groupPulls(pulls), [pulls])
   const commits = rootSession?.commits ?? EMPTY_COMMITS
   const stack = rootSession?.stack ?? null
+  const stackContext = stackReviewContext(rootSession, session)
   const stackPosition = stack
     ? stack.members.findIndex((member) => member.pull.number === stack.current)
     : -1
@@ -804,7 +807,7 @@ export default function App() {
   // and mode, and the reviewed file stays selected when the next scope has it.
   const selectScope = useCallback(
     async (index: number | null, mode: ScopeMode) => {
-      if (!rootSession || loading) return
+      if (!rootSession || loading || stackLoading) return
       const request = ++scopeRequestRef.current
       setCommitIndex(index)
       let next: Session | undefined = rootSession
@@ -849,7 +852,7 @@ export default function App() {
           : scopeStatus(next, rootSession.commits ?? EMPTY_COMMITS, index, mode),
       )
     },
-    [rootSession, loading],
+    [rootSession, loading, stackLoading],
   )
 
   // `[` from the first commit returns to all changes; neither end wraps.
@@ -873,6 +876,10 @@ export default function App() {
   const selectStack = useCallback(
     async (number: number, mode: StackMode) => {
       if (!rootSession?.stack || loading) return
+      // A commit from the old PR must not land while a new member is loading.
+      scopeRequestRef.current += 1
+      setScopeLoading(false)
+      setCommitIndex(shownCommitIndexRef.current)
       const request = ++stackRequestRef.current
       const cacheKey = `${number}:${mode}`
       let next = stackCacheRef.current.get(cacheKey)
@@ -905,6 +912,13 @@ export default function App() {
     },
     [rootSession, showRoot, loading],
   )
+
+  const reviewFromBottom = useCallback(() => {
+    const bottom = stack?.members[0]
+    if (!bottom || loading) return
+    setDiffMode("semantic")
+    void selectStack(bottom.pull.number, "pr")
+  }, [stack, loading, selectStack])
 
   const stepStack = useCallback(
     (direction: 1 | -1) => {
@@ -1613,99 +1627,14 @@ export default function App() {
             >
               <CardHeader className="gap-3 rounded-t-lg bg-card p-3">
                 {stack && (
-                  <section
-                    data-testid="stack-rail"
-                    aria-label="Pull-request stack"
-                    className="grid gap-1.5 rounded-xl bg-muted/55 p-2"
+                  <StackRail
+                    stack={stack}
+                    busy={stackLoading}
+                    disabled={loading}
+                    onSelect={(number) => void selectStack(number, stack.mode)}
+                    onStep={stepStack}
+                    onStart={reviewFromBottom}
                   >
-                    <div className="flex items-center justify-between gap-2 pl-1">
-                      <span className="flex items-center gap-1.5 text-xs font-semibold">
-                        <Layers className="size-3.5 text-primary" /> Stack{" "}
-                        <span className="font-normal tabular-nums text-muted-foreground">
-                          {stackPosition + 1}/{stack.members.length}
-                        </span>
-                      </span>
-                      <div className="flex items-center gap-0.5">
-                        {stackLoading && (
-                          <LoaderCircle className="mr-1 size-3.5 animate-spin text-primary" />
-                        )}
-                        <Button
-                          type="button"
-                          data-testid="previous-stack-pr"
-                          size="icon"
-                          variant="ghost"
-                          className="size-7"
-                          title="PR below in the stack ({)"
-                          aria-label="PR below in the stack"
-                          disabled={stackPosition <= 0}
-                          onClick={() => stepStack(-1)}
-                        >
-                          <ChevronUp className="size-4" />
-                        </Button>
-                        <Button
-                          type="button"
-                          data-testid="next-stack-pr"
-                          size="icon"
-                          variant="ghost"
-                          className="size-7"
-                          title="PR above in the stack (})"
-                          aria-label="PR above in the stack"
-                          disabled={stackPosition >= stack.members.length - 1}
-                          onClick={() => stepStack(1)}
-                        >
-                          <ChevronDown className="size-4" />
-                        </Button>
-                      </div>
-                    </div>
-                    <ol className="grid max-h-48 gap-0.5 overflow-auto">
-                      <li className="flex items-center gap-2 px-1.5 py-0.5 text-[11px] text-muted-foreground">
-                        <GitBranch className="size-3 shrink-0" />
-                        <span className="truncate font-mono">{stack.trunk}</span>
-                      </li>
-                      {stack.members.map((member, index) => {
-                        const current = member.pull.number === stack.current
-                        return (
-                          <li key={member.pull.number}>
-                            <button
-                              type="button"
-                              data-testid={`stack-pr-${member.pull.number}`}
-                              aria-current={current ? "true" : undefined}
-                              title={`#${member.pull.number} ${member.pull.title} · ${member.pull.headRefName}`}
-                              onClick={() => {
-                                if (!current) void selectStack(member.pull.number, stack.mode)
-                              }}
-                              style={{ paddingLeft: 6 + (member.depth + 1) * 10 }}
-                              className={cn(
-                                "flex w-full items-center gap-2 rounded-lg py-1 pr-2 text-left text-xs transition-colors",
-                                current
-                                  ? "bg-background text-foreground shadow-sm"
-                                  : "text-muted-foreground hover:bg-background/60 hover:text-foreground",
-                              )}
-                            >
-                              <span
-                                className={cn(
-                                  "size-1.5 shrink-0 rounded-full",
-                                  current
-                                    ? "bg-primary"
-                                    : index < stackPosition
-                                      ? "bg-muted-foreground/60"
-                                      : "bg-muted-foreground/25",
-                                )}
-                              />
-                              <span className="shrink-0 font-medium tabular-nums">
-                                #{member.pull.number}
-                              </span>
-                              <span className="min-w-0 truncate">{member.pull.title}</span>
-                              {member.pull.isDraft && (
-                                <span className="ml-auto shrink-0 text-[10px] font-medium uppercase opacity-70">
-                                  Draft
-                                </span>
-                              )}
-                            </button>
-                          </li>
-                        )
-                      })}
-                    </ol>
                     <Segmented
                       value={stack.mode}
                       options={STACK_MODES}
@@ -1715,7 +1644,7 @@ export default function App() {
                       label="Stack scope"
                       testId="stack-scope"
                     />
-                  </section>
+                  </StackRail>
                 )}
                 <div className="flex items-center justify-between gap-2">
                   <CardTitle className="text-sm">
@@ -2031,6 +1960,22 @@ export default function App() {
               activeRegion === "diff" && keyboardOverlay && "ring-2 ring-primary ring-offset-2",
             )}
           >
+            {stackContext && (
+              <div
+                data-testid="stack-review-context"
+                aria-live="polite"
+                aria-atomic="true"
+                className={cn("border-b bg-muted/35 px-4 py-2.5", chromeHidden && "pr-[180px]")}
+              >
+                <p className="text-sm font-semibold">{stackContext.title}</p>
+                <p className="mt-0.5 text-xs text-muted-foreground">{stackContext.description}</p>
+                {stackContext.range && (
+                  <p className="mt-1 font-mono text-[11px] text-muted-foreground">
+                    {stackContext.range}
+                  </p>
+                )}
+              </div>
+            )}
             {/* The floating "Show controls" button is fixed at the top-right of
                 the viewport, so the collapsed header reserves room for it and
                 keeps the viewed checkbox clickable underneath. */}

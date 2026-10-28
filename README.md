@@ -74,7 +74,9 @@ GitHub CLI authentication and a running Local Diffe server are still required.
 URL parsing tests: `just test-frontend`. Browser flows: `just test-browser`
 (requires Chrome/Chromium; set `RUSTWRIGHT_CHROMIUM` if needed). The browser suite
 uses local API fixtures in both the production build and development StrictMode;
-it does not contact GitHub or clone repositories.
+it does not contact GitHub or clone repositories. It also covers semantic stack
+navigation, file/commit continuity, review-from-bottom, empty members, viewed-mark
+isolation, stack keyboard commands, and late-response/error handling.
 
 ## Review stacked pull requests
 
@@ -92,9 +94,19 @@ here**, with nearby members prepared first. Changed file contents stay in the
 local Git cache across restarts, including binary and oversized files; this is
 not a full checkout of every file or historical blob.
 
-The **Stack** panel above the file list
-shows the whole stack, bottom first; click a PR, or step with ⌃ ⌄ (or `{` /
-`}` with the keyboard overlay on). Two views are available:
+The **Stack review** panel above the file list stays available while navigating
+files, commits, and focus view. It shows the whole detected stack, bottom first;
+click a PR, or step with ⌃ ⌄ (or `{` / `}` with the keyboard overlay on). The
+context above the diff explicitly identifies the selected PR and comparison base,
+e.g. **Reviewing #2481 against #2480**. In a commit view it instead identifies the
+actual commit scope. Clicking the current PR returns to its full comparison.
+
+**Review from bottom** opens the first PR's own changes in Semantic view, leaving
+commit scopes and cumulative mode without clearing viewed marks. Switching PRs
+keeps the selected file when that member also changes it; otherwise the first
+reviewable file opens. Empty members keep the stack controls available.
+
+Two views are available:
 
 - **This PR** compares the PR with the merge-base of its parent PR's *current*
   head. You see only that PR's own changes, even after its parent has been
