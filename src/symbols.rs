@@ -8,7 +8,7 @@ use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, time::Duration};
 
-const POLICY: &str = "go-functions-v1: exact same-path function/method name and receiver type; lexical comments/strings/braces; no generics, cross-file moves, renames, splits or stable symbol IDs; ambiguous matches never inherit review status; hashes are noncryptographic content cues only";
+const POLICY: &str = "go-functions-v1: exact same-path function/method name and receiver type; lexical comments/strings/braces; no generics, cross-file moves, renames, splits or stable symbol IDs; edited existing declarations with any addition/removal fall back as possible split/merge; ambiguous matches never inherit review status; hashes are noncryptographic content cues only";
 #[derive(Deserialize)]
 pub struct Request {
     id: String,
@@ -362,6 +362,17 @@ fn compare(old: &str, new: &str) -> Response {
     if by_key.is_empty() {
         return unsupported("No supported Go function or method declarations in this file.");
     }
+    let has_unmatched = by_key
+        .values()
+        .any(|(old, new)| old.is_empty() || new.is_empty());
+    let has_changed_match = by_key.values().any(|(old, new)| {
+        matches!((old.as_slice(), new.as_slice()), ([old], [new]) if old.text != new.text)
+    });
+    // Exact names alone cannot distinguish a routine edit from extraction into
+    // a new helper or merging a removed declaration into a retained one.
+    if has_unmatched && has_changed_match {
+        return unsupported("Possible function split/merge: an existing declaration changed while another was added or removed. Symbol continuity is uncertain; use file history.");
+    }
     let mut symbols = Vec::new();
     let mut ambiguous = false;
     for (key, (old, new)) in by_key {
@@ -426,10 +437,7 @@ mod tests {
     }
     #[test]
     fn exact_keys_only_and_duplicate_names_are_ambiguous() {
-        let result = compare(
-            "func A() {}\nfunc B() {}",
-            "func C() {}\nfunc B() { work() }",
-        );
+        let result = compare("func A() {}\nfunc B() {}", "func C() {}\nfunc B() {}");
         assert_eq!(result.state, "ready");
         assert_eq!(
             result
@@ -437,12 +445,65 @@ mod tests {
                 .iter()
                 .map(|symbol| symbol.status)
                 .collect::<Vec<_>>(),
-            ["removed", "changed", "added"]
+            ["removed", "unchanged", "added"]
         );
         let result = compare("func init() {}\nfunc init() {}", "func init() {}");
         assert_eq!(result.state, "ambiguous");
         assert_eq!(result.symbols[0].old_start, None);
     }
+    #[test]
+    fn possible_splits_merges_and_mixed_renames_fail_closed() {
+        let cases = [
+            (
+                "func A() { first(); second() }",
+                "func A() { first(); Helper() }\nfunc Helper() { second() }",
+            ),
+            (
+                "func A() { first() }\nfunc B() { second() }",
+                "func A() { first(); second() }",
+            ),
+            (
+                "func A() {}\nfunc B() {}",
+                "func C() {}\nfunc B() { work() }",
+            ),
+        ];
+        for (old, new) in cases {
+            let result = compare(old, new);
+            assert_eq!(result.state, "unsupported");
+            assert!(result.symbols.is_empty());
+            assert!(result.message.unwrap().contains("split/merge"));
+        }
+    }
+
+    #[test]
+    fn renamed_or_moved_bodies_remain_unmatched_without_cross_key_identity() {
+        let result = compare("func A() { work() }", "func C() { work() }");
+        assert_eq!(result.state, "ready");
+        assert_eq!(result.symbols.len(), 2);
+        assert_eq!(result.symbols[0].status, "removed");
+        assert_eq!(result.symbols[1].status, "added");
+        assert!(result.symbols[0].new_source.is_none());
+        assert!(result.symbols[1].old_source.is_none());
+        assert_eq!(result.symbols[0].key, "func:A");
+        assert_eq!(result.symbols[1].key, "func:C");
+    }
+
+    #[test]
+    fn deletion_only_and_unchanged_reordering_keep_truthful_declaration_states() {
+        let result = compare("func A() {}\nfunc B() {}", "func B() {}");
+        assert_eq!(result.state, "ready");
+        assert_eq!(result.symbols[0].status, "removed");
+        assert_eq!(result.symbols[1].status, "unchanged");
+        let result = compare("func A() {}\nfunc B() {}", "func B() {}\nfunc A() {}");
+        assert_eq!(result.state, "ready");
+        assert!(result
+            .symbols
+            .iter()
+            .all(|symbol| symbol.status == "unchanged"));
+        assert_eq!(result.symbols[0].old_start, Some(1));
+        assert_eq!(result.symbols[0].new_start, Some(2));
+    }
+
     #[test]
     fn unsupported_syntax_and_unterminated_input_fall_back() {
         for source in [
