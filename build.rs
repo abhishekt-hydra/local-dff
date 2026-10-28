@@ -4,8 +4,7 @@ use std::{
     process::Command,
 };
 
-const DEFAULT_SEMANTICDIFF_EXTENSION: &str =
-    "/Users/abhishek/.cursor/extensions/semanticdiff.semanticdiff-0.10.0-darwin-arm64";
+const DEFAULT_SEMANTICDIFF_EXTENSION: &str = "vendor/semanticdiff/extension";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -16,7 +15,7 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let extension_dir = env::var_os("SEMANTICDIFF_EXTENSION_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_SEMANTICDIFF_EXTENSION));
+        .unwrap_or_else(|| manifest_dir.join(DEFAULT_SEMANTICDIFF_EXTENSION));
     let web_dist = manifest_dir.join("web/dist");
     let semanticdiff_bin = extension_dir.join("bin/semanticdiff");
     let semanticdiff_parsers = extension_dir.join("bin");

@@ -8,3 +8,5 @@
 /local-debug/
 /.optmem/
 .env
+# Local vendored copy of the proprietary SemanticDiff CLI/parsers (see vendor/semanticdiff/README.md)
+/vendor/semanticdiff/extension/
