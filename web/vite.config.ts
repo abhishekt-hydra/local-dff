@@ -15,7 +15,24 @@ export default defineConfig(({ mode }) => {
     ["1", "true", "yes", "on"].includes((env.LOCAL_DIFFE_PROFILE_BUILD || "").toLowerCase())
   return {
     plugins: [react(), tailwindcss()],
-    worker: { format: "es" },
+    worker: {
+      format: "es",
+      rolldownOptions: {
+        output: {
+          codeSplitting: {
+            groups: [
+              {
+                // C++ includes a second, large macro grammar. Split its support
+                // modules, but keep them behind the existing lazy language import.
+                name: "cpp-support",
+                test: /node_modules[\\/]@shikijs[\\/]langs[\\/]dist[\\/]cpp-macro\.mjs$/,
+                entriesAware: true,
+              },
+            ],
+          },
+        },
+      },
+    },
     resolve: {
       alias: {
         "@": fileURLToPath(new URL("./src", import.meta.url)),
@@ -34,13 +51,21 @@ export default defineConfig(({ mode }) => {
     build: {
       outDir: profilingBuild ? "dist-profile" : "dist",
       sourcemap: profilingBuild,
-      rollupOptions: {
+      rolldownOptions: {
         preserveEntrySignatures: "strict",
         input: {
           index: fileURLToPath(new URL("./index.html", import.meta.url)),
           "semantic-viewer": fileURLToPath(new URL("./src/semantic-viewer.ts", import.meta.url)),
         },
         output: {
+          codeSplitting: {
+            groups: [
+              {
+                name: "react-runtime",
+                test: /node_modules[\\/](?:react|react-dom|scheduler)[\\/]/,
+              },
+            ],
+          },
           entryFileNames: (chunk) =>
             chunk.name === "semantic-viewer"
               ? "assets/semantic-viewer.js"
