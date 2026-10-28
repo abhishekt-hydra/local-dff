@@ -15,6 +15,7 @@ use tokio::process::Command;
 
 pub(crate) const QUERY: &str = r#"query($owner: String!, $name: String!, $endCursor: String) {
   repository(owner: $owner, name: $name) {
+    defaultBranchRef { name }
     pullRequests(first: 100, states: OPEN, after: $endCursor, orderBy: {field: CREATED_AT, direction: ASC}) {
       totalCount
       nodes { number title url state baseRefName baseRefOid headRefName headRefOid isDraft isCrossRepository author { login } updatedAt }
@@ -22,7 +23,7 @@ pub(crate) const QUERY: &str = r#"query($owner: String!, $name: String!, $endCur
     }
   }
 }"#;
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const TTL: u64 = 60;
 
 #[derive(Deserialize, Serialize)]
@@ -31,7 +32,21 @@ struct Cache {
     repository: String,
     complete: bool,
     fetched_at: u64,
+    default_branch: Option<String>,
     pulls: Vec<PullRequestInfo>,
+}
+
+pub(crate) struct Topology {
+    pub pulls: Vec<PullRequestInfo>,
+    pub default_branch: Option<String>,
+}
+impl Topology {
+    pub fn mark_trunk_base(&self, pull: &mut PullRequestInfo) {
+        // Always recompute: fresh `gh pr view` metadata has no derived flag,
+        // and an older selected copy may have changed its target branch.
+        pull.is_stack_trunk_base =
+            self.default_branch.as_deref() == Some(pull.base_ref_name.as_str());
+    }
 }
 #[derive(Deserialize)]
 struct Page {
@@ -45,7 +60,12 @@ struct Data {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Repository {
+    default_branch_ref: Option<Branch>,
     pull_requests: Connection,
+}
+#[derive(Deserialize)]
+struct Branch {
+    name: String,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -95,17 +115,26 @@ fn valid_cache(cache: &Cache, repository: &str, time: u64) -> bool {
     cache.version == VERSION
         && cache.complete
         && cache.repository == repository
+        && (cache.pulls.is_empty()
+            || cache
+                .default_branch
+                .as_ref()
+                .is_some_and(|branch| !branch.is_empty()))
         && time
             .checked_sub(cache.fetched_at)
             .is_some_and(|age| age < TTL)
         && cache.pulls.iter().all(|pull| {
-            pull.state == "OPEN" && validate_pull(pull, repository) && numbers.insert(pull.number)
+            pull.state == "OPEN"
+                && validate_pull(pull, repository)
+                && numbers.insert(pull.number)
+                && pull.is_stack_trunk_base
+                    == (cache.default_branch.as_deref() == Some(pull.base_ref_name.as_str()))
         })
 }
 
 /// `gh --paginate --slurp` must end with a terminal page. Check the complete
 /// connection, including totalCount, so partial GraphQL successes never cache.
-fn parse_pages(bytes: &[u8], repository: &str) -> Result<Vec<PullRequestInfo>, ApiError> {
+fn parse_pages(bytes: &[u8], repository: &str) -> Result<Topology, ApiError> {
     let pages: Vec<Page> =
         serde_json::from_slice(bytes).map_err(|_| failure("invalid paginated response"))?;
     if pages.is_empty() {
@@ -113,6 +142,7 @@ fn parse_pages(bytes: &[u8], repository: &str) -> Result<Vec<PullRequestInfo>, A
     }
     let page_count = pages.len();
     let mut total = None;
+    let mut default_branch: Option<Option<String>> = None;
     let mut cursors = HashSet::new();
     let mut pulls: BTreeMap<u64, PullRequestInfo> = BTreeMap::new();
     for (index, page) in pages.into_iter().enumerate() {
@@ -121,11 +151,22 @@ fn parse_pages(bytes: &[u8], repository: &str) -> Result<Vec<PullRequestInfo>, A
         }) {
             return Err(failure("GitHub returned GraphQL errors"));
         }
-        let connection = page
+        let repository_info = page
             .data
             .repository
-            .ok_or_else(|| failure("repository is missing or inaccessible"))?
-            .pull_requests;
+            .ok_or_else(|| failure("repository is missing or inaccessible"))?;
+        let branch = repository_info.default_branch_ref.map(|branch| branch.name);
+        if branch.as_ref().is_some_and(|name| name.is_empty())
+            || default_branch
+                .as_ref()
+                .is_some_and(|previous| previous != &branch)
+        {
+            return Err(failure(
+                "repository default branch changed or is invalid during pagination",
+            ));
+        }
+        default_branch = Some(branch);
+        let connection = repository_info.pull_requests;
         if total
             .replace(connection.total_count)
             .is_some_and(|count| count != connection.total_count)
@@ -175,7 +216,19 @@ fn parse_pages(bytes: &[u8], repository: &str) -> Result<Vec<PullRequestInfo>, A
     if total != Some(pulls.len()) {
         return Err(failure("pagination did not include every open PR"));
     }
-    Ok(pulls.into_values().collect())
+    let default_branch = default_branch.flatten();
+    if !pulls.is_empty() && default_branch.is_none() {
+        return Err(failure("repository default branch is unavailable"));
+    }
+    let mut topology = Topology {
+        pulls: Vec::new(),
+        default_branch,
+    };
+    for mut pull in pulls.into_values() {
+        topology.mark_trunk_base(&mut pull);
+        topology.pulls.push(pull);
+    }
+    Ok(topology)
 }
 
 fn command(repo: &Path, repository: &str) -> Result<Command, ApiError> {
@@ -204,14 +257,17 @@ pub(crate) async fn open(
     repo: &Path,
     repository: &str,
     refresh: bool,
-) -> Result<Vec<PullRequestInfo>, ApiError> {
+) -> Result<Topology, ApiError> {
     let repository = canonical(repository)?;
     let path = github_pr_cache_dir(cache_dir, &repository)?.join("open.json");
     if !refresh {
         if let Some(cache) =
             read_json_cache::<Cache>(&path).filter(|cache| valid_cache(cache, &repository, now()))
         {
-            return Ok(cache.pulls);
+            return Ok(Topology {
+                pulls: cache.pulls,
+                default_branch: cache.default_branch,
+            });
         }
     }
     let output = tokio::time::timeout(
@@ -226,7 +282,7 @@ pub(crate) async fn open(
     .await
     .map_err(|_| failure("metadata pagination timed out"))?
     .map_err(failure)?;
-    let pulls = parse_pages(&output, &repository)?;
+    let topology = parse_pages(&output, &repository)?;
     write_json_cache(
         &path,
         &Cache {
@@ -234,10 +290,11 @@ pub(crate) async fn open(
             repository,
             complete: true,
             fetched_at: now(),
-            pulls: pulls.clone(),
+            default_branch: topology.default_branch.clone(),
+            pulls: topology.pulls.clone(),
         },
     )?;
-    Ok(pulls)
+    Ok(topology)
 }
 
 #[cfg(test)]
@@ -251,10 +308,11 @@ mod tests {
         serde_json::to_value(pull).unwrap()
     }
     fn page(nodes: Vec<Value>, total: usize, more: bool, cursor: Option<&str>) -> Value {
-        json!({"data":{"repository":{"pullRequests":{"nodes":nodes,"totalCount":total,"pageInfo":{"hasNextPage":more,"endCursor":cursor}}}}})
+        json!({"data":{"repository":{"defaultBranchRef":{"name":"main"},"pullRequests":{"nodes":nodes,"totalCount":total,"pageInfo":{"hasNextPage":more,"endCursor":cursor}}}}})
     }
     fn parse(pages: Vec<Value>) -> Result<Vec<PullRequestInfo>, ApiError> {
         parse_pages(&serde_json::to_vec(&pages).unwrap(), "owner/repo")
+            .map(|topology| topology.pulls)
     }
     #[test]
     fn complete_pagination_exceeds_old_cap_and_deduplicates_identical_nodes() {
@@ -295,12 +353,39 @@ mod tests {
         }
     }
     #[test]
+    fn authoritative_default_branch_is_derived_and_reapplied_to_fresh_selected_metadata() {
+        let mut node = pull(1);
+        node["baseRefName"] = json!("staging");
+        let mut data = page(vec![node], 1, false, None);
+        data["data"]["repository"]["defaultBranchRef"] = json!({"name":"staging"});
+        let topology = parse_pages(
+            &serde_json::to_vec(&vec![data.clone()]).unwrap(),
+            "owner/repo",
+        )
+        .unwrap();
+        assert_eq!(topology.default_branch.as_deref(), Some("staging"));
+        assert!(topology.pulls[0].is_stack_trunk_base);
+        let mut selected = crate::test_support::pull(1, "staging", "topic");
+        topology.mark_trunk_base(&mut selected);
+        assert!(selected.is_stack_trunk_base);
+        selected.base_ref_name = "different-parent".into();
+        topology.mark_trunk_base(&mut selected);
+        assert!(!selected.is_stack_trunk_base);
+        data["data"]["repository"]["defaultBranchRef"] = Value::Null;
+        assert!(parse(vec![data]).is_err());
+        let mut other = page(vec![pull(2)], 2, false, Some("end"));
+        other["data"]["repository"]["defaultBranchRef"] = json!({"name":"staging"});
+        assert!(parse(vec![page(vec![pull(1)], 2, true, Some("more")), other]).is_err());
+    }
+
+    #[test]
     fn complete_cache_contract_expires_and_rejects_legacy_partial_or_future_data() {
         let mut cache = Cache {
             version: VERSION,
             repository: "owner/repo".into(),
             complete: true,
             fetched_at: 100,
+            default_branch: Some("main".into()),
             pulls: vec![serde_json::from_value(pull(1)).unwrap()],
         };
         assert!(valid_cache(&cache, "owner/repo", 159));
@@ -327,12 +412,14 @@ mod tests {
                 repository: "owner/repo".into(),
                 complete: true,
                 fetched_at: now(),
+                default_branch: Some("main".into()),
                 pulls: vec![serde_json::from_value(pull(1)).unwrap()],
             },
         )
         .unwrap();
         let pulls = open(&repo.0, &repo.0, "Owner/Repo", false).await.unwrap();
-        assert_eq!(pulls[0].number, 1);
+        assert_eq!(pulls.pulls[0].number, 1);
+        assert_eq!(pulls.default_branch.as_deref(), Some("main"));
         write_json_cache(&path, &vec![pull(1)]).unwrap();
         assert!(read_json_cache::<Cache>(&path).is_none());
     }
@@ -344,21 +431,35 @@ mod tests {
         let pulls = open(&repo.0, &repo.0, "hydra-db/hydradb-application", true)
             .await
             .unwrap_or_else(|error| panic!("{}", error.message));
-        println!("Complete live metadata: {} open PRs", pulls.len());
-        if let Some(selected) = pulls.iter().find(|pull| pull.number == 2480) {
-            let members = crate::stacks::stack_members(&pulls, selected);
-            println!(
-                "#2480 discovered members: {:?}",
-                members
-                    .iter()
-                    .map(|member| member.pull.number)
-                    .collect::<Vec<_>>()
-            );
-        }
+        assert_eq!(pulls.default_branch.as_deref(), Some("staging"));
+        println!(
+            "Complete live metadata: {} open PRs; trunk staging",
+            pulls.pulls.len()
+        );
+        let selected = pulls
+            .pulls
+            .iter()
+            .find(|pull| pull.number == 2480)
+            .expect("live #2480 must remain open for this explicit regression check");
+        let members = crate::stacks::stack_members(&pulls.pulls, selected);
+        let numbers = members
+            .iter()
+            .map(|member| member.pull.number)
+            .collect::<Vec<_>>();
+        println!("#2480 discovered members: {numbers:?}");
+        assert_eq!(
+            numbers,
+            [2480, 2481, 2484, 2485, 2543, 2583, 2669, 2670, 2840, 2918, 2919, 2939]
+        );
+        assert_eq!(members[0].pull.base_ref_name, "staging");
+        assert!(members[0].pull.is_stack_trunk_base);
+        let release = pulls.pulls.iter().find(|pull| pull.number == 2475).unwrap();
+        assert!(crate::stacks::stack_members(&pulls.pulls, release).is_empty());
     }
 
     #[test]
     fn query_and_cli_contract_use_real_cursor_pagination_and_literal_variables() {
+        assert!(QUERY.contains("defaultBranchRef { name }"));
         assert!(QUERY.contains("$endCursor: String"));
         assert!(QUERY.contains("after: $endCursor"));
         assert!(QUERY.contains("pageInfo { hasNextPage endCursor }"));

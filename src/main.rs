@@ -181,6 +181,9 @@ struct PullRequestInfo {
     is_draft: bool,
     #[serde(rename = "isCrossRepository", default)]
     is_cross_repository: bool,
+    /// Server-derived from the repository's authoritative default branch.
+    #[serde(rename = "isStackTrunkBase", default)]
+    is_stack_trunk_base: bool,
     #[serde(default)]
     author: Option<PullRequestAuthor>,
     #[serde(rename = "updatedAt", default)]
@@ -632,8 +635,9 @@ async fn github_open_prs(
     let repo = PathBuf::from(request.repo.trim());
     ensure_git_repo(&repo)?;
     let github_repo = github_repo_for_local(&repo).await?;
-    let pulls =
-        github_topology::open(&state.cache_dir, &repo, &github_repo, request.refresh).await?;
+    let pulls = github_topology::open(&state.cache_dir, &repo, &github_repo, request.refresh)
+        .await?
+        .pulls;
     warm_github_pr_cache(state.clone(), github_repo, pulls.clone());
     Ok(Json(pulls))
 }
@@ -747,7 +751,9 @@ async fn start_github_pr_session(
         github_topology::open(&state.cache_dir, &repo, &github_repo, false),
     );
     let mut pull = pull?;
-    let members = stacks::stack_members(&open?, &pull);
+    let topology = open?;
+    topology.mark_trunk_base(&mut pull);
+    let members = stacks::stack_members(&topology.pulls, &pull);
     if !members.is_empty() {
         let stack = Arc::new(stacks::resolve(&repo, members).await?);
         for member in &stack.members {

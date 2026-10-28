@@ -54,6 +54,7 @@ pub fn pull(number: u64, base: &str, head: &str) -> crate::PullRequestInfo {
         head_ref_oid: String::new(),
         is_draft: false,
         is_cross_repository: false,
+        is_stack_trunk_base: false,
         author: None,
         updated_at: String::new(),
     }

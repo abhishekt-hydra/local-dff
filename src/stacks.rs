@@ -121,12 +121,15 @@ pub fn stack_members(open: &[PullRequestInfo], pull: &PullRequestInfo) -> Vec<St
     }
     // Several open PRs can share one head branch; the parent is then ambiguous
     // and the walk stops rather than guessing.
-    let parent_of = |child: &PullRequestInfo| match by_head
-        .get(child.base_ref_name.as_str())
-        .map(Vec::as_slice)
-    {
-        Some([parent]) if parent.number != child.number => Some(*parent),
-        _ => None,
+    let parent_of = |child: &PullRequestInfo| {
+        if child.is_stack_trunk_base {
+            None
+        } else {
+            match by_head.get(child.base_ref_name.as_str()).map(Vec::as_slice) {
+                Some([parent]) if parent.number != child.number => Some(*parent),
+                _ => None,
+            }
+        }
     };
 
     let mut bottom = pull;
@@ -234,6 +237,7 @@ mod tests {
             head_ref_oid: String::new(),
             is_draft: false,
             is_cross_repository: false,
+            is_stack_trunk_base: false,
             author: None,
             updated_at: String::new(),
         }
@@ -265,6 +269,52 @@ mod tests {
                 (5, Some(1), 1)
             ]
         );
+    }
+
+    #[test]
+    fn authoritative_trunk_boundary_separates_release_and_unrelated_feature_roots() {
+        let lane = [
+            2480, 2481, 2484, 2485, 2543, 2583, 2669, 2670, 2840, 2918, 2919, 2939,
+        ];
+        let mut open = vec![pr(2475, "byoc-staging", "staging")];
+        let mut base = "staging".to_owned();
+        for number in lane {
+            let head = format!("feature-{number}");
+            open.push(pr(number, &base, &head));
+            base = head;
+        }
+        open.extend([
+            pr(9000, "staging", "unrelated-one"),
+            pr(9001, "staging", "unrelated-two"),
+            pr(9002, "unrelated-two", "unrelated-tip"),
+        ]);
+        for pull in &mut open {
+            pull.is_stack_trunk_base = pull.base_ref_name == "staging";
+        }
+        for selected in [&open[1], &open[12]] {
+            let members = stack_members(&open, selected);
+            assert_eq!(
+                members
+                    .iter()
+                    .map(|member| member.pull.number)
+                    .collect::<Vec<_>>(),
+                lane
+            );
+            assert_eq!(members[0].parent, None);
+            assert_eq!(members[0].pull.base_ref_name, "staging");
+        }
+        assert!(stack_members(&open, &open[0]).is_empty());
+        assert!(stack_members(&open, &open[13]).is_empty());
+        assert_eq!(
+            numbers(&stack_members(&open, &open[14])),
+            [(9001, None, 0), (9002, Some(9001), 1)]
+        );
+        // With no authoritative flag, keep the legacy graph contract rather
+        // than treating a hard-coded branch name as a guessed boundary.
+        for pull in &mut open {
+            pull.is_stack_trunk_base = false;
+        }
+        assert_eq!(stack_members(&open, &open[1]).len(), open.len());
     }
 
     #[test]
