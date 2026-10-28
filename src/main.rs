@@ -32,6 +32,7 @@ mod stacks;
 mod storage;
 #[cfg(test)]
 mod test_support;
+mod warmup;
 use commits::{CommitInfo, CommitLog, ScopeMode};
 use domain::{FileEntry, SemanticResponse};
 use stacks::{Stack, StackMember, StackMode};
@@ -74,6 +75,7 @@ struct AppState {
     // foreground PR opens from trying to update the same cached clone at once.
     github_cache_lock: Arc<AsyncMutex<()>>,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
+    warmup: warmup::Warmup,
 }
 
 #[derive(Clone)]
@@ -257,11 +259,12 @@ async fn main() {
         diffs: Arc::new(application::DiffService::new(
             Arc::new(adapters::GitDiffSource),
             Arc::new(adapters::SemanticCli::new(semanticdiff_bin)),
-            Arc::new(storage::FoyerDiffStore::new(64 * 1024 * 1024)),
+            Arc::new(storage::FoyerDiffStore::new(500 * 1024 * 1024)),
         )),
         cache_dir,
         github_cache_lock: Arc::new(AsyncMutex::new(())),
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        warmup: warmup::Warmup::default(),
     };
     let app = Router::new()
         .route("/", get(index))
@@ -448,10 +451,18 @@ async fn create_git_comparison(
 ) -> Result<Json<StartResponse>, ApiError> {
     let (base_commit, target_commit) =
         tokio::try_join!(git_commit(&repo, &base), git_commit(&repo, &target),)?;
-    let (files, log) = tokio::try_join!(
-        comparison_files(&repo, &base_commit, &target_commit),
-        commits::commit_log(&repo, &base_commit, &target_commit),
-    )?;
+    let (files, log) = if let Some(selection) = &stack {
+        let prepared = selection
+            .stack
+            .comparison(&repo, selection.number, selection.mode)
+            .await?;
+        (prepared.files.clone(), prepared.log.clone())
+    } else {
+        tokio::try_join!(
+            comparison_files(&repo, &base_commit, &target_commit),
+            commits::commit_log(&repo, &base_commit, &target_commit),
+        )?
+    };
     // A stack member may legitimately add nothing on top of its parent; the
     // review still opens so the rest of the stack stays reachable.
     if stack.is_none() {
@@ -738,6 +749,9 @@ async fn start_github_pr_session(
     let members = stacks::stack_members(&open, &pull);
     if !members.is_empty() {
         let stack = Arc::new(stacks::resolve(&repo, members).await?);
+        for member in &stack.members {
+            write_pr_cache(&state.cache_dir, &github_repo, &member.member.pull)?;
+        }
         return open_stack_member(state, repo, stack, number, StackMode::Pr).await;
     }
     fetch_github_pr(&repo, &pull, false).await?;
@@ -911,6 +925,7 @@ fn create_session(
         commits: log.commits.clone(),
         stack: stack.as_ref().map(|selection| selection.stack.clone()),
     };
+    state.warmup.start(state.diffs.clone(), session.clone());
     state.sessions.lock().unwrap().insert(id.clone(), session);
     Json(StartResponse {
         id,
@@ -1261,6 +1276,7 @@ async fn git_changed_files(
     target: &str,
 ) -> Result<Vec<FileEntry>, ApiError> {
     let output = Command::new("git")
+        .kill_on_drop(true)
         .current_dir(repo)
         .args(["diff", "--no-ext-diff", "--name-status", "-z", base, target])
         .output()
@@ -1337,6 +1353,7 @@ async fn git_renderable_paths(
     target: &str,
 ) -> Result<HashSet<String>, ApiError> {
     let output = Command::new("git")
+        .kill_on_drop(true)
         .current_dir(repo)
         .args(["diff", "--no-ext-diff", "--numstat", "-z", base, target])
         .output()

@@ -24,4 +24,8 @@ pub trait DiffStore: Send + Sync {
 
 pub trait DiffReader: Send + Sync {
     fn load(&self, input: DiffInput, kind: DiffKind) -> Task<Arc<DiffArtifact>>;
+
+    /// Low-priority semantic warming. Wait outside the cache so a click never
+    /// joins a background job that is still queued for admission.
+    fn prefetch(&self, input: DiffInput) -> Task<()>;
 }

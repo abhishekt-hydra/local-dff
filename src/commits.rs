@@ -48,6 +48,7 @@ pub async fn commit_log(repo: &Path, base: &str, target: &str) -> Result<CommitL
     let range = format!("{base}..{target}");
     let max_count = format!("--max-count={}", COMMIT_LIMIT + 1);
     let output = Command::new("git")
+        .kill_on_drop(true)
         .current_dir(repo)
         .args([
             "log",

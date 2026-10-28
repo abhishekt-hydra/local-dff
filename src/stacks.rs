@@ -9,6 +9,13 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::OnceCell;
+
+use crate::{
+    commits::{self, CommitLog},
+    comparison_files,
+    domain::FileEntry,
+};
 
 use crate::{git_command, git_commit, git_merge_base, ApiError, PullRequestInfo};
 
@@ -38,6 +45,14 @@ pub struct ResolvedMember {
     pub base: String,
     /// Merge-base with the trunk.
     pub cumulative_base: String,
+    pr_comparison: OnceCell<PreparedComparison>,
+    cumulative_comparison: OnceCell<PreparedComparison>,
+}
+
+#[derive(Debug)]
+pub struct PreparedComparison {
+    pub files: Vec<FileEntry>,
+    pub log: CommitLog,
 }
 
 #[derive(Debug)]
@@ -49,6 +64,34 @@ pub struct Stack {
 }
 
 impl Stack {
+    /// Share warmed file lists and commit rails with foreground scope switches.
+    /// Failed or cancelled preparation is retryable; the stack owns immutable OIDs.
+    pub async fn comparison(
+        &self,
+        repo: &PathBuf,
+        number: u64,
+        mode: StackMode,
+    ) -> Result<&PreparedComparison, ApiError> {
+        let member = &self.members[self.position(number).ok_or_else(|| {
+            ApiError::bad_request("That pull request is not part of this stack.")
+        })?];
+        let (base, cell) = match mode {
+            StackMode::Pr => (&member.base, &member.pr_comparison),
+            StackMode::Cumulative if member.base == member.cumulative_base => {
+                (&member.base, &member.pr_comparison)
+            }
+            StackMode::Cumulative => (&member.cumulative_base, &member.cumulative_comparison),
+        };
+        cell.get_or_try_init(|| async {
+            let (files, log) = tokio::try_join!(
+                comparison_files(repo, base, &member.head),
+                commits::commit_log(repo, base, &member.head),
+            )?;
+            Ok(PreparedComparison { files, log })
+        })
+        .await
+    }
+
     pub fn position(&self, number: u64) -> Option<usize> {
         self.members
             .iter()
@@ -163,6 +206,8 @@ pub async fn resolve(repo: &PathBuf, members: Vec<StackMember>) -> Result<Stack,
             head,
             base,
             cumulative_base,
+            pr_comparison: OnceCell::new(),
+            cumulative_comparison: OnceCell::new(),
         });
     }
     Ok(Stack {
@@ -292,6 +337,151 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[tokio::test]
+    async fn background_stack_warming_hydrates_blobless_clone_and_reuses_scopes() {
+        use crate::{
+            adapters::GitDiffSource,
+            domain::{DiffArtifact, DiffInput, DiffKind},
+            ports::{DiffReader, DiffSource, Task},
+            warmup::Warmup,
+            Session,
+        };
+        use std::{sync::Arc, time::Duration};
+
+        struct Reader(tokio::sync::mpsc::UnboundedSender<DiffInput>);
+        impl DiffReader for Reader {
+            fn load(&self, _: DiffInput, _: DiffKind) -> Task<Arc<DiffArtifact>> {
+                unreachable!()
+            }
+            fn prefetch(&self, input: DiffInput) -> Task<()> {
+                let completed = self.0.clone();
+                Box::pin(async move {
+                    GitDiffSource.contents(input.clone()).await?;
+                    completed.send(input).unwrap();
+                    Ok(())
+                })
+            }
+        }
+
+        let origin = TempRepo::new("partial-origin");
+        origin.git(&["init", "-q", "-b", "main"]);
+        origin.git(&["config", "user.email", "test@example.com"]);
+        origin.git(&["config", "user.name", "Test"]);
+        origin.git(&["config", "uploadpack.allowFilter", "true"]);
+        origin.commit_file("base.txt", "trunk");
+        origin.git(&["checkout", "-qb", "a"]);
+        let first = origin.commit_file("a.txt", "first pr");
+        origin.git(&["update-ref", "refs/pull/1/head", &first]);
+        origin.git(&["checkout", "-qb", "b"]);
+        std::fs::write(origin.0.join("binary.bin"), b"\0binary").unwrap();
+        origin.git(&["add", "binary.bin"]);
+        origin.git(&["commit", "-qm", "binary file"]);
+        let second = origin.commit_file("b.txt", "second pr");
+        let binary_oid = origin.git(&["rev-parse", "HEAD:binary.bin"]);
+        let text_oid = origin.git(&["rev-parse", "HEAD:b.txt"]);
+        origin.git(&["update-ref", "refs/pull/2/head", &second]);
+
+        let clone = TempRepo::new("partial-clone");
+        clone.git(&[
+            "clone",
+            "-q",
+            "--filter=blob:none",
+            "--no-checkout",
+            "--single-branch",
+            "--branch",
+            "main",
+            &format!("file://{}", origin.0.display()),
+            ".",
+        ]);
+        let stack = Arc::new(
+            resolve(
+                &clone.0,
+                stack_members(&[pr(1, "main", "a")], &pr(2, "a", "b")),
+            )
+            .await
+            .unwrap(),
+        );
+        let has_blob = |oid: &str| {
+            std::process::Command::new("git")
+                .current_dir(&clone.0)
+                .env("GIT_NO_LAZY_FETCH", "1")
+                .args(["cat-file", "-e", oid])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        };
+        assert!(!has_blob(&text_oid));
+        assert!(!has_blob(&binary_oid));
+
+        // Only the selected PR is inspected on the request's critical path.
+        let selected = stack.comparison(&clone.0, 1, StackMode::Pr).await.unwrap();
+        let session = Session {
+            repo: clone.0.clone(),
+            base: stack.members[0].base.clone(),
+            target: first.clone(),
+            files: selected.files.clone(),
+            commits: selected.log.commits.clone(),
+            stack: Some(stack.clone()),
+        };
+        assert!(!has_blob(&text_oid));
+        let (completed, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let warmup = Warmup::default();
+        warmup.start(Arc::new(Reader(completed)), session);
+        // Selected PR: a.txt. Top PR: b.txt. Cumulative top: a.txt + b.txt.
+        // Binary content is downloaded, but not sent for semantic analysis.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for _ in 0..4 {
+                events.recv().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(has_blob(&text_oid));
+        assert!(has_blob(&binary_oid));
+
+        // Prepared data and Git contents remain usable with no origin.
+        clone.git(&["remote", "set-url", "origin", "/no-such-local-diffe-origin"]);
+        let (a, b) = tokio::join!(
+            stack.comparison(&clone.0, 2, StackMode::Pr),
+            stack.comparison(&clone.0, 2, StackMode::Pr),
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert!(std::ptr::eq(a, b));
+        assert_eq!(a.log.commits.len(), 2);
+        assert!(a
+            .files
+            .iter()
+            .any(|file| file.display_path == "binary.bin" && !file.renderable));
+        let cumulative = stack
+            .comparison(&clone.0, 2, StackMode::Cumulative)
+            .await
+            .unwrap();
+        assert!(cumulative
+            .files
+            .iter()
+            .any(|file| file.display_path == "a.txt"));
+        let patch = GitDiffSource
+            .text_diff(DiffInput {
+                repo: clone.0.clone(),
+                base: stack.members[1].base.clone(),
+                target: second,
+                file: a
+                    .files
+                    .iter()
+                    .find(|file| file.display_path == "b.txt")
+                    .unwrap()
+                    .clone(),
+            })
+            .await
+            .unwrap();
+        assert!(patch.contains("+second pr"));
+        assert!(stack
+            .comparison(&clone.0, 999, StackMode::Pr)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

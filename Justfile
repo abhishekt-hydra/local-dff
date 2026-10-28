@@ -1,10 +1,13 @@
 set shell := ["zsh", "-cu"]
 
+rust_toolchain := "1.99.0"
+
 default: build
 
+# Use pinned tools directly: shell-based cargo wrappers can strip DYLD variables.
 # Compile the React app and self-contained Rust executable.
 build: frontend
-    cargo build --release --target-dir .build
+    sysroot="$(rustc +{{rust_toolchain}} --print sysroot)"; DYLD_LIBRARY_PATH="$sysroot/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" RUSTC="$sysroot/bin/rustc" "$sysroot/bin/cargo" build --release --target-dir .build
 
 # Run the packaged-equivalent executable on its default 0.0.0.0:3333 listener.
 run: package
@@ -21,6 +24,14 @@ package: build
 # Print the deterministic Git-derived release version: <sha>+<YYYY.MM.DD>.
 version: build
     ./.build/release/local-diffe --version
+
+# Run backend regression tests with the same toolchain and build workaround.
+test:
+    sysroot="$(rustc +{{rust_toolchain}} --print sysroot)"; DYLD_LIBRARY_PATH="$sysroot/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" RUSTC="$sysroot/bin/rustc" "$sysroot/bin/cargo" test --target-dir .build
+
+# Check Rust formatting.
+fmt-check:
+    cargo +{{rust_toolchain}} fmt --check
 
 frontend:
     cd web && bun ci

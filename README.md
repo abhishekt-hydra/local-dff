@@ -11,6 +11,10 @@ cd /Users/abhishek/hydradb/2026-07/local-diffe
 just run
 ```
 
+Rust **1.99.0** is pinned by `rust-toolchain.toml`; `just build` and `just test`
+select it explicitly. The macOS LLVM library-path workaround is scoped to those
+`Justfile` commands, not your shell configuration.
+
 The port is configured in the root `.env` file: `LOCAL_DIFFE_PORT=3333`.
 Change that one value and restart the server and Vite to use a different port;
 the frontend proxy and local debug scripts read the same setting. The server
@@ -50,8 +54,16 @@ A PR is part of a stack when its base branch is another open PR's head branch
 groups each stack under one heading, with stacked PRs indented under the PR
 they build on.
 
-Opening any PR in a stack fetches every member's current head, together with
-the trunk, in a single `git fetch`. The **Stack** panel above the file list
+Opening any PR in a stack (including a pasted URL) fetches every member's
+current head, together with the trunk, in a single metadata-only `git fetch`
+into the blobless cache clone. Only the opened PR's file content is needed to
+show the review; the remaining stack downloads in the background. File lists,
+commit rails, and semantic diffs are warmed for both **This PR** and **Through
+here**, with nearby members prepared first. Changed file contents stay in the
+local Git cache across restarts, including binary and oversized files; this is
+not a full checkout of every file or historical blob.
+
+The **Stack** panel above the file list
 shows the whole stack, bottom first; click a PR, or step with ⌃ ⌄ (or `{` /
 `}` with the keyboard overlay on). Two views are available:
 
@@ -69,6 +81,14 @@ across forks. If a parent PR was merged and its child retargeted to the trunk
 without a rebase, the child is reviewed as a standalone PR.
 
 ## Review faster
+
+Every comparison starts best-effort semantic precomputation in file-list order.
+The backend keeps up to **500 MiB** of weighted text/semantic results in memory;
+clicks reuse warmed results or join an already-running computation. Background
+analysis occupies at most one of two semantic slots, leaving capacity for file
+clicks. Switching comparisons cancels the obsolete queue; bounded loads already
+started by the cache may finish. Semantic failures do not stop warming other
+files or block Text diff. Rendering/highlighting still happens in the browser.
 
 Press `-` to turn on the keyboard overlay. Then `J` / `K` moves between files,
 `N` jumps to the next file you have not marked as viewed, and `M` toggles
