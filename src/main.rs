@@ -26,6 +26,7 @@ mod adapters;
 mod application;
 mod commits;
 mod domain;
+mod github_topology;
 mod http;
 mod ports;
 mod review;
@@ -631,31 +632,9 @@ async fn github_open_prs(
     let repo = PathBuf::from(request.repo.trim());
     ensure_git_repo(&repo)?;
     let github_repo = github_repo_for_local(&repo).await?;
-    let pulls = match (!request.refresh)
-        .then(|| read_pr_list_cache(&state.cache_dir, &github_repo))
-        .flatten()
-    {
-        Some(pulls) => pulls,
-        None => {
-            let pulls = gh_json::<Vec<PullRequestInfo>>(
-                Some(&repo),
-                &[
-                    "pr",
-                    "list",
-                    "--state",
-                    "open",
-                    "--limit",
-                    "100",
-                    "--json",
-                    OPEN_PR_FIELDS,
-                ],
-            )
-            .await?;
-            write_pr_list_cache(&state.cache_dir, &github_repo, &pulls)?;
-            pulls
-        }
-    };
-    warm_github_pr_cache(state.clone(), github_repo, pulls.clone(), request.refresh);
+    let pulls =
+        github_topology::open(&state.cache_dir, &repo, &github_repo, request.refresh).await?;
+    warm_github_pr_cache(state.clone(), github_repo, pulls.clone());
     Ok(Json(pulls))
 }
 
@@ -683,12 +662,7 @@ async fn github_open_url(
     start_github_pr_session(state, repo, reference.repo, reference.number).await
 }
 
-fn warm_github_pr_cache(
-    state: AppState,
-    github_repo: String,
-    pulls: Vec<PullRequestInfo>,
-    refresh: bool,
-) {
+fn warm_github_pr_cache(state: AppState, github_repo: String, pulls: Vec<PullRequestInfo>) {
     tokio::spawn(async move {
         let _cache_lock = state.github_cache_lock.lock().await;
         let repo = match cached_github_repo(&state.cache_dir, &github_repo).await {
@@ -710,15 +684,11 @@ fn warm_github_pr_cache(
         }
         for listed_pull in pulls {
             let result = async {
-                let pull = github_pr_info(
-                    &state.cache_dir,
-                    &repo,
-                    &github_repo,
-                    listed_pull.number,
-                    refresh,
-                )
-                .await?;
-                fetch_github_pr(&repo, &pull, refresh).await
+                // The complete list already contains this metadata and the
+                // bulk fetch just refreshed heads. Avoid N extra `gh pr view`
+                // calls while holding the shared Git cache lock.
+                write_pr_cache(&state.cache_dir, &github_repo, &listed_pull)?;
+                fetch_github_pr(&repo, &listed_pull, false).await
             }
             .await;
             if let Err(error) = result {
@@ -753,10 +723,15 @@ async fn github_pr_info(
             "--repo",
             github_repo,
             "--json",
-            "number,title,url,state,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,isCrossRepository,author,updatedAt",
+            OPEN_PR_FIELDS,
         ],
     )
     .await?;
+    if pull.number != number || !github_topology::validate_pull(&pull, github_repo) {
+        return Err(ApiError::bad_request(
+            "GitHub returned unexpected PR metadata. Retry opening this PR.",
+        ));
+    }
     write_pr_cache(cache_dir, github_repo, &pull)?;
     Ok(pull)
 }
@@ -768,11 +743,11 @@ async fn start_github_pr_session(
     number: u64,
 ) -> Result<Json<StartResponse>, ApiError> {
     let (pull, open) = tokio::join!(
-        github_pr_info(&state.cache_dir, &repo, &github_repo, number, false),
-        open_pulls(&state.cache_dir, &repo, &github_repo),
+        github_pr_info(&state.cache_dir, &repo, &github_repo, number, true),
+        github_topology::open(&state.cache_dir, &repo, &github_repo, false),
     );
-    let pull = pull?;
-    let members = stacks::stack_members(&open, &pull);
+    let mut pull = pull?;
+    let members = stacks::stack_members(&open?, &pull);
     if !members.is_empty() {
         let stack = Arc::new(stacks::resolve(&repo, members).await?);
         for member in &stack.members {
@@ -780,9 +755,10 @@ async fn start_github_pr_session(
         }
         return open_stack_member(state, repo, stack, number, StackMode::Pr).await;
     }
-    fetch_github_pr(&repo, &pull, false).await?;
+    fetch_github_pr(&repo, &pull, true).await?;
     let base = git_commit(&repo, &pull.base_ref_oid).await?;
     let head = git_commit(&repo, &format!("refs/local-diffe/pr/{}", pull.number)).await?;
+    pull.head_ref_oid = head.clone();
     let merge_base = git_merge_base(&repo, &base, &head).await?;
     create_git_comparison(
         state,
@@ -877,48 +853,6 @@ async fn open_stack_member(
         comparison.target.revision = format!("#{number}");
     }
     Ok(Json(response))
-}
-
-/// The open PRs used to find a stack. The cached list is reused (the PR list's
-/// Refresh rewrites it); a failure only means the PR opens without its stack.
-async fn open_pulls(cache_dir: &FsPath, repo: &FsPath, github_repo: &str) -> Vec<PullRequestInfo> {
-    if let Some(pulls) = read_pr_list_cache(cache_dir, github_repo) {
-        return pulls;
-    }
-    match gh_json::<Vec<PullRequestInfo>>(
-        Some(repo),
-        &[
-            "pr",
-            "list",
-            "--repo",
-            github_repo,
-            "--state",
-            "open",
-            "--limit",
-            "100",
-            "--json",
-            OPEN_PR_FIELDS,
-        ],
-    )
-    .await
-    {
-        Ok(pulls) => {
-            if let Err(error) = write_pr_list_cache(cache_dir, github_repo, &pulls) {
-                eprintln!(
-                    "Could not cache open PRs for {github_repo}: {}",
-                    error.message
-                );
-            }
-            pulls
-        }
-        Err(error) => {
-            eprintln!(
-                "Could not list open PRs for {github_repo}; opening without its stack: {}",
-                error.message
-            );
-            Vec::new()
-        }
-    }
 }
 
 /// A full comparison with nothing to show is an error; a single commit may
@@ -1158,25 +1092,6 @@ fn github_pr_cache_dir(cache_dir: &FsPath, github_repo: &str) -> Result<PathBuf,
         .join(format!("{owner}--{name}")))
 }
 
-fn read_pr_list_cache(cache_dir: &FsPath, github_repo: &str) -> Option<Vec<PullRequestInfo>> {
-    read_json_cache(
-        &github_pr_cache_dir(cache_dir, github_repo)
-            .ok()?
-            .join("open.json"),
-    )
-}
-
-fn write_pr_list_cache(
-    cache_dir: &FsPath,
-    github_repo: &str,
-    pulls: &[PullRequestInfo],
-) -> Result<(), ApiError> {
-    write_json_cache(
-        &github_pr_cache_dir(cache_dir, github_repo)?.join("open.json"),
-        pulls,
-    )
-}
-
 fn read_pr_cache(cache_dir: &FsPath, github_repo: &str, number: u64) -> Option<PullRequestInfo> {
     read_json_cache(
         &github_pr_cache_dir(cache_dir, github_repo)
@@ -1221,7 +1136,9 @@ async fn fetch_github_pr(
     pull: &PullRequestInfo,
     refresh: bool,
 ) -> Result<(), ApiError> {
-    if refresh || !git_commit_exists(repo, &pull.base_ref_oid).await {
+    // The metadata names an immutable base object; do not require its branch
+    // to still exist when reopening a closed/retargeted standalone PR.
+    if !git_commit_exists(repo, &pull.base_ref_oid).await {
         git_command(repo, &["fetch", "origin", &pull.base_ref_name]).await?;
     }
     let refspec = format!(
@@ -1604,6 +1521,33 @@ mod metadata_tests {
             HashSet::from(["new\tname.go".to_owned(), "literal\tname.go".to_owned()])
         );
         assert!(parse_numstat(b"1\t1\t\0only-old\0").is_err());
+    }
+
+    #[tokio::test]
+    async fn standalone_reopen_fetches_current_remote_head_not_cached_ref() {
+        let remote = crate::test_support::Repo::new();
+        let base = remote.write("file.go", "base\n");
+        remote.git(&["checkout", "-qb", "topic"]);
+        let first = remote.write("file.go", "first\n");
+        remote.git(&["update-ref", "refs/pull/7/head", &first]);
+        let local = crate::test_support::Repo::new();
+        local.git(&["remote", "add", "origin", remote.0.to_str().unwrap()]);
+        let mut pull = crate::test_support::pull(7, "main", "topic");
+        pull.base_ref_oid = base;
+        pull.head_ref_oid = first.clone();
+        fetch_github_pr(&local.0, &pull, true).await.unwrap();
+        assert_eq!(
+            git_commit(&local.0, "refs/local-diffe/pr/7").await.unwrap(),
+            first
+        );
+        let second = remote.write("file.go", "second\n");
+        remote.git(&["branch", "-D", "main"]);
+        remote.git(&["update-ref", "refs/pull/7/head", &second]);
+        fetch_github_pr(&local.0, &pull, true).await.unwrap();
+        assert_eq!(
+            git_commit(&local.0, "refs/local-diffe/pr/7").await.unwrap(),
+            second
+        );
     }
 
     #[tokio::test]
