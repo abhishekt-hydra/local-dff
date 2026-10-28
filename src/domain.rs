@@ -10,6 +10,9 @@ pub struct FileEntry {
     pub new_path: Option<String>,
     pub display_path: String,
     pub renderable: bool,
+    /// Evidence from Git name-status, never inferred from path similarity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_kind: Option<String>,
 }
 
 /// Revisions must be resolved commit IDs before constructing a request.

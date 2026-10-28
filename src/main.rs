@@ -28,8 +28,11 @@ mod commits;
 mod domain;
 mod http;
 mod ports;
+mod review;
+mod stack_history;
 mod stacks;
 mod storage;
+mod symbols;
 #[cfg(test)]
 mod test_support;
 mod warmup;
@@ -76,11 +79,13 @@ struct AppState {
     github_cache_lock: Arc<AsyncMutex<()>>,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     warmup: warmup::Warmup,
+    reviews: Arc<Mutex<review::Snapshots>>,
 }
 
 #[derive(Clone)]
 struct Session {
     repo: PathBuf,
+    repository: String,
     base: String,
     target: String,
     files: Vec<FileEntry>,
@@ -98,6 +103,8 @@ struct RevisionInfo {
 
 #[derive(Serialize)]
 struct ComparisonInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<&'static str>,
     base: RevisionInfo,
     target: RevisionInfo,
     changed_paths: usize,
@@ -199,6 +206,7 @@ struct GitHubPrReference {
 #[derive(Serialize)]
 struct StartResponse {
     id: String,
+    repository: String,
     files: Vec<FileEntry>,
     comparison: Option<ComparisonInfo>,
     commits: Vec<CommitInfo>,
@@ -265,6 +273,7 @@ async fn main() {
         github_cache_lock: Arc::new(AsyncMutex::new(())),
         sessions: Arc::new(Mutex::new(HashMap::new())),
         warmup: warmup::Warmup::default(),
+        reviews: Arc::new(Mutex::new(review::Snapshots::default())),
     };
     let app = Router::new()
         .route("/", get(index))
@@ -276,6 +285,10 @@ async fn main() {
         .route("/api/github/open-url", post(github_open_url))
         .route("/api/commit-scope", post(commit_scope))
         .route("/api/stack-scope", post(stack_scope))
+        .route("/api/stack-history", post(stack_history::history))
+        .route("/api/review-snapshot", post(review::snapshot))
+        .route("/api/since-review", post(review::since_review))
+        .route("/api/stack-symbols", post(symbols::stack_symbols))
         .route("/api/semantic/{id}/{index}", post(semantic_file))
         .route("/api/diff/{id}/{index}", get(http::text_diff))
         .route("/semanticdiff-view/{id}/{index}", get(semanticdiff_view))
@@ -499,7 +512,7 @@ async fn commit_scope(
     State(state): State<AppState>,
     Json(request): Json<CommitScopeRequest>,
 ) -> Result<Json<StartResponse>, ApiError> {
-    let (repo, range_base, commit, position, total) = {
+    let (repo, repository, range_base, commit, position, total) = {
         let sessions = state.sessions.lock().unwrap();
         let session = sessions.get(&request.id).ok_or_else(|| {
             ApiError::bad_request("This session has expired. Reload the comparison.")
@@ -511,6 +524,7 @@ async fn commit_scope(
             .ok_or_else(|| ApiError::bad_request("That commit is not part of this comparison."))?;
         (
             session.repo.clone(),
+            session.repository.clone(),
             session.base.clone(),
             session.commits[position].clone(),
             position + 1,
@@ -554,8 +568,8 @@ async fn commit_scope(
         None,
     );
     let target = commit.sha.clone();
-    Ok(create_session(
-        state,
+    let Json(mut response) = create_session(
+        state.clone(),
         repo,
         base_commit,
         target,
@@ -563,7 +577,18 @@ async fn commit_scope(
         Some(comparison),
         CommitLog::default(),
         None,
-    ))
+    );
+    // Commit scopes retain the full review's repository identity even though
+    // their comparison deliberately has no PR/stack selection.
+    response.repository = repository.clone();
+    state
+        .sessions
+        .lock()
+        .unwrap()
+        .get_mut(&response.id)
+        .unwrap()
+        .repository = repository;
+    Ok(Json(response))
 }
 
 async fn comparison_files(
@@ -589,6 +614,7 @@ fn comparison_info(
     pull_request: Option<PullRequestInfo>,
 ) -> ComparisonInfo {
     ComparisonInfo {
+        kind: None,
         base,
         target,
         changed_paths: files.len(),
@@ -917,8 +943,10 @@ fn create_session(
     stack: Option<StackSelection>,
 ) -> Json<StartResponse> {
     let id = Uuid::new_v4().to_string();
+    let repository = review::repository_identity(&repo, comparison.as_ref(), stack.as_ref());
     let session = Session {
         repo,
+        repository: repository.clone(),
         base: base.trim().to_owned(),
         target: target.trim().to_owned(),
         files: files.clone(),
@@ -929,6 +957,7 @@ fn create_session(
     state.sessions.lock().unwrap().insert(id.clone(), session);
     Json(StartResponse {
         id,
+        repository,
         files,
         comparison,
         commits: log.commits,
@@ -1275,24 +1304,18 @@ async fn git_changed_files(
     base: &str,
     target: &str,
 ) -> Result<Vec<FileEntry>, ApiError> {
-    let output = Command::new("git")
-        .kill_on_drop(true)
-        .current_dir(repo)
-        .args(["diff", "--no-ext-diff", "--name-status", "-z", base, target])
-        .output()
-        .await
-        .map_err(|error| ApiError::internal(format!("Could not list changed files: {error}")))?;
-    if !output.status.success() {
-        return Err(ApiError::bad_request(format!(
-            "Could not list files between `{base}` and `{target}`: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-
-    let fields = output
-        .stdout
-        .split(|byte| *byte == b'\0')
-        .collect::<Vec<_>>();
+    let mut command = Command::new("git");
+    command.current_dir(repo).args([
+        "diff",
+        "--no-ext-diff",
+        "--find-renames",
+        "--name-status",
+        "-z",
+        base,
+        target,
+    ]);
+    let output = adapters::output(command, "Git", None, 16 * 1024 * 1024).await?;
+    let fields = output.split(|byte| *byte == b'\0').collect::<Vec<_>>();
     let mut index = 0;
     let mut files = Vec::new();
     while index < fields.len() {
@@ -1338,6 +1361,18 @@ async fn git_changed_files(
             old_path,
             new_path,
             display_path,
+            change_kind: Some(
+                match status.as_bytes()[0] {
+                    b'A' => "added",
+                    b'D' => "deleted",
+                    b'R' => "renamed",
+                    b'C' => "copied",
+                    b'M' => "modified",
+                    b'T' => "type-changed",
+                    _ => "unknown",
+                }
+                .into(),
+            ),
             renderable: false,
         });
     }
@@ -1352,37 +1387,60 @@ async fn git_renderable_paths(
     base: &str,
     target: &str,
 ) -> Result<HashSet<String>, ApiError> {
-    let output = Command::new("git")
-        .kill_on_drop(true)
-        .current_dir(repo)
-        .args(["diff", "--no-ext-diff", "--numstat", "-z", base, target])
-        .output()
-        .await
-        .map_err(|error| {
-            ApiError::internal(format!("Could not inspect changed file content: {error}"))
-        })?;
-    if !output.status.success() {
-        return Err(ApiError::bad_request(format!(
-            "Could not inspect changed file content between `{base}` and `{target}`: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
+    let mut command = Command::new("git");
+    command.current_dir(repo).args([
+        "diff",
+        "--no-ext-diff",
+        "--find-renames",
+        "--numstat",
+        "-z",
+        base,
+        target,
+    ]);
+    let output = adapters::output(command, "Git", None, 16 * 1024 * 1024).await?;
+    parse_numstat(&output)
+}
 
+fn parse_numstat(output: &[u8]) -> Result<HashSet<String>, ApiError> {
     let mut renderable = HashSet::new();
-    let fields = output
-        .stdout
-        .split(|byte| *byte == b'\0')
-        .collect::<Vec<_>>();
-    for record in fields.into_iter().filter(|record| !record.is_empty()) {
-        let Ok(record) = std::str::from_utf8(record) else {
-            return Err(ApiError::internal(
-                "Git returned a non-UTF-8 content summary.",
-            ));
-        };
+    let fields = output.split(|byte| *byte == b'\0').collect::<Vec<_>>();
+    let mut index = 0;
+    while index < fields.len() {
+        let record = fields[index];
+        index += 1;
+        if record.is_empty() {
+            continue;
+        }
+        let record = std::str::from_utf8(record)
+            .map_err(|_| ApiError::internal("Git returned a non-UTF-8 content summary."))?;
         let mut columns = record.splitn(3, '\t');
         let additions = columns.next().unwrap_or_default();
-        let deletions = columns.next().unwrap_or_default();
-        let path = columns.next().unwrap_or_default();
+        let deletions = columns
+            .next()
+            .ok_or_else(|| ApiError::internal("Git returned an incomplete content summary."))?;
+        let mut path = columns
+            .next()
+            .ok_or_else(|| ApiError::internal("Git returned an incomplete content summary."))?;
+        // With -z, rename/copy records are numstat + empty path, followed by
+        // the old and new paths as separate NUL fields. Neither is a stat row.
+        if path.is_empty() {
+            let old = fields
+                .get(index)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| ApiError::internal("Git returned an incomplete rename summary."))?;
+            std::str::from_utf8(old)
+                .map_err(|_| ApiError::internal("Git returned a non-UTF-8 old path."))?;
+            path = std::str::from_utf8(
+                fields
+                    .get(index + 1)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        ApiError::internal("Git returned an incomplete rename summary.")
+                    })?,
+            )
+            .map_err(|_| ApiError::internal("Git returned a non-UTF-8 new path."))?;
+            index += 2;
+        }
         if additions != "-" && deletions != "-" && (additions != "0" || deletions != "0") {
             renderable.insert(path.to_owned());
         }
@@ -1498,6 +1556,7 @@ fn parse_patch(patch: &str) -> Vec<FileEntry> {
                 new_path: None,
                 display_path: "unknown file".into(),
                 renderable: true,
+                change_kind: None,
             });
         } else if let Some(file) = current.as_mut() {
             if let Some(path) = line.strip_prefix("--- ") {
@@ -1528,4 +1587,39 @@ fn patch_path(header: &str, prefix: char) -> Option<String> {
         return None;
     }
     path.strip_prefix(&format!("{prefix}/")).map(str::to_owned)
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    #[test]
+    fn numstat_rename_fields_are_not_treated_as_rows() {
+        let summary = b"1\t2\t\0old name.go\0new\tname.go\0-\t-\tbinary.bin\0\
+            0\t0\t\0old-empty\0new-empty\0\
+            1\t0\tliteral\tname.go\0";
+        let paths = parse_numstat(summary).unwrap();
+        assert_eq!(
+            paths,
+            HashSet::from(["new\tname.go".to_owned(), "literal\tname.go".to_owned()])
+        );
+        assert!(parse_numstat(b"1\t1\t\0only-old\0").is_err());
+    }
+
+    #[tokio::test]
+    async fn renamed_and_edited_files_remain_renderable_even_when_git_config_disables_renames() {
+        let repo = crate::test_support::Repo::new();
+        repo.git(&["config", "diff.renames", "false"]);
+        let source = (0..30)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let base = repo.write("old.go", &source);
+        repo.git(&["mv", "old.go", "new.go"]);
+        let target = repo.write("new.go", &source.replace("line 10", "changed 10"));
+        let files = comparison_files(&repo.0, &base, &target).await.unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].change_kind.as_deref(), Some("renamed"));
+        assert_eq!(files[0].display_path, "new.go");
+        assert!(files[0].renderable);
+    }
 }

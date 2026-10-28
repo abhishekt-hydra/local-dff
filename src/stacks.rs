@@ -45,7 +45,7 @@ pub struct ResolvedMember {
     pub base: String,
     /// Merge-base with the trunk.
     pub cumulative_base: String,
-    pr_comparison: OnceCell<PreparedComparison>,
+    pub(crate) pr_comparison: OnceCell<PreparedComparison>,
     cumulative_comparison: OnceCell<PreparedComparison>,
 }
 
@@ -61,6 +61,7 @@ pub struct Stack {
     pub trunk: String,
     /// Depth-first from the bottom PR, children in PR-number order.
     pub members: Vec<ResolvedMember>,
+    pub history: crate::stack_history::Preparation,
 }
 
 impl Stack {
@@ -213,6 +214,7 @@ pub async fn resolve(repo: &PathBuf, members: Vec<StackMember>) -> Result<Stack,
     Ok(Stack {
         trunk,
         members: resolved,
+        history: crate::stack_history::Preparation::default(),
     })
 }
 
@@ -419,6 +421,7 @@ mod tests {
         // Only the selected PR is inspected on the request's critical path.
         let selected = stack.comparison(&clone.0, 1, StackMode::Pr).await.unwrap();
         let session = Session {
+            repository: "test-repository".into(),
             repo: clone.0.clone(),
             base: stack.members[0].base.clone(),
             target: first.clone(),
