@@ -11,7 +11,7 @@
   }
   const check = () => {
     const error = document.getElementById("errorNotification")
-    if (error && getComputedStyle(error).display !== "none") {
+    if (error && getComputedStyle(error).display !== "none" && !window.initialState?.patch?.fallback) {
       report({ error: error.querySelector(".text")?.textContent || "Semantic rendering failed. Use Text diff." })
       return
     }

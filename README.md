@@ -400,6 +400,14 @@ Semantic diff is the default. The mode buttons persist the selected mode in
 `localStorage` under `local-diffe:diff-mode`. An 8 MiB estimated LRU cache retains
 semantic HTML for file revisits; a failed render evicts its entry before retry.
 
+YAML files (`.yaml` and `.yml`, case-insensitive) use a local Tree-sitter YAML
+parser in the same viewer. Values are matched by document, mapping key, and
+sequence position, so mapping key reordering, indentation, and equivalent string
+quoting do not produce changes. Sequence order, scalar types, comments, anchors,
+and tags remain significant. The viewer retains original source and line numbers
+with YAML syntax highlighting. Invalid YAML, duplicate keys, and structures that
+cannot be matched safely fall back to an explicitly labeled line diff.
+
 The CLI produces change tokens but does not run VS Code's syntax-highlighting
 host. Our `semantic-viewer.ts` adapter fills that gap using a Shiki worker, with
 language grammars loaded on demand. The diff renders first; syntax colors arrive

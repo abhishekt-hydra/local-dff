@@ -7,6 +7,31 @@ import {
   type SemanticToken,
 } from "../src/semantic-highlight.ts"
 
+test("YAML extensions highlight keys and values while preserving change tokens", async () => {
+  for (const extension of ["yaml", "yml", "YAML", "YML"]) {
+    const content = "replicas: 2 # deployment"
+    const native: SemanticToken = { start: 10, end: 11, background: "#native", priority: 7 }
+    const line: SemanticLine = { line: 1, content, tokens: [native] }
+    const patch: SemanticPatch = { blocks: [{ new_column: [line] }] }
+
+    await decorateSemanticPatch(patch, {
+      old: "",
+      new: content,
+      oldPath: "",
+      newPath: `deployment.${extension}`,
+    })
+
+    assert.equal(line.tokens?.[0], native)
+    assert.ok(
+      line.tokens?.some((token) => token.start === 0 && token.end === 8 && token.foreground),
+    )
+    assert.ok(
+      line.tokens?.some((token) => token.start === 10 && token.end === 11 && token.foreground),
+    )
+    assert.ok(line.tokens?.some((token) => token.foreground === "#8B949E"))
+  }
+})
+
 test("lazy TypeScript grammar preserves native tokens and maps emoji to Unicode scalar offsets", async () => {
   const content = 'const emoji = "😀" // note'
   const native: SemanticToken = { start: 100, end: 101, foreground: "#native", priority: 7 }
