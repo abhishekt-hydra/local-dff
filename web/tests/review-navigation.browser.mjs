@@ -168,6 +168,8 @@ let failOnce = true
 let failStackOnce = false
 let delayCommit = false
 let commitRequests = 0
+const localComments = new Map()
+let commentPosts = 0
 const fixture = createHttpServer(async (request, response) => {
   try {
     const url = new URL(request.url, "http://fixture")
@@ -181,7 +183,31 @@ const fixture = createHttpServer(async (request, response) => {
       for await (const chunk of request) body += chunk
       const input = JSON.parse(body)
       let result
-      if (url.pathname === "/api/github/open-url") {
+      if (url.pathname.startsWith("/api/comments/")) {
+        const rows = localComments.get(input.pr_url) ?? []
+        const comment = rows.find((item) => item.id === input.id)
+        if (url.pathname.endsWith("/save")) {
+          if (comment) {
+            comment.body = input.body
+            comment.version += 1
+          } else
+            rows.push({
+              id: `comment-${rows.length + 1}`,
+              body: input.body,
+              version: 1,
+              state: "draft",
+              remote_url: null,
+              target: { kind: "general" },
+            })
+        } else if (url.pathname.endsWith("/publish")) {
+          assert.ok(comment)
+          commentPosts += 1
+          comment.state = "posted"
+          comment.remote_url = `${input.pr_url}#issuecomment-1`
+        }
+        localComments.set(input.pr_url, rows)
+        result = rows
+      } else if (url.pathname === "/api/github/open-url") {
         opened.push(input.url)
         const number = Number(input.url.split("/").at(-1))
         assert.ok(number > 0, `Non-canonical API request: ${input.url}`)
@@ -388,6 +414,8 @@ try {
     ambiguousSymbols = false
     largeHistory = false
     snapshots.clear()
+    localComments.clear()
+    commentPosts = 0
     lastSincePair = undefined
     const page = await browser.newPage()
     async function waitText(selector, fragment) {
@@ -1067,6 +1095,59 @@ try {
           }),
       )
       assert.equal(await overlay(), true)
+      // Saving and editing are local. Publication requires its own user action.
+      await page.goto(`${app}/?pr=${github(3006)}`)
+      await review(3006)
+      const panel = '[data-testid="comments-panel"]'
+      const clickComment = (text) =>
+        page.evaluate(
+          (text) =>
+            new Promise((resolve, reject) => {
+              const deadline = performance.now() + 10000
+              const check = () => {
+                const button = [
+                  ...document.querySelectorAll('[data-testid="comments-panel"] button'),
+                ].find((node) => node.textContent.trim() === text)
+                if (button && !button.disabled) {
+                  button.click()
+                  return resolve()
+                }
+                if (performance.now() > deadline)
+                  return reject(new Error(`Comment button unavailable: ${text}`))
+                requestAnimationFrame(check)
+              }
+              check()
+            }),
+          text,
+        )
+      await page.click(`${panel} summary`)
+      await page.fill(`${panel} textarea`, "Draft from the review")
+      await clickComment("Save locally")
+      await waitText(`${panel} li`, "Draft from the review")
+      assert.equal(commentPosts, 0)
+      await page.goto(await location())
+      await review(3006)
+      await page.click(`${panel} summary`)
+      await waitText(`${panel} li`, "Draft from the review")
+      await clickComment("Edit")
+      await page.fill(`${panel} textarea`, "Edited draft from the review")
+      await clickComment("Save locally")
+      await waitText(`${panel} li`, "Edited draft from the review")
+      await clickComment("Post to GitHub")
+      assert.equal(commentPosts, 0)
+      await clickComment("Confirm post")
+      await waitText(`${panel} li`, "View on GitHub")
+      assert.equal(commentPosts, 1)
+      await page.goto(`${app}/?pr=${github(3007)}`)
+      await review(3007)
+      await waitText(`${panel} summary`, "0 local")
+      assert.equal(
+        await page.evaluate(
+          (selector) => document.querySelector(selector).textContent.includes("Edited draft"),
+          panel,
+        ),
+        false,
+      )
       console.log(
         `Review browser checks passed (${mode}): URL/scope restoration, explicit final lanes, file/folder history, review evidence and updates, retained deltas, conservative Go function navigation, keyboard/focus, retries/races, API contracts and viewer boundaries.`,
       )

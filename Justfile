@@ -37,6 +37,10 @@ test-frontend:
 test-browser: frontend
     cd web && bun run test:browser
 
+# Verify durable comments through the packaged API, using an isolated fake gh.
+test-comments: package
+    cd web && node tests/comments-api.mjs
+
 # Enforce frontend correctness, React, accessibility, and vendored anti-slop rules.
 lint-frontend:
     cd web && bun run lint

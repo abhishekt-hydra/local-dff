@@ -471,6 +471,7 @@ mod tests {
         // Only the selected PR is inspected on the request's critical path.
         let selected = stack.comparison(&clone.0, 1, StackMode::Pr).await.unwrap();
         let session = Session {
+            comment_pr: None,
             repository: "test-repository".into(),
             repo: clone.0.clone(),
             base: stack.members[0].base.clone(),

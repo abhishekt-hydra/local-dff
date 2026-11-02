@@ -212,6 +212,55 @@ back in lists that merge once — diffed against its first parent — instead of
 every commit it brought along. A root commit is compared with the empty tree.
 Viewed marks are kept separately for each commit.
 
+## Local PR comments
+
+Open a PR and expand **Comments** to write a draft. **Save locally** stores it
+in SQLite; it survives page reloads and server restarts. You can edit or delete
+drafts. Optionally attach one to the selected file, an old/new side, and the
+original file line number. Line attachments are available in the PR's own full
+comparison. Editing a body keeps its attachment unless you select **Change attachment**.
+
+**Post to GitHub**, followed by **Confirm post**, sends that saved draft using
+your authenticated `gh` account. General comments go to the PR conversation;
+line comments use GitHub's
+[review comment API](https://docs.github.com/en/rest/pulls/comments#create-a-review-comment-for-a-pull-request).
+The backend checks the current PR head before sending a line comment. If it
+changed, reopen the PR and update the draft's attachment. GitHub also requires
+the line to belong to its PR diff, which can differ from a local stack comparison.
+
+Each posted comment retains its GitHub URL locally. Duplicate publish requests
+reuse that receipt. After an interrupted or failed send, **Check GitHub** searches
+for an invisible draft marker and records the receipt without sending again.
+If no receipt is found, the draft stays uncertain; inspect GitHub before creating
+another draft. Published comments cannot be edited or deleted through this panel.
+
+Drafts live separately from disposable caches, in the OS application data
+directory as `comments.sqlite3`. On macOS the default is
+`~/Library/Application Support/com.hydradb.local-diffe/comments.sqlite3`.
+Set `--data-dir /path/to/data` or `LOCAL_DIFFE_DATA_DIR` to choose another
+directory. One server may use a data directory at a time. To back it up, stop
+the server and copy that directory, or use SQLite's online backup operation.
+The comments API also supports agents via JSON POST requests to
+`/api/comments/list`, `/save`, `/delete`, and `/publish`. Every request names
+`pr_url`; mutations of an existing draft include its `id` and `version` from
+the list response. Only `/publish` contacts GitHub.
+
+For example, save a PR-level draft with this JSON body at `/api/comments/save`:
+
+```json
+{"pr_url":"https://github.com/owner/repo/pull/123","body":"My review comment","location":{"kind":"general"}}
+```
+
+The response includes the draft's `id` and `version`. To publish that exact
+saved version when requested, send these fields to `/api/comments/publish`:
+
+```json
+{"pr_url":"https://github.com/owner/repo/pull/123","id":"<draft-id>","version":1}
+```
+
+Run `just test-comments` to check the packaged API against real SQLite and a
+fixture `gh` command. This check makes no GitHub requests.
+
 ## Cache directory
 
 By default, Local Diffe stores its data in the operating system's application

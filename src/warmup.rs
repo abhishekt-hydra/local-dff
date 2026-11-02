@@ -161,6 +161,7 @@ mod tests {
         metadata.renderable = false;
         files.push(metadata);
         Session {
+            comment_pr: None,
             repository: "test-repository".into(),
             repo: input.repo,
             base: input.base,

@@ -564,6 +564,7 @@ mod tests {
         state.sessions.lock().unwrap().insert(
             "stack".into(),
             crate::Session {
+                comment_pr: None,
                 repository: "https://github.com/owner/repo".into(),
                 repo: repo.0.clone(),
                 base: stack.members[0].base.clone(),

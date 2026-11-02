@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 mod adapters;
 mod application;
+mod comments;
 mod commits;
 mod domain;
 mod github_topology;
@@ -69,10 +70,15 @@ struct Args {
     /// Directory for SemanticDiff, GitHub repository, and pull-request caches.
     #[arg(long, env = "LOCAL_DIFFE_CACHE_DIR", value_name = "DIR")]
     cache_dir: Option<PathBuf>,
+
+    /// Durable SQLite storage for local PR comments, separate from disposable caches.
+    #[arg(long, env = "LOCAL_DIFFE_DATA_DIR", value_name = "DIR")]
+    data_dir: Option<PathBuf>,
 }
 
 #[derive(Clone)]
 struct AppState {
+    comments: comments::Store,
     diffs: Arc<dyn ports::DiffReader>,
     cache_dir: PathBuf,
     // Git updates use lock files inside a repository. Keep cache population and
@@ -85,6 +91,7 @@ struct AppState {
 
 #[derive(Clone)]
 struct Session {
+    comment_pr: Option<u64>,
     repo: PathBuf,
     repository: String,
     base: String,
@@ -262,12 +269,22 @@ async fn main() {
         .listen
         .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], args.port)));
     let cache_dir = args.cache_dir.unwrap_or_else(default_cache_dir);
+    let data_dir = args.data_dir.unwrap_or_else(|| {
+        ProjectDirs::from("com", "hydradb", "local-diffe")
+            .map(|dirs| dirs.data_local_dir().to_path_buf())
+            .unwrap_or_else(|| PathBuf::from(".local-diffe-data"))
+    });
+    let comments = comments::Store::open(&data_dir).unwrap_or_else(|error| {
+        eprintln!("Could not open local comments: {}", error.message);
+        std::process::exit(2);
+    });
     let semanticdiff_bin = extract_semanticdiff(&cache_dir).unwrap_or_else(|error| {
         eprintln!("Could not prepare embedded SemanticDiff: {error}");
         std::process::exit(2);
     });
 
     let state = AppState {
+        comments,
         diffs: Arc::new(application::DiffService::new(
             Arc::new(adapters::GitDiffSource),
             Arc::new(adapters::SemanticCli::new(semanticdiff_bin)),
@@ -287,6 +304,10 @@ async fn main() {
         .route("/api/github/open-prs", post(github_open_prs))
         .route("/api/github/compare", post(github_compare_pr))
         .route("/api/github/open-url", post(github_open_url))
+        .route("/api/comments/list", post(comments::list))
+        .route("/api/comments/save", post(comments::save))
+        .route("/api/comments/delete", post(comments::delete))
+        .route("/api/comments/publish", post(comments::publish))
         .route("/api/commit-scope", post(commit_scope))
         .route("/api/stack-scope", post(stack_scope))
         .route("/api/stack-history", post(stack_history::history))
@@ -885,6 +906,15 @@ fn create_session(
     let id = Uuid::new_v4().to_string();
     let repository = review::repository_identity(&repo, comparison.as_ref(), stack.as_ref());
     let session = Session {
+        comment_pr: comparison
+            .as_ref()
+            .and_then(|info| info.pull_request.as_ref())
+            .map(|pull| pull.number)
+            .filter(|_| {
+                stack
+                    .as_ref()
+                    .is_none_or(|selection| matches!(selection.mode, StackMode::Pr))
+            }),
         repo,
         repository: repository.clone(),
         base: base.trim().to_owned(),

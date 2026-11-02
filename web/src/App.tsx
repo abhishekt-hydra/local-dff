@@ -87,6 +87,7 @@ import { descendantTips, inFolder } from "./lib/stack-history"
 import { useStackHistory } from "./lib/use-stack-history"
 import { reviewEvidenceContext, evidenceFor } from "./lib/review-evidence"
 import { useReviewEvidence } from "./lib/use-review-evidence"
+import { CommentsPanel } from "./components/CommentsPanel"
 type ScopeMode = "commit" | "cumulative"
 type SourceTab = "pr" | "branches" | "patch"
 const EMPTY_FILES: PatchFile[] = []
@@ -1769,6 +1770,19 @@ export default function App() {
           >
             {reviewError}
           </p>
+        )}
+        {pullRequest && !chromeHidden && (
+          <CommentsPanel
+            key={pullRequest.url}
+            prUrl={pullRequest.url}
+            session={session}
+            selected={selected}
+            inlineEnabled={Boolean(
+              session?.comparison?.pull_request?.url === pullRequest.url &&
+              session?.stack?.mode !== "cumulative" &&
+              !sinceReview,
+            )}
+          />
         )}
         {rootSession && evidenceWarning && (
           <p

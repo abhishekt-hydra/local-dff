@@ -100,6 +100,7 @@ pub fn state() -> crate::AppState {
         }
     }
     crate::AppState {
+        comments: crate::comments::Store::memory(),
         diffs: std::sync::Arc::new(Reader),
         cache_dir: std::env::temp_dir(),
         github_cache_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
