@@ -133,3 +133,37 @@ input,
   letter-spacing: 0.12em;
   animation: loading-dots 1.2s ease-in-out infinite;
 }
+
+.review-minimal [data-testid="review-layout"] {
+  display: block;
+}
+.review-minimal [aria-label="Changed files sidebar"] {
+  display: none;
+}
+.review-minimal.review-sidebar-open [aria-label="Changed files sidebar"] {
+  display: flex;
+  position: fixed;
+  left: 12px;
+  top: 58px;
+  bottom: 12px;
+  width: min(340px, calc(100vw - 24px));
+  z-index: 35;
+  overflow-y: auto;
+  box-shadow: 12px 0 48px #0005;
+  border: 1px solid var(--muted);
+}
+.review-minimal [aria-label="Diff panel"] {
+  margin-top: 40px;
+}
+.review-minimal [data-testid="stack-review-context"] {
+  display: none;
+}
+.review-minimal [aria-label="Diff panel"] > div:last-child {
+  height: calc(100vh - 110px);
+}
+[data-comment-line] {
+  cursor: pointer;
+}
+[data-comment-line]:hover {
+  background: color-mix(in srgb, var(--primary) 18%, transparent);
+}

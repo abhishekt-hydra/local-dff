@@ -1,3 +1,4 @@
+import { LineComment, type SelectedLine } from "./LineComment"
 import { memo, Profiler, useEffect, useRef, useState, type RefObject, type UIEvent } from "react"
 import { LoaderCircle } from "lucide-react"
 import { Button } from "./ui/button"
@@ -230,6 +231,8 @@ const DiffRowView = memo(function DiffRowView({ row, index }: { row: DiffRow; in
   return (
     <div
       data-diff-row={index}
+      data-comment-old={row.old}
+      data-comment-new={row.next}
       className={
         row.kind === "add"
           ? "bg-emerald-500/10"
@@ -253,8 +256,12 @@ const DiffRowView = memo(function DiffRowView({ row, index }: { row: DiffRow; in
         className="sticky left-0 flex shrink-0 select-none bg-card text-muted-foreground"
         aria-hidden="true"
       >
-        <span className="w-[8ch] pr-2 text-right">{row.old ?? ""}</span>
-        <span className="w-[8ch] pr-2 text-right">{row.next ?? ""}</span>
+        <span data-comment-side="LEFT" className="w-[8ch] pr-2 text-right">
+          {row.old ?? ""}
+        </span>
+        <span data-comment-side="RIGHT" className="w-[8ch] pr-2 text-right">
+          {row.next ?? ""}
+        </span>
         <span className="w-[3ch] text-center">
           {row.kind === "add" ? "+" : row.kind === "remove" ? "−" : " "}
         </span>
@@ -270,11 +277,23 @@ type DiffViewerProps = {
   path: string
   mode: DiffMode
   frameRef: RefObject<HTMLIFrameElement | null>
+  commentPrUrl?: string
+  onCommentSaved?: () => void
 }
 
 // The mode is owned by the app: a PR stack always opens in Semantic diff, while
 // other reviews follow the last mode chosen.
-function DiffViewerContent({ sessionId, index, path, mode, frameRef }: DiffViewerProps) {
+function DiffViewerContent({
+  sessionId,
+  index,
+  path,
+  mode,
+  frameRef,
+  commentPrUrl,
+  onCommentSaved,
+}: DiffViewerProps) {
+  const [selection, setSelection] = useState<SelectedLine | null>(null)
+  const [saved, setSaved] = useState(false)
   const [attempt, setAttempt] = useState(0)
   const url = `/api/diff/${sessionId}/${index}`
   const semanticUrl = `/semanticdiff-view/${sessionId}/${index}`
@@ -485,6 +504,63 @@ function DiffViewerContent({ sessionId, index, path, mode, frameRef }: DiffViewe
     }
   }, [url, semanticUrl, sessionId, index, mode, attempt, frameRef])
 
+  function selectTextLine(event: React.MouseEvent<HTMLDivElement>) {
+    if (!commentPrUrl || selection || !(event.target instanceof Element)) return
+    const row = event.target.closest<HTMLElement>("[data-diff-row]")
+    if (!row) return
+    const requested = event.target.closest<HTMLElement>("[data-comment-side]")?.dataset.commentSide
+    const side = requested === "LEFT" || (!requested && !row.dataset.commentNew) ? "LEFT" : "RIGHT"
+    const line = Number(side === "LEFT" ? row.dataset.commentOld : row.dataset.commentNew)
+    if (Number.isInteger(line) && line > 0) {
+      setSaved(false)
+      setSelection({ line, side, x: event.clientX, y: event.clientY })
+    }
+  }
+  function connectSemanticComments() {
+    const iframe = frameRef.current
+    const doc = iframe?.contentDocument
+    if (!iframe || !doc || !commentPrUrl) return
+    doc.addEventListener("mouseup", (event) => {
+      const target = event.target
+      if (!(target instanceof (doc.defaultView?.Element ?? Element))) return
+      let gutter = target.closest(".line")
+      if (!gutter) {
+        const code = target.closest(".code-fg")
+        if (!code) return
+        let previous = code.previousElementSibling
+        while (
+          previous &&
+          !previous.classList.contains("line") &&
+          Math.abs(previous.getBoundingClientRect().top - code.getBoundingClientRect().top) < 1
+        )
+          previous = previous.previousElementSibling
+        gutter = previous?.classList.contains("line") ? previous : null
+      }
+      if (!gutter || gutter.parentElement?.id !== "patch") return
+      const line = Number(gutter.textContent)
+      const rect = gutter.getBoundingClientRect()
+      const headers = [...doc.querySelectorAll("#patch > .header")]
+      const header = headers.find(
+        (item) =>
+          Math.abs(item.getBoundingClientRect().left - rect.left) < 1 &&
+          item.querySelector(".offset"),
+      )
+      const offset = header?.querySelector(".offset")?.textContent ?? ""
+      if (!Number.isInteger(line) || line < 1 || !/^[+-]/.test(offset)) return
+      const frameRect = iframe.getBoundingClientRect()
+      setSaved(false)
+      setSelection(
+        (current) =>
+          current ?? {
+            line,
+            side: offset.startsWith("-") ? "LEFT" : "RIGHT",
+            x: frameRect.left + event.clientX,
+            y: frameRect.top + event.clientY,
+          },
+      )
+    })
+  }
+
   const textDiff =
     result &&
     (PERFORMANCE_BUILD_ENABLED ? (
@@ -497,9 +573,31 @@ function DiffViewerContent({ sessionId, index, path, mode, frameRef }: DiffViewe
   return (
     <div
       className="flex h-full min-h-0 flex-col"
+      role="presentation"
+      onMouseUp={selectTextLine}
       data-diff-complete={mode === "text" ? complete : true}
       data-diff-row-count={mode === "text" ? (result?.rows.length ?? 0) : 0}
     >
+      {selection && commentPrUrl && (
+        <LineComment
+          key={`${selection.side}:${selection.line}`}
+          selection={selection}
+          prUrl={commentPrUrl}
+          sessionId={sessionId}
+          index={index}
+          path={path}
+          onClose={() => setSelection(null)}
+          onSaved={() => {
+            setSaved(true)
+            onCommentSaved?.()
+          }}
+        />
+      )}
+      {commentPrUrl && (
+        <p role="status" className="shrink-0 px-3 py-1 text-xs text-muted-foreground">
+          {saved ? "Comment saved. Find it in the sidebar." : "Select a line to leave a comment."}
+        </p>
+      )}
       {result?.truncated && mode === "text" && (
         <p className="shrink-0 px-3 py-1 text-xs text-muted-foreground">
           Long lines are shortened to 2,000 characters.
@@ -522,6 +620,7 @@ function DiffViewerContent({ sessionId, index, path, mode, frameRef }: DiffViewe
           html && (
             <iframe
               ref={frameRef}
+              onLoad={connectSemanticComments}
               title={`Semantic diff for ${path}`}
               srcDoc={html}
               className="h-full w-full border-0 bg-card"

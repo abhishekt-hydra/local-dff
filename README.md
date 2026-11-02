@@ -214,11 +214,18 @@ Viewed marks are kept separately for each commit.
 
 ## Local PR comments
 
-Open a PR and expand **Comments** to write a draft. **Save locally** stores it
-in SQLite; it survives page reloads and server restarts. You can edit or delete
-drafts. Optionally attach one to the selected file, an old/new side, and the
-original file line number. Line attachments are available in the PR's own full
-comparison. Editing a body keeps its attachment unless you select **Change attachment**.
+Open a PR and select a code line or its line number in either Semantic or Text
+view. A small comment composer opens beside that line, with the old/new side and
+line number already selected. **Save comment** stores the draft locally in
+SQLite. Cmd/Ctrl+Enter saves; Escape closes the composer. Unsaved text remains
+available when you reopen that same line during the current comparison.
+
+The left sidebar holds **Comments**, including saved drafts, editing, deletion,
+and a general PR comment form. **Minimal** gives the diff the full window;
+**Sidebar** opens or hides the floating files/comments sidebar, and **Full view**
+restores the setup controls. Line commenting remains available in minimal mode.
+Line attachments are available in the PR's own comparison, outside cumulative
+and since-review views. Saving an edited draft preserves its original attachment.
 
 **Post to GitHub**, followed by **Confirm post**, sends that saved draft using
 your authenticated `gh` account. General comments go to the PR conversation;

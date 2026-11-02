@@ -444,6 +444,8 @@ export default function App() {
   const [coordinates, setCoordinates] = useState<ReviewCoordinates>(DEFAULT_COORDINATES)
   const [finalReview, setFinalReview] = useState<{ anchor: Session; tip: number } | null>(null)
   const [chromeHidden, setChromeHidden] = useState(false)
+  const [sidebarPeek, setSidebarPeek] = useState(false)
+  const [commentsRevision, setCommentsRevision] = useState(0)
   const [keyboardOverlay, setKeyboardOverlay] = useState(false)
   const [keyboardOverlayExpanded, setKeyboardOverlayExpanded] = useState(false)
   const [activeRegion, setActiveRegion] = useState<ReviewRegion>("sidebar")
@@ -1509,14 +1511,32 @@ export default function App() {
                 variant="outline"
                 onClick={() => setChromeHidden(true)}
               >
-                <ChevronUp className="size-4" /> Focus view
+                <ChevronUp className="size-4" /> Minimal
               </Button>
             </div>
           </div>
         </header>
       )}
 
-      <main className="flex w-full flex-col gap-3 p-4">
+      <main
+        className={cn(
+          "flex w-full flex-col gap-3 p-4",
+          chromeHidden && "review-minimal",
+          sidebarPeek && "review-sidebar-open",
+        )}
+      >
+        {chromeHidden && (
+          <Button
+            className="fixed left-4 top-4 z-40 shadow-md"
+            size="sm"
+            variant="outline"
+            aria-expanded={sidebarPeek}
+            aria-label="Toggle review sidebar"
+            onClick={() => setSidebarPeek((value) => !value)}
+          >
+            <Folder className="size-4" /> Sidebar
+          </Button>
+        )}
         {loading && (
           <div
             className="flex items-center gap-3 rounded-2xl bg-primary/[.07] px-4 py-3 text-sm text-foreground shadow-[0_12px_32px_-28px_rgba(0,113,227,0.8)]"
@@ -1538,7 +1558,7 @@ export default function App() {
             className="fixed right-4 top-4 z-20 shadow-md"
             onClick={() => setChromeHidden(false)}
           >
-            <ChevronDown className="size-4" /> Show controls
+            <ChevronDown className="size-4" /> Full view
           </Button>
         )}
         {!chromeHidden && (
@@ -1771,19 +1791,7 @@ export default function App() {
             {reviewError}
           </p>
         )}
-        {pullRequest && !chromeHidden && (
-          <CommentsPanel
-            key={pullRequest.url}
-            prUrl={pullRequest.url}
-            session={session}
-            selected={selected}
-            inlineEnabled={Boolean(
-              session?.comparison?.pull_request?.url === pullRequest.url &&
-              session?.stack?.mode !== "cumulative" &&
-              !sinceReview,
-            )}
-          />
-        )}
+
         {rootSession && evidenceWarning && (
           <p
             data-testid="evidence-warning"
@@ -1909,6 +1917,7 @@ export default function App() {
         )}
 
         <div
+          data-testid="review-layout"
           ref={reviewGrid}
           aria-busy={loading}
           style={gridStyle}
@@ -1929,6 +1938,13 @@ export default function App() {
                   "ring-2 ring-primary ring-offset-2",
               )}
             >
+              {pullRequest && (
+                <CommentsPanel
+                  key={pullRequest.url}
+                  revision={commentsRevision}
+                  prUrl={pullRequest.url}
+                />
+              )}
               <CardHeader className="gap-3 rounded-t-lg bg-card p-3">
                 {stack && (
                   <StackRail
@@ -2547,6 +2563,14 @@ export default function App() {
                   path={selectedFile.display_path}
                   mode={diffMode}
                   frameRef={diffFrameRef}
+                  commentPrUrl={
+                    session.comparison?.pull_request?.url === pullRequest?.url &&
+                    session.stack?.mode !== "cumulative" &&
+                    !sinceReview
+                      ? pullRequest?.url
+                      : undefined
+                  }
+                  onCommentSaved={() => setCommentsRevision((value) => value + 1)}
                 />
               ) : (
                 <div className="grid h-full place-items-center p-8 text-center text-sm text-muted-foreground">
