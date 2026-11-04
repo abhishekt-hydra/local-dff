@@ -99,7 +99,7 @@ not a full checkout of every file or historical blob.
 
 The **Stack review** panel above the file list stays available while navigating
 files, commits, and focus view. It shows the whole detected stack, bottom first;
-click a PR, or step with ⌃ ⌄ (or `{` / `}` with the keyboard overlay on). The
+click a PR, or step with ⌃ ⌄ (or `{` / `}` on the keyboard). The
 context above the diff explicitly identifies the selected PR and comparison base,
 e.g. **Reviewing #2481 against #2480**. In a commit view it instead identifies the
 actual commit scope. Clicking the current PR returns to its full comparison.
@@ -180,9 +180,9 @@ Mixed edited declarations plus additions/removals fail closed as possible
 split/merge cases. Source previews are limited to 16 KiB per declaration.
 Function marks do not mark the file or any later revision reviewed.
 
-The polished, keyboard-first interaction/visual redesign remains a dedicated
-follow-up. Current controls preserve existing shortcuts and native Tab/Enter/
-select/details keyboard behavior; no new keyboard framework is introduced.
+Single-letter keyboard shortcuts are live by default (see **Review faster**);
+the remaining polished interaction/visual redesign is still a dedicated
+follow-up. Native Tab/Enter/select/details keyboard behavior is preserved.
 
 ## Review faster
 
@@ -194,17 +194,25 @@ clicks. Switching comparisons cancels the obsolete queue; bounded loads already
 started by the cache may finish. Semantic failures do not stop warming other
 files or block Text diff. Rendering/highlighting still happens in the browser.
 
-Press `-` to turn on the keyboard overlay. Then `J` / `K` moves between files,
-`N` jumps to the next file you have not marked as viewed, and `M` toggles
-**Viewed**. The review header shows how many files have been viewed. When you
-open a review, or move to another PR or commit, its first file opens
-automatically.
+Single-letter shortcuts work immediately — no overlay gate. `J` / `K` moves
+between files (or scrolls the diff when it is focused), `N` jumps to the next
+file you have not marked as viewed, `M` toggles **Viewed**, `U` removes the
+viewed mark, `/` focuses the file filter, `T` toggles Semantic/Text, `X`
+expands or collapses all file-tree folders, `O` opens the PR on GitHub, and
+`[` / `]` / `{` / `}` step commits and stacked PRs. Press `-` to turn
+single-letter shortcuts off (persisted; `-` and `?` always work), `?` for the
+full shortcut list, and `Cmd+K` on macOS (`Ctrl+K` elsewhere — browsers
+reserve `Ctrl+K` for the address bar and pages cannot override it) for the
+command palette, which jumps to
+any file, stack/open PR, or commit and runs the same actions. The review
+header shows how many files have been viewed. When you open a review, or move
+to another PR or commit, its first file opens automatically.
 
 ## Review commit by commit
 
 Any Git or PR comparison lists its commits above the file filter, oldest first.
 Pick one from the commit menu, or step with the ‹ › buttons (or `[` / `]` with
-the keyboard overlay on); `[` from the first commit returns to **All changes**.
+on the keyboard); `[` from the first commit returns to **All changes**.
 **This commit** shows the commit against its parent, as GitHub's Commits tab
 does; **Up to commit** shows everything from the comparison base through it.
 The list follows the first-parent chain, so a PR that merged its base branch
@@ -224,6 +232,8 @@ The left sidebar holds **Comments**, including saved drafts, editing, deletion,
 and a general PR comment form. **Minimal** gives the diff the full window;
 **Sidebar** opens or hides the floating files/comments sidebar, and **Full view**
 restores the setup controls. Line commenting remains available in minimal mode.
+With keyboard shortcuts on, `E` toggles the sidebar. From full view,
+`E` enters minimal mode with the sidebar closed.
 Line attachments are available in the PR's own comparison, outside cumulative
 and since-review views. Saving an edited draft preserves its original attachment.
 

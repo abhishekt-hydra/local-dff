@@ -12,9 +12,10 @@ import {
   useState,
   type CSSProperties,
   type PointerEvent as ReactPointerEvent,
+  type RefObject,
   type ReactNode,
 } from "react"
-import { Tree, type NodeRendererProps } from "react-arborist"
+import { Tree, type NodeRendererProps, type TreeApi } from "react-arborist"
 import {
   ChevronLeft,
   ChevronRight,
@@ -79,6 +80,15 @@ import {
   type StackMode,
 } from "./lib/review-api"
 import { readViewerKey } from "./lib/viewer-keyboard"
+import {
+  commandKeyFor,
+  isPaletteShortcut,
+  nextTreeExpanded,
+  preferredKeyboardMode,
+  rememberKeyboardMode,
+  KEYBOARD_COMMANDS,
+  OVERLAY_KEYS,
+} from "./lib/keyboard"
 import { stackReviewContext, reviewFileSelection } from "./lib/stack-review"
 import { StackRail } from "./components/StackRail"
 import { StackHistoryPanel } from "./components/StackHistoryPanel"
@@ -92,7 +102,6 @@ type ScopeMode = "commit" | "cumulative"
 type SourceTab = "pr" | "branches" | "patch"
 const EMPTY_FILES: PatchFile[] = []
 const EMPTY_COMMITS: Commit[] = []
-const OVERLAY_KEYS = ["f", "d", "v", "j", "k", "[", "]", "{", "}", "n", "m"]
 const SOURCE_TABS = [
   ["pr", "Pull request", GitPullRequest],
   ["branches", "Branches", GitCompareArrows],
@@ -369,6 +378,7 @@ const SidebarTree = memo(function SidebarTree({
   sidebarGap,
   sidebarPadding,
   onSelectFile,
+  treeRef,
 }: {
   tree: TreeItem[]
   treeHeight: number
@@ -383,6 +393,7 @@ const SidebarTree = memo(function SidebarTree({
   sidebarGap: number
   sidebarPadding: number
   onSelectFile: (fileIndex: number) => void
+  treeRef?: RefObject<TreeApi<TreeItem> | undefined>
 }) {
   const context = useMemo(
     () => ({
@@ -411,6 +422,7 @@ const SidebarTree = memo(function SidebarTree({
   return (
     <SidebarTreeContext.Provider value={context}>
       <Tree<TreeItem>
+        ref={treeRef}
         data={tree}
         width="100%"
         height={treeHeight}
@@ -446,8 +458,13 @@ export default function App() {
   const [chromeHidden, setChromeHidden] = useState(false)
   const [sidebarPeek, setSidebarPeek] = useState(false)
   const [commentsRevision, setCommentsRevision] = useState(0)
+  // Single-letter shortcuts are live by default (persisted); the help overlay
+  // (`?`) and the command palette (Cmd/Ctrl+K) are independent of that choice.
+  const [keyboardMode, setKeyboardMode] = useState<boolean>(preferredKeyboardMode)
   const [keyboardOverlay, setKeyboardOverlay] = useState(false)
   const [keyboardOverlayExpanded, setKeyboardOverlayExpanded] = useState(false)
+  const [paletteOpen, setPaletteOpen] = useState(false)
+  const [treeAllExpanded, setTreeAllExpanded] = useState(true)
   const [activeRegion, setActiveRegion] = useState<ReviewRegion>("sidebar")
   const [sidebarWidth, setSidebarWidth] = useState(320)
   const [sidebarFontSize, setSidebarFontSize] = useState(12)
@@ -466,6 +483,8 @@ export default function App() {
   const [loading, setLoading] = useState(false)
   const reviewGrid = useRef<HTMLDivElement>(null)
   const sidebarRef = useRef<HTMLDivElement>(null)
+  const searchInputRef = useRef<HTMLInputElement>(null)
+  const treeRef = useRef<TreeApi<TreeItem> | undefined>(undefined)
   const sidebarContentRef = useRef<HTMLDivElement>(null)
   const diffPanelRef = useRef<HTMLDivElement>(null)
   const diffFrameRef = useRef<HTMLIFrameElement>(null)
@@ -1120,11 +1139,14 @@ export default function App() {
     [selectStack, stack, stackPosition],
   )
 
-  const changeDiffMode = (mode: DiffMode) => {
-    setDiffMode(mode)
-    updateCoordinates({ ...coordinates, diff: mode })
-    if (!rootSession?.stack) rememberMode(mode)
-  }
+  const changeDiffMode = useCallback(
+    (mode: DiffMode) => {
+      setDiffMode(mode)
+      updateCoordinates({ ...coordinates, diff: mode })
+      if (!rootSession?.stack) rememberMode(mode)
+    },
+    [coordinates, rootSession?.stack, updateCoordinates],
+  )
 
   const changeScopeMode = (mode: ScopeMode) => {
     if (mode === scopeMode) return
@@ -1280,13 +1302,66 @@ export default function App() {
     if (indices.length) setStatus("Every file in this view is marked as viewed.")
   }, [fileNavigation, selected, viewedFiles, selectFile])
 
-  const toggleKeyboardOverlay = useCallback(() => {
-    setKeyboardOverlay((open) => {
-      const next = !open
-      setKeyboardOverlayExpanded(next)
-      return next
+  const toggleKeyboardMode = useCallback(() => {
+    const next = !keyboardMode
+    setKeyboardMode(next)
+    rememberKeyboardMode(next)
+    setStatus(
+      `Keyboard shortcuts ${next ? "on" : "off"} — press - to toggle, ? for help, Cmd/Ctrl+K for the palette.`,
+    )
+  }, [keyboardMode])
+
+  const undoViewed = useCallback(() => {
+    if (
+      selected === null ||
+      !files[selected] ||
+      !session ||
+      session.comparison?.kind === "since-review" ||
+      scopeLoading ||
+      stackLoading ||
+      loading
+    )
+      return
+    if (!viewedFiles.has(selected)) {
+      setStatus("Selected file is not marked viewed.")
+      return
+    }
+    setReviewError("")
+    toggleEvidence(files[selected], session.id, selected)
+  }, [files, selected, session, toggleEvidence, viewedFiles, scopeLoading, stackLoading, loading])
+
+  const focusSearch = useCallback(() => {
+    setChromeHidden(false)
+    setSidebarPeek(false)
+    requestAnimationFrame(() => {
+      searchInputRef.current?.focus()
+      searchInputRef.current?.select()
     })
   }, [])
+
+  const toggleTreeExpansion = useCallback(() => {
+    const expand = nextTreeExpanded(treeAllExpanded)
+    if (expand) treeRef.current?.openAll()
+    else treeRef.current?.closeAll()
+    setTreeAllExpanded(expand)
+  }, [treeAllExpanded])
+
+  const openOnGitHub = useCallback(() => {
+    const pullUrl = rootSession?.comparison?.pull_request?.url
+    let url = pullUrl ?? null
+    if (!url && prUrl.trim()) {
+      try {
+        url = normalizePrUrl(prUrl)
+      } catch {
+        url = null
+      }
+    }
+    if (!url) {
+      setStatus("No GitHub pull request for this review — Open on GitHub needs a PR URL.")
+      return
+    }
+    window.open(url, "_blank", "noopener,noreferrer")
+  }, [prUrl, rootSession])
 
   const showKeyboardHelp = useCallback(() => {
     setKeyboardOverlay(true)
@@ -1296,6 +1371,10 @@ export default function App() {
   const runOverlayCommand = useCallback(
     (key: string) => {
       switch (key.toLowerCase()) {
+        case "e":
+          setChromeHidden(true)
+          setSidebarPeek(chromeHidden ? !sidebarPeek : false)
+          break
         case "f":
           focusSidebar()
           break
@@ -1332,19 +1411,84 @@ export default function App() {
         case "m":
           toggleViewed()
           break
+        case "u":
+          undoViewed()
+          break
+        case "/":
+          focusSearch()
+          break
+        case "t":
+          changeDiffMode(diffMode === "semantic" ? "text" : "semantic")
+          break
+        case "x":
+          toggleTreeExpansion()
+          break
+        case "o":
+          openOnGitHub()
+          break
       }
     },
     [
       activeRegion,
+      changeDiffMode,
+      chromeHidden,
+      diffMode,
       focusDiff,
+      focusSearch,
       focusSidebar,
       moveFile,
       nextUnviewed,
+      openOnGitHub,
       scrollDiff,
+      sidebarPeek,
       stepCommit,
       stepStack,
+      toggleTreeExpansion,
       toggleViewed,
+      undoViewed,
     ],
+  )
+
+  const paletteJumpFile = useCallback(
+    (fileIndex: number) => {
+      setPaletteOpen(false)
+      selectFile(fileIndex)
+    },
+    [selectFile],
+  )
+  const paletteJumpStack = useCallback(
+    (number: number) => {
+      setPaletteOpen(false)
+      if (stack) void selectStack(number, stack.mode)
+    },
+    [selectStack, stack],
+  )
+  const paletteJumpPull = useCallback(
+    (number: number) => {
+      setPaletteOpen(false)
+      setPrNumber(String(number))
+      if (loading) return
+      void loadSession(
+        "/api/github/compare",
+        { repo, number },
+        `Fetching PR #${number} and generating its merge-base diff…`,
+      )
+    },
+    [loading, loadSession, repo],
+  )
+  const paletteJumpCommit = useCallback(
+    (index: number | null) => {
+      setPaletteOpen(false)
+      void selectScope(index, scopeMode)
+    },
+    [selectScope, scopeMode],
+  )
+  const paletteCommand = useCallback(
+    (key: string) => {
+      setPaletteOpen(false)
+      runOverlayCommand(key)
+    },
+    [runOverlayCommand],
   )
 
   useEffect(() => {
@@ -1361,12 +1505,31 @@ export default function App() {
     return () => window.clearTimeout(timer)
   }, [keyboardOverlay, keyboardOverlayExpanded])
 
+  // Single-letter commands are handled when keyboardMode is on (the default).
+  // `-`, `?`, Esc and Cmd/Ctrl+K stay available in either mode so the user
+  // can always toggle the mode, open help, or open the palette. Modifier
+  // chords and editable targets are never hijacked (see lib/keyboard.ts).
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      if (isPaletteShortcut(event)) {
+        event.preventDefault()
+        setPaletteOpen((open) => !open)
+        return
+      }
       if (isEditableTarget(event.target)) return
+      if (event.key === "Escape") {
+        if (paletteOpen) {
+          event.preventDefault()
+          setPaletteOpen(false)
+        } else if (keyboardOverlay) {
+          event.preventDefault()
+          setKeyboardOverlay(false)
+        }
+        return
+      }
       if (event.key === "-") {
         event.preventDefault()
-        toggleKeyboardOverlay()
+        toggleKeyboardMode()
         return
       }
       if (event.key === "?") {
@@ -1374,14 +1537,9 @@ export default function App() {
         showKeyboardHelp()
         return
       }
-      if (event.key === "Escape" && keyboardOverlay) {
-        event.preventDefault()
-        setKeyboardOverlay(false)
-        return
-      }
-      if (!keyboardOverlay) return
-      const key = event.key.toLowerCase()
-      if (OVERLAY_KEYS.includes(key)) {
+      if (!keyboardMode || paletteOpen) return
+      const key = commandKeyFor(event)
+      if (key && OVERLAY_KEYS.includes(key)) {
         event.preventDefault()
         runOverlayCommand(key)
       }
@@ -1393,16 +1551,25 @@ export default function App() {
         event.source !== diffFrameRef.current.contentWindow
       )
         return
-      const key = readViewerKey(event.data)
-      if (!key) return
+      const message = readViewerKey(event.data)
+      if (!message) return
+      // The palette chord works from inside the diff iframe too: the bridge
+      // forwards Ctrl/Cmd+K with its modifiers (see lib/viewer-keyboard.ts).
+      if (isPaletteShortcut(message)) {
+        setPaletteOpen((open) => !open)
+        return
+      }
+      const key = message.key
       if (key === "-") {
-        toggleKeyboardOverlay()
+        toggleKeyboardMode()
       } else if (key === "?") {
         showKeyboardHelp()
-      } else if (key === "Escape" && keyboardOverlay) {
-        setKeyboardOverlay(false)
-      } else if (keyboardOverlay && OVERLAY_KEYS.includes(key.toLowerCase())) {
-        runOverlayCommand(key)
+      } else if (key === "Escape") {
+        if (paletteOpen) setPaletteOpen(false)
+        else if (keyboardOverlay) setKeyboardOverlay(false)
+      } else if (keyboardMode && !paletteOpen) {
+        const command = commandKeyFor(message)
+        if (command && OVERLAY_KEYS.includes(command)) runOverlayCommand(command)
       }
     }
     window.addEventListener("keydown", onKeyDown)
@@ -1411,7 +1578,14 @@ export default function App() {
       window.removeEventListener("keydown", onKeyDown)
       window.removeEventListener("message", onMessage)
     }
-  }, [keyboardOverlay, runOverlayCommand, showKeyboardHelp, toggleKeyboardOverlay])
+  }, [
+    keyboardMode,
+    keyboardOverlay,
+    paletteOpen,
+    runOverlayCommand,
+    showKeyboardHelp,
+    toggleKeyboardMode,
+  ])
 
   const selectedFile = selected === null ? null : session?.files[selected]
   const previousReviews = evidenceContext
@@ -1498,12 +1672,16 @@ export default function App() {
               <Button
                 data-testid="keyboard-overlay-toggle"
                 size="sm"
-                variant={keyboardOverlay ? "secondary" : "outline"}
-                onClick={toggleKeyboardOverlay}
-                aria-pressed={keyboardOverlay}
-                title="Toggle keyboard overlay (-)"
+                variant={keyboardMode ? "secondary" : "outline"}
+                onClick={toggleKeyboardMode}
+                aria-pressed={keyboardMode}
+                title={
+                  keyboardMode
+                    ? "Keyboard shortcuts on — press - to turn off, ? for help, Cmd/Ctrl+K for the palette"
+                    : "Keyboard shortcuts off — press - to turn on, ? for help"
+                }
               >
-                <Keyboard className="size-4" /> Keys
+                <Keyboard className="size-4" /> Keys{keyboardMode ? "" : " off"}
               </Button>
               <Button
                 data-testid="hide-chrome"
@@ -1532,6 +1710,7 @@ export default function App() {
             variant="outline"
             aria-expanded={sidebarPeek}
             aria-label="Toggle review sidebar"
+            title="Toggle review sidebar (E)"
             onClick={() => setSidebarPeek((value) => !value)}
           >
             <Folder className="size-4" /> Sidebar
@@ -2279,9 +2458,12 @@ export default function App() {
                 <div className="relative">
                   <Search className="pointer-events-none absolute left-2 top-2 size-3.5 text-muted-foreground" />
                   <Input
+                    ref={searchInputRef}
+                    data-testid="file-filter"
                     value={search}
                     onChange={(event) => setSearch(event.target.value)}
                     placeholder="Filter files"
+                    title="Filter files (/ )"
                     className="h-8 pl-7 text-xs"
                   />
                 </div>
@@ -2306,6 +2488,7 @@ export default function App() {
                     sidebarGap={sidebarGap}
                     sidebarPadding={sidebarPadding}
                     onSelectFile={selectFile}
+                    treeRef={treeRef}
                   />
                 ) : loading ? (
                   <div className="grid h-full place-items-center p-6 text-center text-sm text-muted-foreground">
@@ -2599,9 +2782,11 @@ export default function App() {
                         "Fetching the pull request and preparing diffs."
                       ) : session ? (
                         <>
-                          Or press <kbd className="rounded border bg-muted px-1 font-mono">-</kbd>{" "}
-                          then <kbd className="rounded border bg-muted px-1 font-mono">N</kbd> to
-                          jump to the next unviewed file.
+                          Press <kbd className="rounded border bg-muted px-1 font-mono">N</kbd> to
+                          jump to the next unviewed file,{" "}
+                          <kbd className="rounded border bg-muted px-1 font-mono">?</kbd> for all
+                          keys, <kbd className="rounded border bg-muted px-1 font-mono">Ctrl+K</kbd>{" "}
+                          to jump anywhere.
                         </>
                       ) : (
                         "Open a pull request above to start."
@@ -2629,67 +2814,71 @@ export default function App() {
             <>
               <div className="flex items-center justify-between gap-3 px-1 pb-2 text-xs text-muted-foreground">
                 <span className="flex items-center gap-1.5 font-medium text-foreground">
-                  <Keyboard className="size-3.5 text-primary" /> Keyboard overlay
+                  <Keyboard className="size-3.5 text-primary" /> Keyboard shortcuts{" "}
+                  <span className="font-normal text-muted-foreground">
+                    {keyboardMode ? "on" : "off"} — press - to toggle
+                  </span>
                 </span>
                 <span>
                   <kbd className="rounded border bg-muted px-1.5 py-0.5 font-mono text-foreground">
-                    ?
+                    Ctrl+K
                   </kbd>{" "}
-                  show keys ·{" "}
+                  jump anywhere ·{" "}
                   <kbd className="rounded border bg-muted px-1.5 py-0.5 font-mono text-foreground">
                     Esc
                   </kbd>{" "}
-                  or{" "}
-                  <kbd className="rounded border bg-muted px-1.5 py-0.5 font-mono text-foreground">
-                    -
-                  </kbd>{" "}
-                  hide
+                  close
                 </span>
               </div>
-              <div className="grid gap-2 sm:grid-cols-3">
+              <div className="grid max-h-[46vh] gap-2 overflow-y-auto pr-1 sm:grid-cols-3">
+                {KEYBOARD_COMMANDS.map((command) => (
+                  <button
+                    key={command.key}
+                    type="button"
+                    onClick={() => runOverlayCommand(command.key)}
+                    className={cn(
+                      "rounded-lg border p-3 text-left transition-colors hover:bg-accent",
+                      command.key === "f" &&
+                        activeRegion === "sidebar" &&
+                        "border-primary bg-primary/5",
+                      command.key === "d" &&
+                        activeRegion === "diff" &&
+                        "border-primary bg-primary/5",
+                    )}
+                  >
+                    <kbd className="mr-2 rounded bg-foreground px-1.5 py-0.5 font-mono text-xs text-background">
+                      {command.key.toUpperCase()}
+                    </kbd>
+                    <span className="font-medium">{command.label}</span>
+                    <span className="mt-1 block text-xs text-muted-foreground">
+                      {command.detail}
+                    </span>
+                  </button>
+                ))}
                 <button
                   type="button"
-                  onClick={() => runOverlayCommand("f")}
-                  className={cn(
-                    "rounded-lg border p-3 text-left transition-colors hover:bg-accent",
-                    activeRegion === "sidebar" && "border-primary bg-primary/5",
-                  )}
-                >
-                  <kbd className="mr-2 rounded bg-foreground px-1.5 py-0.5 font-mono text-xs text-background">
-                    F
-                  </kbd>
-                  <span className="font-medium">Files</span>
-                  <span className="mt-1 block text-xs text-muted-foreground">
-                    Focus the changed-file sidebar
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => runOverlayCommand("d")}
-                  className={cn(
-                    "rounded-lg border p-3 text-left transition-colors hover:bg-accent",
-                    activeRegion === "diff" && "border-primary bg-primary/5",
-                  )}
-                >
-                  <kbd className="mr-2 rounded bg-foreground px-1.5 py-0.5 font-mono text-xs text-background">
-                    D
-                  </kbd>
-                  <span className="font-medium">Diff panel</span>
-                  <span className="mt-1 block text-xs text-muted-foreground">
-                    Focus the SemanticDiff view
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => runOverlayCommand("v")}
+                  onClick={() => setPaletteOpen(true)}
                   className="rounded-lg border p-3 text-left transition-colors hover:bg-accent"
                 >
                   <kbd className="mr-2 rounded bg-foreground px-1.5 py-0.5 font-mono text-xs text-background">
-                    V
+                    Ctrl+K
                   </kbd>
-                  <span className="font-medium">Focus view</span>
+                  <span className="font-medium">Jump anywhere</span>
                   <span className="mt-1 block text-xs text-muted-foreground">
-                    Hide controls and enter the diff
+                    File, pull request, or commit palette
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onClick={toggleKeyboardMode}
+                  className="rounded-lg border p-3 text-left transition-colors hover:bg-accent"
+                >
+                  <kbd className="mr-2 rounded bg-foreground px-1.5 py-0.5 font-mono text-xs text-background">
+                    -
+                  </kbd>
+                  <span className="font-medium">Toggle shortcuts</span>
+                  <span className="mt-1 block text-xs text-muted-foreground">
+                    Turn single-letter shortcuts {keyboardMode ? "off" : "on"} (persisted)
                   </span>
                 </button>
               </div>
@@ -2705,38 +2894,22 @@ export default function App() {
                 </span>
                 <span>
                   <kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">
-                    N
+                    /
                   </kbd>{" "}
-                  next unviewed
+                  filter files
                 </span>
                 <span>
                   <kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">
-                    M
+                    T
                   </kbd>{" "}
-                  mark viewed
+                  semantic / text
                 </span>
-                {commits.length > 0 && (
-                  <span>
-                    <kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">
-                      [
-                    </kbd>
-                    <kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">
-                      ]
-                    </kbd>{" "}
-                    commit
-                  </span>
-                )}
-                {stack && (
-                  <span>
-                    <kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">
-                      {"{"}
-                    </kbd>
-                    <kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">
-                      {"}"}
-                    </kbd>{" "}
-                    stacked PR
-                  </span>
-                )}
+                <span>
+                  <kbd className="mr-1 rounded border bg-background px-1.5 py-0.5 font-mono text-foreground">
+                    O
+                  </kbd>{" "}
+                  open on GitHub
+                </span>
                 <span className="ml-auto">
                   {activeRegion === "sidebar" ? "Files sidebar active" : "Diff panel active"}
                 </span>
@@ -2759,6 +2932,123 @@ export default function App() {
             </button>
           )}
         </aside>
+      )}
+      {paletteOpen && (
+        <div
+          role="presentation"
+          data-testid="command-palette"
+          className="fixed inset-0 z-[60] flex items-start justify-center bg-black/40 px-4 pt-[12vh]"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setPaletteOpen(false)
+          }}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Jump to file, pull request, or commit"
+            className="w-[min(640px,100%)] overflow-hidden rounded-xl border bg-popover shadow-2xl"
+          >
+            <Command label="Jump to file, pull request, or commit" vimBindings={false}>
+              <CommandInput autoFocus placeholder="Jump to file, PR, or commit…" />
+              <CommandList>
+                <CommandEmpty>No matches.</CommandEmpty>
+                {files.length > 0 && (
+                  <CommandGroup heading="Files">
+                    {files.map((file, index) => (
+                      <CommandItem
+                        key={`${file.display_path}:${index}`}
+                        value={`file ${file.display_path}`}
+                        onSelect={() => paletteJumpFile(index)}
+                      >
+                        <FileCode2 className="mr-2 size-4 shrink-0" />
+                        <span className="min-w-0 flex-1 truncate">{file.display_path}</span>
+                        {viewedFiles.has(index) && (
+                          <Check className="ml-2 size-4 shrink-0 text-emerald-600" />
+                        )}
+                      </CommandItem>
+                    ))}
+                  </CommandGroup>
+                )}
+                {stack && (
+                  <CommandGroup heading="Stack pull requests">
+                    {stack.members.map((member) => (
+                      <CommandItem
+                        key={member.pull.number}
+                        value={`stack pr ${member.pull.number} ${member.pull.title}`}
+                        onSelect={() => paletteJumpStack(member.pull.number)}
+                      >
+                        <GitPullRequest className="mr-2 size-4 shrink-0" />
+                        <span className="shrink-0 font-medium tabular-nums">
+                          #{member.pull.number}
+                        </span>
+                        <span className="min-w-0 flex-1 truncate">{member.pull.title}</span>
+                        {member.pull.number === stack.current && (
+                          <span className="ml-2 shrink-0 text-xs text-muted-foreground">
+                            current
+                          </span>
+                        )}
+                      </CommandItem>
+                    ))}
+                  </CommandGroup>
+                )}
+                {!stack && pulls.length > 0 && (
+                  <CommandGroup heading="Open pull requests">
+                    {pulls.map((pull) => (
+                      <CommandItem
+                        key={pull.number}
+                        value={`open pr ${pull.number} ${pull.title} ${pull.author?.login ?? ""} ${pull.headRefName}`}
+                        onSelect={() => paletteJumpPull(pull.number)}
+                      >
+                        <GitPullRequest className="mr-2 size-4 shrink-0" />
+                        <span className="shrink-0 font-medium tabular-nums">#{pull.number}</span>
+                        <span className="min-w-0 flex-1 truncate">{pull.title}</span>
+                      </CommandItem>
+                    ))}
+                  </CommandGroup>
+                )}
+                {commits.length > 0 && (
+                  <CommandGroup heading="Commits">
+                    <CommandItem value="all changes" onSelect={() => paletteJumpCommit(null)}>
+                      <GitCommitHorizontal className="mr-2 size-4 shrink-0" />
+                      <span>All changes</span>
+                    </CommandItem>
+                    {commits.map((commit, index) => (
+                      <CommandItem
+                        key={commit.sha}
+                        value={`commit ${commit.sha} ${commit.subject} ${commit.author}`}
+                        onSelect={() => paletteJumpCommit(index)}
+                      >
+                        <GitCommitHorizontal className="mr-2 size-4 shrink-0" />
+                        <span className="shrink-0 font-mono text-xs">{commit.short}</span>
+                        <span className="min-w-0 flex-1 truncate">
+                          {commit.subject || "(no message)"}
+                        </span>
+                        <span className="ml-2 shrink-0 text-xs text-muted-foreground">
+                          {commit.author} · {formatCommitDate(commit.date)}
+                        </span>
+                      </CommandItem>
+                    ))}
+                  </CommandGroup>
+                )}
+                <CommandGroup heading="Actions">
+                  {KEYBOARD_COMMANDS.map((command) => (
+                    <CommandItem
+                      key={command.key}
+                      value={`action ${command.label} ${command.key}`}
+                      onSelect={() => paletteCommand(command.key)}
+                    >
+                      <Keyboard className="mr-2 size-4 shrink-0" />
+                      <span className="min-w-0 flex-1 truncate">{command.label}</span>
+                      <kbd className="ml-2 rounded border bg-muted px-1.5 py-0.5 font-mono text-xs">
+                        {command.key.toUpperCase()}
+                      </kbd>
+                    </CommandItem>
+                  ))}
+                </CommandGroup>
+              </CommandList>
+            </Command>
+          </div>
+        </div>
       )}
     </div>
   )

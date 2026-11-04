@@ -38,7 +38,30 @@ test("viewer readiness preserves a rendered fallback and reports errors without 
 })
 
 test("reads keyboard commands only from correctly typed bridge payloads", () => {
-  assert.equal(readViewerKey({ source: "local-diffe-keyboard", key: "Escape" }), "Escape")
+  assert.deepEqual(readViewerKey({ source: "local-diffe-keyboard", key: "Escape" }), {
+    key: "Escape",
+    ctrlKey: false,
+    metaKey: false,
+    altKey: false,
+  })
+  // The palette chord arrives from inside the diff iframe with modifiers;
+  // without them it would be misread as a bare "k" (scroll up).
+  assert.deepEqual(
+    readViewerKey({
+      source: "local-diffe-keyboard",
+      key: "k",
+      ctrlKey: true,
+      metaKey: false,
+      altKey: false,
+    }),
+    { key: "k", ctrlKey: true, metaKey: false, altKey: false },
+  )
+  assert.deepEqual(readViewerKey({ source: "local-diffe-keyboard", key: "k", metaKey: true }), {
+    key: "k",
+    ctrlKey: false,
+    metaKey: true,
+    altKey: false,
+  })
   for (const data of [
     null,
     undefined,
@@ -50,6 +73,8 @@ test("reads keyboard commands only from correctly typed bridge payloads", () => 
     { source: "local-diffe-keyboard" },
     { source: "local-diffe-keyboard", key: 1 },
     { source: "local-diffe-keyboard", key: {} },
+    { source: "local-diffe-keyboard", key: "k", ctrlKey: "yes" },
+    { source: "local-diffe-keyboard", key: "k", metaKey: 1 },
   ]) {
     assert.equal(readViewerKey(data), null)
   }

@@ -360,7 +360,7 @@ const fixture = createHttpServer(async (request, response) => {
           parent.postMessage({ source: "local-diffe-viewer", ready: true }, origin);
           addEventListener("message", (event) => {
             if (event.source === parent && event.data?.testKey) {
-              parent.postMessage({ source: "local-diffe-keyboard", key: event.data.testKey }, origin);
+              parent.postMessage({ source: "local-diffe-keyboard", key: event.data.testKey, ctrlKey: Boolean(event.data.testCtrl), metaKey: Boolean(event.data.testMeta) }, origin);
             }
           });
         </script>
@@ -679,6 +679,28 @@ try {
       await page.click('[data-testid="hide-chrome"]')
       await waitContext("Reviewing #3007 · commit ccccccc")
       assert.ok(await page.textContent('[data-testid="stack-rail"]'))
+      const sidebarDisplay = () =>
+        page.evaluate(
+          () =>
+            getComputedStyle(document.querySelector('[aria-label="Changed files sidebar"]'))
+              .display,
+        )
+      // Single-letter shortcuts are live by default (persisted mode, no gate).
+      // The header toggle is hidden in focus view, so read the persisted mode.
+      const keyboardModeOn = () =>
+        page.evaluate(() => localStorage.getItem("local-diffe:keyboard-mode") !== "off")
+      if (!(await keyboardModeOn())) await key("-")
+      assert.equal(await sidebarDisplay(), "none")
+      await key("e")
+      assert.notEqual(await sidebarDisplay(), "none")
+      await key("E")
+      assert.equal(await sidebarDisplay(), "none")
+      await key("-")
+      assert.equal(await keyboardModeOn(), false, "- turns keyboard shortcuts off")
+      await key("e")
+      assert.equal(await sidebarDisplay(), "none", "Sidebar shortcut requires keyboard mode on")
+      await key("-")
+      assert.equal(await keyboardModeOn(), true, "- turns keyboard shortcuts back on")
       await page.click('[data-testid="show-chrome"]')
       await page.click('[data-testid="stack-pr-3007"]')
       await waitContext("Reviewing #3007 against #3006")
@@ -741,13 +763,11 @@ try {
       await new Promise((resolve) => setTimeout(resolve, 600))
       await waitContext("Reviewing #3007 against #3006")
       await waitFile("shared.go")
-      // Keep the existing keyboard overlay's stack shortcuts working.
-      await key("-")
+      // Stack shortcuts work without opening any overlay (mode is on above).
       await key("}")
       await review(3008)
       await key("{")
       await review(3007)
-      await key("-")
       await page.evaluate(() => localStorage.removeItem("local-diffe:diff-mode"))
 
       // Final-stack scope keeps the selected member as the URL anchor and
@@ -1037,7 +1057,14 @@ try {
       )
       const overlay = () =>
         page.evaluate(() => document.querySelector('[data-testid="keyboard-overlay"]') !== null)
+      const keyboardPressed = () =>
+        page.evaluate(() =>
+          document
+            .querySelector('[data-testid="keyboard-overlay-toggle"]')
+            ?.getAttribute("aria-pressed"),
+        )
       assert.equal(await overlay(), false)
+      const before = await keyboardPressed()
       await page.evaluate(
         () =>
           new Promise((resolve) => {
@@ -1049,9 +1076,10 @@ try {
             window.postMessage({ source: "local-diffe-keyboard", key: "-" }, location.origin)
           }),
       )
+      assert.equal(await overlay(), false)
       assert.equal(
-        await overlay(),
-        false,
+        await keyboardPressed(),
+        before,
         "same-origin messages from the host must not act as viewer commands",
       )
       await page.evaluate(() => {
@@ -1071,30 +1099,108 @@ try {
           }),
         )
       })
+      assert.equal(await overlay(), false)
       assert.equal(
-        await overlay(),
-        false,
+        await keyboardPressed(),
+        before,
         "foreign-origin and malformed viewer messages must be ignored",
       )
       await page.evaluate(
-        () =>
+        (beforePressed) =>
           new Promise((resolve, reject) => {
             document
               .querySelector("iframe")
               .contentWindow.postMessage({ testKey: "-" }, location.origin)
             const deadline = performance.now() + 10_000
             const check = () => {
-              if (document.querySelector('[data-testid="keyboard-overlay"]')) return resolve()
+              const pressed = document
+                .querySelector('[data-testid="keyboard-overlay-toggle"]')
+                ?.getAttribute("aria-pressed")
+              if (pressed !== null && pressed !== undefined && pressed !== beforePressed)
+                return resolve()
               if (performance.now() > deadline)
-                return reject(
-                  new Error("Trusted viewer command did not toggle the keyboard overlay"),
-                )
+                return reject(new Error("Trusted viewer command did not toggle keyboard mode"))
+              requestAnimationFrame(check)
+            }
+            check()
+          }),
+        before,
+      )
+      assert.equal(await keyboardPressed(), before === "true" ? "false" : "true")
+      assert.equal(await overlay(), false)
+      // Restore keyboard mode, then exercise the new always-on keys.
+      await key("-")
+      assert.equal(await keyboardPressed(), "true")
+      await page.evaluate(() =>
+        window.dispatchEvent(
+          new KeyboardEvent("keydown", {
+            key: "k",
+            ctrlKey: true,
+            bubbles: true,
+            cancelable: true,
+          }),
+        ),
+      )
+      assert.equal(
+        await page.evaluate(() =>
+          Boolean(document.querySelector('[data-testid="command-palette"]')),
+        ),
+        true,
+        "Ctrl+K opens the command palette",
+      )
+      await key("Escape")
+      assert.equal(
+        await page.evaluate(() =>
+          Boolean(document.querySelector('[data-testid="command-palette"]')),
+        ),
+        false,
+        "Escape closes the command palette",
+      )
+      // Ctrl+K pressed inside the focused diff iframe must open the palette
+      // (the bridge forwards the chord with modifiers, not a bare "k").
+      await page.evaluate(
+        () =>
+          new Promise((resolve, reject) => {
+            document
+              .querySelector("iframe")
+              .contentWindow.postMessage({ testKey: "k", testCtrl: true }, location.origin)
+            const deadline = performance.now() + 10_000
+            const check = () => {
+              if (document.querySelector('[data-testid="command-palette"]')) return resolve()
+              if (performance.now() > deadline)
+                return reject(new Error("Ctrl+K inside the diff did not open the palette"))
               requestAnimationFrame(check)
             }
             check()
           }),
       )
-      assert.equal(await overlay(), true)
+      await key("Escape")
+      assert.equal(
+        await page.evaluate(() =>
+          Boolean(document.querySelector('[data-testid="command-palette"]')),
+        ),
+        false,
+        "Escape closes the palette opened from inside the diff",
+      )
+      await key("/")
+      await page.evaluate(
+        () =>
+          new Promise((resolve, reject) => {
+            const deadline = performance.now() + 10_000
+            const check = () => {
+              if (document.activeElement?.getAttribute("data-testid") === "file-filter")
+                return resolve()
+              if (performance.now() > deadline)
+                return reject(new Error("/ did not focus the file filter"))
+              requestAnimationFrame(check)
+            }
+            check()
+          }),
+      )
+      await page.evaluate(() => document.activeElement?.blur())
+      const modeBefore = await checked("diff-mode-semantic")
+      await key("t")
+      assert.notEqual(await checked("diff-mode-semantic"), modeBefore, "t toggles the diff mode")
       // Saving and editing are local. Publication requires its own user action.
       await page.goto(`${app}/?pr=${github(3006)}`)
       await review(3006)
