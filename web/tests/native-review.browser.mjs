@@ -126,6 +126,7 @@ try {
   await page.screenshot({ path: `${output}/sidebar.png` })
   await api("delete", { id: saved.id, version: saved.version })
   await page.click('[aria-label="Toggle review sidebar"]')
+  await page.click('[data-testid="show-chrome"]')
   await page.click('[data-testid="diff-mode-text"]')
   await waitFor("[data-comment-old]")
   await page.evaluate(() => {

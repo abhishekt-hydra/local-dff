@@ -679,6 +679,54 @@ try {
       await page.click('[data-testid="hide-chrome"]')
       await waitContext("Reviewing #3007 · commit ccccccc")
       assert.ok(await page.textContent('[data-testid="stack-rail"]'))
+      assert.deepEqual(
+        await page.evaluate(() => {
+          const header = document.querySelector('[data-testid="minimal-header"]')
+          const panel = document.querySelector('[aria-label="Diff panel"]')
+          const frame = panel.querySelector("iframe")
+          return {
+            title: header.querySelector("a").textContent.trim(),
+            path: header.querySelector('[aria-label^="Copy file path:"]').textContent.trim(),
+            toolbarHidden: !panel.querySelector('[data-testid="next-file"]'),
+            headerHeight: Math.round(header.getBoundingClientRect().height),
+            frameTop: Math.round(frame.getBoundingClientRect().top),
+            pageFits: document.documentElement.scrollHeight <= window.innerHeight,
+          }
+        }),
+        {
+          title: "#3007Fixture PR 3007",
+          path: "shared.go",
+          toolbarHidden: true,
+          headerHeight: 44,
+          frameTop: 44,
+          pageFits: true,
+        },
+      )
+      await page.click('[aria-label="Copy file path: shared.go"]')
+      await waitText('[data-testid="minimal-header"] [role="status"]', "File path copied")
+      await page.evaluate(() =>
+        document.querySelector('[aria-label="Toggle review sidebar"]').focus(),
+      )
+      await page.evaluate(
+        () =>
+          new Promise((resolve, reject) => {
+            const deadline = performance.now() + 2000
+            const check = () => {
+              const trigger = document.querySelector('[aria-label="Toggle review sidebar"]')
+              const tooltip = document.getElementById(trigger.getAttribute("aria-describedby"))
+              if (
+                getComputedStyle(tooltip).opacity === "1" &&
+                tooltip.querySelector("kbd")?.textContent === "E"
+              )
+                return resolve()
+              if (performance.now() > deadline)
+                return reject(new Error("Sidebar hint did not show E on focus"))
+              requestAnimationFrame(check)
+            }
+            check()
+          }),
+      )
+      await page.screenshot({ path: `/tmp/local-diffe-minimal-${mode.split(" ")[0]}.png` })
       const sidebarDisplay = () =>
         page.evaluate(
           () =>
@@ -697,10 +745,26 @@ try {
       assert.equal(await sidebarDisplay(), "none")
       await key("-")
       assert.equal(await keyboardModeOn(), false, "- turns keyboard shortcuts off")
+      assert.equal(
+        await page.evaluate(
+          () => document.querySelector('[data-testid="minimal-header"] kbd') === null,
+        ),
+        true,
+        "Disabled keyboard mode hides inactive key hints",
+      )
       await key("e")
       assert.equal(await sidebarDisplay(), "none", "Sidebar shortcut requires keyboard mode on")
       await key("-")
       assert.equal(await keyboardModeOn(), true, "- turns keyboard shortcuts back on")
+      await key("v")
+      assert.equal(
+        await page.evaluate(
+          () => document.querySelector('[data-testid="minimal-header"]') === null,
+        ),
+        true,
+        "V restores the overview",
+      )
+      await key("v")
       await page.click('[data-testid="show-chrome"]')
       await page.click('[data-testid="stack-pr-3007"]')
       await waitContext("Reviewing #3007 against #3006")

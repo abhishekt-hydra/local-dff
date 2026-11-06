@@ -32,7 +32,7 @@ export const KEYBOARD_COMMANDS = [
   { key: "u", label: "Undo viewed", detail: "Remove the viewed mark from the selected file" },
   { key: "f", label: "Files", detail: "Focus the changed-file sidebar" },
   { key: "d", label: "Diff panel", detail: "Focus the diff panel" },
-  { key: "v", label: "Focus view", detail: "Hide controls and enter the diff (minimal view)" },
+  { key: "v", label: "Toggle overview", detail: "Switch between minimal review and full controls" },
   { key: "e", label: "Toggle sidebar", detail: "Open or close the sidebar in minimal view" },
   {
     key: "[",
@@ -51,6 +51,8 @@ export const KEYBOARD_COMMANDS = [
   },
   { key: "o", label: "Open on GitHub", detail: "Open the current pull request in a new tab" },
 ] as const
+
+export type KeyboardCommandKey = (typeof KEYBOARD_COMMANDS)[number]["key"]
 
 export const OVERLAY_KEYS: readonly string[] = KEYBOARD_COMMANDS.map((command) => command.key)
 

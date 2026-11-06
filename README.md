@@ -229,9 +229,11 @@ SQLite. Cmd/Ctrl+Enter saves; Escape closes the composer. Unsaved text remains
 available when you reopen that same line during the current comparison.
 
 The left sidebar holds **Comments**, including saved drafts, editing, deletion,
-and a general PR comment form. **Minimal** gives the diff the full window;
-**Sidebar** opens or hides the floating files/comments sidebar, and **Full view**
-restores the setup controls. Line commenting remains available in minimal mode.
+and a general PR comment form. **Minimal** leaves a compact header with the PR
+name and a file path you can click to copy. The folder icon toggles the floating
+files/comments sidebar, and **Overview** restores the setup controls. Hover or
+focus a control to see its shortcut. `V` switches between minimal mode and the
+overview. Line commenting remains available in minimal mode.
 With keyboard shortcuts on, `E` toggles the sidebar. From full view,
 `E` enters minimal mode with the sidebar closed.
 Line attachments are available in the PR's own comparison, outside cumulative

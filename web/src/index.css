@@ -134,7 +134,75 @@ input,
   animation: loading-dots 1.2s ease-in-out infinite;
 }
 
+.shortcut-tooltip {
+  position: relative;
+  display: inline-flex;
+}
+.shortcut-tooltip-content {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--popover);
+  color: var(--popover-foreground);
+  box-shadow:
+    0 2px 10px #0003,
+    0 0 0 1px color-mix(in srgb, var(--foreground) 10%, transparent);
+  font-size: 11px;
+  white-space: nowrap;
+  pointer-events: none;
+  visibility: hidden;
+  opacity: 0;
+  transition:
+    opacity 100ms,
+    visibility 100ms;
+}
+.shortcut-tooltip-content[data-align="start"] {
+  left: 0;
+  transform: none;
+}
+.shortcut-tooltip-content[data-align="end"] {
+  left: auto;
+  right: 0;
+  transform: none;
+}
+.shortcut-tooltip:hover > .shortcut-tooltip-content,
+.shortcut-tooltip:focus-within > .shortcut-tooltip-content {
+  visibility: visible;
+  opacity: 1;
+  transition-delay: 150ms;
+}
+.shortcut-key {
+  display: inline-flex;
+  min-width: 18px;
+  height: 18px;
+  align-items: center;
+  justify-content: center;
+  padding: 0 4px;
+  border: 1px solid color-mix(in srgb, var(--foreground) 14%, transparent);
+  border-radius: 4px;
+  background: var(--muted);
+  color: var(--muted-foreground);
+  font-family: inherit;
+  font-size: 10px;
+  line-height: 1;
+}
+
+.review-minimal {
+  height: 100vh;
+  min-height: 0;
+  gap: 0;
+  padding: 0;
+}
 .review-minimal [data-testid="review-layout"] {
+  flex: 1;
+  min-height: 0;
   display: block;
 }
 .review-minimal [aria-label="Changed files sidebar"] {
@@ -153,13 +221,20 @@ input,
   border: 1px solid var(--muted);
 }
 .review-minimal [aria-label="Diff panel"] {
-  margin-top: 40px;
+  position: static;
+  height: 100%;
+  border-radius: 0;
 }
 .review-minimal [data-testid="stack-review-context"] {
   display: none;
 }
+.review-minimal [data-comment-hint="true"] {
+  display: none;
+}
 .review-minimal [aria-label="Diff panel"] > div:last-child {
-  height: calc(100vh - 110px);
+  flex: 1;
+  min-height: 0;
+  height: 100%;
 }
 [data-comment-line] {
   cursor: pointer;

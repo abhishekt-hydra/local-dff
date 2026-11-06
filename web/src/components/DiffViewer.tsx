@@ -594,7 +594,11 @@ function DiffViewerContent({
         />
       )}
       {commentPrUrl && (
-        <p role="status" className="shrink-0 px-3 py-1 text-xs text-muted-foreground">
+        <p
+          role="status"
+          data-comment-hint={!saved}
+          className="shrink-0 px-3 py-1 text-xs text-muted-foreground"
+        >
           {saved ? "Comment saved. Find it in the sidebar." : "Select a line to leave a comment."}
         </p>
       )}

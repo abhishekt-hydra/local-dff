@@ -98,6 +98,8 @@ import { useStackHistory } from "./lib/use-stack-history"
 import { reviewEvidenceContext, evidenceFor } from "./lib/review-evidence"
 import { useReviewEvidence } from "./lib/use-review-evidence"
 import { CommentsPanel } from "./components/CommentsPanel"
+import { CopyFilePath } from "./components/CopyFilePath"
+import { ShortcutKey, ShortcutTooltip } from "./components/ShortcutTooltip"
 type ScopeMode = "commit" | "cumulative"
 type SourceTab = "pr" | "branches" | "patch"
 const EMPTY_FILES: PatchFile[] = []
@@ -1382,8 +1384,9 @@ export default function App() {
           focusDiff()
           break
         case "v":
-          setChromeHidden(true)
-          focusDiff()
+          setChromeHidden(!chromeHidden)
+          setSidebarPeek(false)
+          if (!chromeHidden) focusDiff()
           break
         case "j":
           if (activeRegion === "diff") scrollDiff(1)
@@ -1683,14 +1686,20 @@ export default function App() {
               >
                 <Keyboard className="size-4" /> Keys{keyboardMode ? "" : " off"}
               </Button>
-              <Button
-                data-testid="hide-chrome"
-                size="sm"
-                variant="outline"
-                onClick={() => setChromeHidden(true)}
+              <ShortcutTooltip
+                label="Minimal view"
+                shortcut={keyboardMode ? "v" : undefined}
+                align="end"
               >
-                <ChevronUp className="size-4" /> Minimal
-              </Button>
+                <Button
+                  data-testid="hide-chrome"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => runOverlayCommand("v")}
+                >
+                  <ChevronUp className="size-4" /> Minimal
+                </Button>
+              </ShortcutTooltip>
             </div>
           </div>
         </header>
@@ -1704,17 +1713,84 @@ export default function App() {
         )}
       >
         {chromeHidden && (
-          <Button
-            className="fixed left-4 top-4 z-40 shadow-md"
-            size="sm"
-            variant="outline"
-            aria-expanded={sidebarPeek}
-            aria-label="Toggle review sidebar"
-            title="Toggle review sidebar (E)"
-            onClick={() => setSidebarPeek((value) => !value)}
+          <header
+            data-testid="minimal-header"
+            className="relative z-40 flex h-11 shrink-0 items-center gap-2 bg-background px-3"
           >
-            <Folder className="size-4" /> Sidebar
-          </Button>
+            <ShortcutTooltip
+              label="Toggle sidebar"
+              shortcut={keyboardMode ? "e" : undefined}
+              align="start"
+            >
+              <Button
+                className="size-7 shrink-0 rounded-md text-muted-foreground"
+                size="icon"
+                variant="ghost"
+                aria-expanded={sidebarPeek}
+                aria-label="Toggle review sidebar"
+                onClick={() => setSidebarPeek((value) => !value)}
+              >
+                <Folder className="size-4" />
+              </Button>
+            </ShortcutTooltip>
+            <div className="flex min-w-0 flex-1 items-center gap-2 text-xs">
+              {pullRequest ? (
+                <ShortcutTooltip
+                  label="Open on GitHub"
+                  shortcut={keyboardMode ? "o" : undefined}
+                  align="start"
+                  className="min-w-0"
+                >
+                  <a
+                    href={pullRequest.url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="truncate font-medium text-foreground/80 hover:text-foreground"
+                  >
+                    <span className="mr-2 text-muted-foreground">#{pullRequest.number}</span>
+                    {pullRequest.title}
+                  </a>
+                </ShortcutTooltip>
+              ) : (
+                <span className="truncate font-medium text-foreground/80">
+                  {rootSession?.comparison
+                    ? `${rootSession.comparison.base.revision} → ${rootSession.comparison.target.revision}`
+                    : rootSession
+                      ? "Uploaded patch"
+                      : "No comparison loaded"}
+                </span>
+              )}
+              {selectedFile && (
+                <>
+                  <span aria-hidden="true" className="text-muted-foreground/40">
+                    /
+                  </span>
+                  <CopyFilePath key={selectedFile.display_path} path={selectedFile.display_path} />
+                </>
+              )}
+              {(loading || scopeLoading || stackLoading) && (
+                <LoaderCircle
+                  aria-label="Loading comparison"
+                  className="size-3.5 shrink-0 animate-spin text-muted-foreground"
+                />
+              )}
+            </div>
+            <ShortcutTooltip
+              label="Show overview"
+              shortcut={keyboardMode ? "v" : undefined}
+              align="end"
+            >
+              <Button
+                data-testid="show-chrome"
+                size="sm"
+                variant="ghost"
+                className="h-7 shrink-0 gap-1 rounded-md px-2 text-muted-foreground"
+                onClick={() => runOverlayCommand("v")}
+              >
+                <ChevronDown className="size-3.5" /> Overview
+              </Button>
+            </ShortcutTooltip>
+          </header>
         )}
         {loading && (
           <div
@@ -1728,17 +1804,6 @@ export default function App() {
               •••
             </span>
           </div>
-        )}
-        {chromeHidden && (
-          <Button
-            data-testid="show-chrome"
-            size="sm"
-            variant="outline"
-            className="fixed right-4 top-4 z-20 shadow-md"
-            onClick={() => setChromeHidden(false)}
-          >
-            <ChevronDown className="size-4" /> Full view
-          </Button>
         )}
         {!chromeHidden && (
           <Card data-testid="source-card">
@@ -2632,106 +2697,127 @@ export default function App() {
                 </Button>
               </div>
             )}
-            {/* The floating "Show controls" button is fixed at the top-right of
-                the viewport, so the collapsed header reserves room for it and
-                keeps the viewed checkbox clickable underneath. */}
-            <CardHeader
-              className={cn(
-                "flex-row flex-wrap items-center gap-x-3 gap-y-2 space-y-0 border-b px-3",
-                chromeHidden ? "py-1 pr-[180px]" : "py-2",
-              )}
-            >
-              <div className="flex min-w-0 flex-1 items-center gap-1">
-                <Button
-                  type="button"
-                  data-testid="previous-file"
-                  size="icon"
-                  variant="ghost"
-                  className="size-7 shrink-0"
-                  title="Previous file (K)"
-                  aria-label="Previous file"
-                  disabled={!reviewable}
-                  onClick={() => moveFile(-1)}
-                >
-                  <ChevronLeft className="size-4" />
-                </Button>
-                <Button
-                  type="button"
-                  data-testid="next-file"
-                  size="icon"
-                  variant="ghost"
-                  className="size-7 shrink-0"
-                  title="Next file (J)"
-                  aria-label="Next file"
-                  disabled={!reviewable}
-                  onClick={() => moveFile(1)}
-                >
-                  <ChevronRight className="size-4" />
-                </Button>
-                {selectedFile ? (
-                  <CardTitle className="ml-1 flex min-w-0 items-center gap-2 font-normal">
-                    <FilePath path={selectedFile.display_path} />
-                    {selectedPosition !== undefined && selectedPosition !== null && (
-                      <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
-                        {selectedPosition + 1}/{reviewable}
-                      </span>
-                    )}
-                  </CardTitle>
-                ) : (
-                  <CardTitle className="ml-1 text-xs font-medium text-muted-foreground">
-                    {session ? "Pick a file to review" : "No comparison loaded"}
-                  </CardTitle>
-                )}
-              </div>
-              <div className="flex shrink-0 items-center gap-2">
-                {(loading || scopeLoading || stackLoading) && (
-                  <LoaderCircle className="size-3.5 animate-spin text-muted-foreground" />
-                )}
-                <Segmented
-                  value={diffMode}
-                  options={DIFF_MODES}
-                  onChange={changeDiffMode}
-                  label="Diff view"
-                  testId="diff-mode"
-                />
-                {session && (
-                  <Button
-                    type="button"
-                    data-testid="next-unviewed"
-                    size="sm"
-                    variant="ghost"
-                    className="h-7 px-2"
-                    title="Next unviewed file (N)"
-                    disabled={!reviewable || viewedCount === reviewable}
-                    onClick={nextUnviewed}
+            {!chromeHidden && (
+              <CardHeader className="flex-row flex-wrap items-center gap-x-3 gap-y-2 space-y-0 border-b px-3 py-2">
+                <div className="flex min-w-0 flex-1 items-center gap-1">
+                  <ShortcutTooltip
+                    label="Previous file"
+                    shortcut={keyboardMode && activeRegion === "sidebar" ? "k" : undefined}
+                    align="start"
                   >
-                    <SkipForward className="size-3.5" /> Next unviewed
-                  </Button>
-                )}
-                {selectedFile && (
-                  <label
-                    className={cn(
-                      "flex shrink-0 cursor-pointer select-none items-center gap-1.5 whitespace-nowrap rounded-full px-2 py-1 text-xs font-medium transition-colors",
-                      selectedViewed
-                        ? "bg-emerald-500/10 text-emerald-600"
-                        : "text-muted-foreground hover:text-foreground",
-                      loading && "cursor-default opacity-50",
-                    )}
-                    title={selectedViewed ? "Mark as unviewed (M)" : "Mark as viewed (M)"}
+                    <Button
+                      type="button"
+                      data-testid="previous-file"
+                      size="icon"
+                      variant="ghost"
+                      className="size-7 shrink-0"
+                      aria-label="Previous file"
+                      disabled={!reviewable}
+                      onClick={() => moveFile(-1)}
+                    >
+                      <ChevronLeft className="size-4" />
+                    </Button>
+                  </ShortcutTooltip>
+                  <ShortcutTooltip
+                    label="Next file"
+                    shortcut={keyboardMode && activeRegion === "sidebar" ? "j" : undefined}
+                    align="start"
                   >
-                    <input
-                      type="checkbox"
-                      data-testid="mark-as-viewed"
-                      className="size-3.5 shrink-0 cursor-pointer accent-emerald-600"
-                      checked={!sinceReview && selectedViewed}
-                      disabled={loading || sinceReview || scopeLoading || stackLoading}
-                      onChange={toggleViewed}
-                    />
-                    Viewed
-                  </label>
-                )}
-              </div>
-            </CardHeader>
+                    <Button
+                      type="button"
+                      data-testid="next-file"
+                      size="icon"
+                      variant="ghost"
+                      className="size-7 shrink-0"
+                      aria-label="Next file"
+                      disabled={!reviewable}
+                      onClick={() => moveFile(1)}
+                    >
+                      <ChevronRight className="size-4" />
+                    </Button>
+                  </ShortcutTooltip>
+                  {selectedFile ? (
+                    <CardTitle className="ml-1 flex min-w-0 items-center gap-2 font-normal">
+                      <FilePath path={selectedFile.display_path} />
+                      {selectedPosition !== undefined && selectedPosition !== null && (
+                        <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
+                          {selectedPosition + 1}/{reviewable}
+                        </span>
+                      )}
+                    </CardTitle>
+                  ) : (
+                    <CardTitle className="ml-1 text-xs font-medium text-muted-foreground">
+                      {session ? "Pick a file to review" : "No comparison loaded"}
+                    </CardTitle>
+                  )}
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  {(loading || scopeLoading || stackLoading) && (
+                    <LoaderCircle className="size-3.5 animate-spin text-muted-foreground" />
+                  )}
+                  <ShortcutTooltip
+                    label="Toggle diff mode"
+                    shortcut={keyboardMode ? "t" : undefined}
+                  >
+                    <div>
+                      <Segmented
+                        value={diffMode}
+                        options={DIFF_MODES}
+                        onChange={changeDiffMode}
+                        label="Diff view"
+                        testId="diff-mode"
+                      />
+                    </div>
+                  </ShortcutTooltip>
+                  {session && (
+                    <ShortcutTooltip
+                      label="Next unviewed file"
+                      shortcut={keyboardMode ? "n" : undefined}
+                      align="end"
+                    >
+                      <Button
+                        type="button"
+                        data-testid="next-unviewed"
+                        size="sm"
+                        variant="ghost"
+                        className="h-7 px-2"
+                        disabled={!reviewable || viewedCount === reviewable}
+                        onClick={nextUnviewed}
+                      >
+                        <SkipForward className="size-3.5" /> Next unviewed
+                      </Button>
+                    </ShortcutTooltip>
+                  )}
+                  {selectedFile && (
+                    <ShortcutTooltip
+                      label={selectedViewed ? "Mark as unviewed" : "Mark as viewed"}
+                      shortcut={keyboardMode ? "m" : undefined}
+                      align="end"
+                    >
+                      <label
+                        className={cn(
+                          "flex shrink-0 cursor-pointer select-none items-center gap-1.5 whitespace-nowrap rounded-full px-2 py-1 text-xs font-medium transition-colors",
+                          selectedViewed
+                            ? "bg-emerald-500/10 text-emerald-600"
+                            : "text-muted-foreground hover:text-foreground",
+                          loading && "cursor-default opacity-50",
+                        )}
+                      >
+                        <input
+                          type="checkbox"
+                          data-testid="mark-as-viewed"
+                          className="size-3.5 shrink-0 cursor-pointer accent-emerald-600"
+                          checked={!sinceReview && selectedViewed}
+                          disabled={loading || sinceReview || scopeLoading || stackLoading}
+                          onChange={toggleViewed}
+                        />
+                        Viewed
+                      </label>
+                    </ShortcutTooltip>
+                  )}
+                </div>
+              </CardHeader>
+            )}
             <CardContent
               className={cn(
                 "min-h-[580px] p-0",
@@ -2846,9 +2932,9 @@ export default function App() {
                         "border-primary bg-primary/5",
                     )}
                   >
-                    <kbd className="mr-2 rounded bg-foreground px-1.5 py-0.5 font-mono text-xs text-background">
-                      {command.key.toUpperCase()}
-                    </kbd>
+                    <span className="mr-2">
+                      <ShortcutKey shortcut={command.key} />
+                    </span>
                     <span className="font-medium">{command.label}</span>
                     <span className="mt-1 block text-xs text-muted-foreground">
                       {command.detail}
@@ -3039,9 +3125,9 @@ export default function App() {
                     >
                       <Keyboard className="mr-2 size-4 shrink-0" />
                       <span className="min-w-0 flex-1 truncate">{command.label}</span>
-                      <kbd className="ml-2 rounded border bg-muted px-1.5 py-0.5 font-mono text-xs">
-                        {command.key.toUpperCase()}
-                      </kbd>
+                      <span className="ml-2">
+                        <ShortcutKey shortcut={command.key} />
+                      </span>
                     </CommandItem>
                   ))}
                 </CommandGroup>
