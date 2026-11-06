@@ -12,6 +12,7 @@
     "check": "bun run lint && bun run format:check && bun run typecheck && bun run test",
     "test": "node --experimental-strip-types --test tests/*.test.ts",
     "test:browser": "node tests/review-navigation.browser.mjs",
+    "test:mobile": "node tests/review-navigation.browser.mjs --mobile",
     "build": "tsc -b && vite build",
     "build:profile": "tsc -b && vite build --mode profile",
     "preview": "vite preview",

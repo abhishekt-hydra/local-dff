@@ -1,4 +1,4 @@
-import { useRef, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { createPortal } from "react-dom"
 import { MessageSquare, X } from "lucide-react"
 import { Button } from "./ui/button"
@@ -31,6 +31,30 @@ export function LineComment({
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState("")
   const textarea = useRef<HTMLTextAreaElement>(null)
+  const dialogRef = useRef<HTMLDialogElement>(null)
+  useEffect(() => {
+    const dialog = dialogRef.current
+    if (!dialog) return
+    dialog.showModal()
+    textarea.current?.focus()
+    const viewport = window.visualViewport
+    const fitViewport = () => {
+      if (!viewport) return
+      dialog.style.setProperty(
+        "--comment-keyboard-inset",
+        `${Math.max(0, window.innerHeight - viewport.height - viewport.offsetTop)}px`,
+      )
+      dialog.style.setProperty("--comment-viewport-height", `${viewport.height}px`)
+    }
+    fitViewport()
+    viewport?.addEventListener("resize", fitViewport)
+    viewport?.addEventListener("scroll", fitViewport)
+    return () => {
+      viewport?.removeEventListener("resize", fitViewport)
+      viewport?.removeEventListener("scroll", fitViewport)
+      dialog.close()
+    }
+  }, [])
   async function save() {
     if (!body.trim() || busy) return
     setBusy(true)
@@ -60,10 +84,14 @@ export function LineComment({
     }
   }
   return createPortal(
-    <section
-      role="dialog"
+    <dialog
+      ref={dialogRef}
       aria-label="Comment on selected line"
-      className="fixed z-50 w-[360px] max-w-[calc(100vw-24px)] rounded-xl border border-muted bg-popover p-4 text-popover-foreground shadow-2xl"
+      className="line-comment-dialog fixed z-50 m-0 w-[360px] max-w-[calc(100vw-24px)] rounded-xl border border-muted bg-popover p-4 text-popover-foreground shadow-2xl"
+      onCancel={(event) => {
+        event.preventDefault()
+        if (!busy) onClose()
+      }}
       style={{
         left: Math.max(12, Math.min(selection.x, window.innerWidth - 380)),
         top: Math.max(12, Math.min(selection.y + 8, window.innerHeight - 300)),
@@ -88,10 +116,7 @@ export function LineComment({
         {path}
       </p>
       <textarea
-        ref={(node) => {
-          textarea.current = node
-          node?.focus()
-        }}
+        ref={textarea}
         onKeyDown={(event) => {
           if (event.key === "Escape" && !busy) {
             event.stopPropagation()
@@ -119,12 +144,14 @@ export function LineComment({
         </p>
       )}
       <div className="mt-3 flex items-center justify-between gap-2">
-        <span className="text-xs text-muted-foreground">Saved locally · ⌘/Ctrl Enter</span>
+        <span className="text-xs text-muted-foreground">
+          Saved locally<span className="hidden lg:inline"> · ⌘/Ctrl Enter</span>
+        </span>
         <Button size="sm" disabled={busy || !body.trim()} onClick={() => void save()}>
           {busy ? "Saving…" : "Save comment"}
         </Button>
       </div>
-    </section>,
+    </dialog>,
     document.body,
   )
 }

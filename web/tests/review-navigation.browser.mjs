@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url"
 import { extname, resolve, sep } from "node:path"
 import { chromium } from "rustwright"
 import { createServer as createViteServer } from "vite"
+import { verifyMobileReview } from "./mobile-review.browser.mjs"
 
 const github = (number) => `https://github.com/hydra-db/hydradb-application/pull/${number}`
 const stackNumbers = [3006, 3007, 3008]
@@ -36,7 +37,13 @@ function session(number, mode = "pr") {
           ? [file("empty.txt", false)]
           : number === 3020
             ? [file("main.go")]
-            : []
+            : number === 3030
+              ? [
+                  file("src/components/ReviewPaneWithLongName.tsx"),
+                  file("src/lib/review-navigation.ts"),
+                  file("docs/review.md"),
+                ]
+              : []
   return {
     id: `fixture-${number}-${mode}`,
     repository: "https://github.com/hydra-db/hydradb-application",
@@ -176,7 +183,31 @@ const fixture = createHttpServer(async (request, response) => {
     if (url.pathname.startsWith("/api/")) {
       if (url.pathname.startsWith("/api/diff/")) {
         response.writeHead(200, { "content-type": "text/plain" })
-        response.end("--- a/shared.go\n+++ b/shared.go\n@@ -1 +1 @@\n-old\n+new\n")
+        response.end(
+          url.pathname.includes("fixture-3030-")
+            ? [
+                "--- a/review.tsx",
+                "+++ b/review.tsx",
+                "@@ -1,90 +1,90 @@",
+                " import { useState } from 'react'",
+                " ",
+                " export function ReviewPane() {",
+                "-  const [viewed, setViewed] = useState(false)",
+                "+  const [viewed, setViewed] = useState(new Set<string>())",
+                " ",
+                "   function reviewNextFile(path: string) {",
+                "-    setViewed(true)",
+                "+    setViewed(current => new Set([...current, path]))",
+                "+    navigateToNextUnviewedFile(path)",
+                "   }",
+                " ",
+                ...Array.from({ length: 75 }, (_, index) => `   // Review context ${index + 1}`),
+                `   const description = '${"A long code line remains horizontally scrollable. ".repeat(5)}'`,
+                " }",
+                "",
+              ].join("\n")
+            : "--- a/shared.go\n+++ b/shared.go\n@@ -1 +1 @@\n-old\n+new\n",
+        )
         return
       }
       let body = ""
@@ -417,6 +448,10 @@ try {
     localComments.clear()
     commentPosts = 0
     lastSincePair = undefined
+    if (process.argv.includes("--mobile")) {
+      await verifyMobileReview(browser, app, mode)
+      continue
+    }
     const page = await browser.newPage()
     async function waitText(selector, fragment) {
       await page.evaluate(
@@ -1324,6 +1359,7 @@ try {
     } finally {
       await page.close()
     }
+    await verifyMobileReview(browser, app, mode)
   }
 } finally {
   await browser.close()

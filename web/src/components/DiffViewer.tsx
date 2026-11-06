@@ -211,7 +211,7 @@ const TextDiff = memo(function TextDiff({ result, path }: { result: RenderDiff; 
           style={{
             height: result.rows.length * ROW_HEIGHT,
             minWidth: "100%",
-            width: `${result.width + 22}ch`,
+            width: `calc(${result.width}ch + var(--diff-gutter-width, 22ch))`,
             position: "relative",
           }}
         >
@@ -231,6 +231,7 @@ const DiffRowView = memo(function DiffRowView({ row, index }: { row: DiffRow; in
   return (
     <div
       data-diff-row={index}
+      data-diff-kind={row.kind}
       data-comment-old={row.old}
       data-comment-new={row.next}
       className={
@@ -256,13 +257,13 @@ const DiffRowView = memo(function DiffRowView({ row, index }: { row: DiffRow; in
         className="sticky left-0 flex shrink-0 select-none bg-card text-muted-foreground"
         aria-hidden="true"
       >
-        <span data-comment-side="LEFT" className="w-[8ch] pr-2 text-right">
+        <span data-comment-side="LEFT" className="diff-line-number w-[8ch] pr-2 text-right">
           {row.old ?? ""}
         </span>
-        <span data-comment-side="RIGHT" className="w-[8ch] pr-2 text-right">
+        <span data-comment-side="RIGHT" className="diff-line-number w-[8ch] pr-2 text-right">
           {row.next ?? ""}
         </span>
-        <span className="w-[3ch] text-center">
+        <span className="diff-line-marker w-[3ch] text-center">
           {row.kind === "add" ? "+" : row.kind === "remove" ? "−" : " "}
         </span>
       </span>

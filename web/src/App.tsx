@@ -100,6 +100,12 @@ import { useReviewEvidence } from "./lib/use-review-evidence"
 import { CommentsPanel } from "./components/CommentsPanel"
 import { CopyFilePath } from "./components/CopyFilePath"
 import { ShortcutKey, ShortcutTooltip } from "./components/ShortcutTooltip"
+import {
+  MobileReviewDrawer,
+  MobileReviewFooter,
+  MobileReviewHeader,
+} from "./components/MobileReviewControls"
+import { useMobileLayout } from "./lib/use-mobile-layout"
 type ScopeMode = "commit" | "cumulative"
 type SourceTab = "pr" | "branches" | "patch"
 const EMPTY_FILES: PatchFile[] = []
@@ -442,6 +448,7 @@ const SidebarTree = memo(function SidebarTree({
 })
 
 export default function App() {
+  const isMobile = useMobileLayout()
   const [repo, setRepo] = useState(initialRepo)
   const [base, setBase] = useState("origin/staging")
   const [target, setTarget] = useState("HEAD")
@@ -452,12 +459,16 @@ export default function App() {
   const [prNumber, setPrNumber] = useState("")
   const [prPickerOpen, setPrPickerOpen] = useState(false)
   const [sourceTab, setSourceTab] = useState<SourceTab>("pr")
-  const [diffMode, setDiffMode] = useState<DiffMode>(preferredMode)
+  const [diffMode, setDiffMode] = useState<DiffMode>(() => (isMobile ? "text" : preferredMode()))
   const [stackLoading, setStackLoading] = useState(false)
   const [reviewError, setReviewError] = useState("")
   const [coordinates, setCoordinates] = useState<ReviewCoordinates>(DEFAULT_COORDINATES)
   const [finalReview, setFinalReview] = useState<{ anchor: Session; tip: number } | null>(null)
-  const [chromeHidden, setChromeHidden] = useState(false)
+  const [layoutMode, setLayoutMode] = useState<"auto" | "minimal" | "overview">("auto")
+  const setChromeHidden = useCallback(
+    (hidden: boolean) => setLayoutMode(hidden ? "minimal" : "overview"),
+    [],
+  )
   const [sidebarPeek, setSidebarPeek] = useState(false)
   const [commentsRevision, setCommentsRevision] = useState(0)
   // Single-letter shortcuts are live by default (persisted); the help overlay
@@ -483,6 +494,10 @@ export default function App() {
   const [search, setSearch] = useState("")
   const [status, setStatus] = useState(INITIAL_STATUS)
   const [loading, setLoading] = useState(false)
+  const chromeHidden =
+    layoutMode === "auto" ? isMobile && (session !== null || loading) : layoutMode === "minimal"
+  const mobileReview = isMobile && chromeHidden
+  const closeSidebar = useCallback(() => setSidebarPeek(false), [])
   const reviewGrid = useRef<HTMLDivElement>(null)
   const sidebarRef = useRef<HTMLDivElement>(null)
   const searchInputRef = useRef<HTMLInputElement>(null)
@@ -540,8 +555,9 @@ export default function App() {
   const stackPosition = stack
     ? stack.members.findIndex((member) => member.pull.number === stack.current)
     : -1
-  const sidebarScale = sidebarFontSize / 12
-  const sidebarRowHeight = Math.max(20, Math.round(28 * sidebarScale))
+  const fileTextSize = isMobile ? Math.max(14, sidebarFontSize) : sidebarFontSize
+  const sidebarScale = fileTextSize / 12
+  const sidebarRowHeight = Math.max(isMobile ? 44 : 20, Math.round(28 * sidebarScale))
   const sidebarIconSize = Math.max(11, Math.round(14 * sidebarScale))
   const sidebarGap = Math.max(2, Math.round(6 * sidebarScale))
   const sidebarPadding = Math.max(2, Math.round(6 * sidebarScale))
@@ -604,7 +620,7 @@ export default function App() {
     const observer = new ResizeObserver(([entry]) => updateHeight(entry))
     observer.observe(element)
     return () => observer.disconnect()
-  }, [session, chromeHidden])
+  }, [session, chromeHidden, mobileReview])
 
   useEffect(() => {
     // DiffViewer replaces both viewports when the selected file changes.
@@ -714,6 +730,7 @@ export default function App() {
                 (file) => file.renderable && inFolder(file.display_path, applied.path ?? ""),
               )?.display_path ?? applied.path)
             : applied.path
+        if (isMobile && !applied.diff) applied = { ...applied, diff: "text" }
         const selectedIndex = reviewFileSelection(
           displayed.files,
           keep,
@@ -748,7 +765,7 @@ export default function App() {
         if (!signal.aborted && sourceRequestRef.current === controller) setLoading(false)
       }
     },
-    [showRoot],
+    [showRoot, isMobile],
   )
 
   const navigateReview = useCallback(
@@ -987,7 +1004,8 @@ export default function App() {
             : coordinates.path
           : priorPath)
       const nextMode =
-        requestedDiff ?? (text ? "text" : number !== selectedStackNumber ? "semantic" : diffMode)
+        requestedDiff ??
+        (text ? "text" : number !== selectedStackNumber && !isMobile ? "semantic" : diffMode)
       const chosen = reviewFileSelection(next.files, keep, layout === "files", nextMode === "text")
       const applied: ReviewCoordinates = {
         ...coordinates,
@@ -1015,7 +1033,7 @@ export default function App() {
       setDiffMode(nextMode)
       showRoot(next, keep, layout === "files", nextMode === "text")
     },
-    [rootSession, selectedStackNumber, showRoot, loading, coordinates, diffMode],
+    [rootSession, selectedStackNumber, showRoot, loading, coordinates, diffMode, isMobile],
   )
 
   const showFinalStack = async (requestedTip: number | null = laneTip) => {
@@ -1119,18 +1137,20 @@ export default function App() {
     (fileIndex: number) => {
       setReviewError("")
       setSelected(fileIndex)
+      if (isMobile) setSidebarPeek(false)
       const file = files[fileIndex]
       if (file) updateCoordinates({ ...coordinates, path: file.display_path, pathKind: "file" })
     },
-    [files, coordinates, updateCoordinates],
+    [files, coordinates, updateCoordinates, isMobile],
   )
 
   const reviewFromBottom = useCallback(() => {
     const bottom = stack?.members[0]
     if (!bottom || loading) return
-    setDiffMode("semantic")
-    void selectStack(bottom.pull.number, "pr", undefined, false, coordinates.layout, "semantic")
-  }, [stack, loading, selectStack, coordinates.layout])
+    const mode = isMobile ? "text" : "semantic"
+    setDiffMode(mode)
+    void selectStack(bottom.pull.number, "pr", undefined, false, coordinates.layout, mode)
+  }, [stack, loading, selectStack, coordinates.layout, isMobile])
 
   const stepStack = useCallback(
     (direction: 1 | -1) => {
@@ -1304,6 +1324,24 @@ export default function App() {
     if (indices.length) setStatus("Every file in this view is marked as viewed.")
   }, [fileNavigation, selected, viewedFiles, selectFile])
 
+  const viewedAndNext = () => {
+    if (selected === null || !session || sinceReview || scopeLoading || stackLoading || loading)
+      return
+    const file = files[selected]
+    if (!file) return
+    if (!viewedFiles.has(selected)) toggleViewed()
+    const { indices, positions } = fileNavigation
+    const start = positions.get(selected) ?? -1
+    for (let step = 1; step < indices.length; step++) {
+      const next = indices[(start + step) % indices.length]
+      if (!viewedFiles.has(next)) {
+        selectFile(next)
+        return
+      }
+    }
+    setStatus("Every file in this view is marked as viewed.")
+  }
+
   const toggleKeyboardMode = useCallback(() => {
     const next = !keyboardMode
     setKeyboardMode(next)
@@ -1339,7 +1377,7 @@ export default function App() {
       searchInputRef.current?.focus()
       searchInputRef.current?.select()
     })
-  }, [])
+  }, [setChromeHidden])
 
   const toggleTreeExpansion = useCallback(() => {
     const expand = nextTreeExpanded(treeAllExpanded)
@@ -1449,6 +1487,7 @@ export default function App() {
       toggleTreeExpansion,
       toggleViewed,
       undoViewed,
+      setChromeHidden,
     ],
   )
 
@@ -1649,7 +1688,7 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-muted/40">
+    <div className="review-app min-h-screen bg-muted/40">
       {loading && (
         <div
           className="fixed inset-x-0 top-0 z-[60] h-1 overflow-hidden bg-primary/10"
@@ -1709,10 +1748,39 @@ export default function App() {
         className={cn(
           "flex w-full flex-col gap-3 p-4",
           chromeHidden && "review-minimal",
+          mobileReview && "review-mobile",
           sidebarPeek && "review-sidebar-open",
         )}
       >
-        {chromeHidden && (
+        {mobileReview && (
+          <MobileReviewHeader
+            path={selectedFile?.display_path ?? null}
+            position={selectedPosition == null ? null : selectedPosition + 1}
+            total={reviewable}
+            viewed={viewedCount}
+            title={pullRequest ? `#${pullRequest.number} ${pullRequest.title}` : "Local Diffe"}
+            url={pullRequest?.url}
+            context={
+              stackContext?.title ??
+              (commitIndex === null ? undefined : commits[commitIndex]?.subject)
+            }
+            busy={loading || scopeLoading || stackLoading}
+            sidebarOpen={sidebarPeek}
+            onToggleSidebar={() => setSidebarPeek((open) => !open)}
+            onOverview={() => {
+              setChromeHidden(false)
+              setSidebarPeek(false)
+            }}
+            mode={diffMode}
+            onModeChange={changeDiffMode}
+            selectedViewed={selectedViewed}
+            canMarkViewed={
+              !!selectedFile && !sinceReview && !loading && !scopeLoading && !stackLoading
+            }
+            onToggleViewed={toggleViewed}
+          />
+        )}
+        {chromeHidden && !isMobile && (
           <header
             data-testid="minimal-header"
             className="relative z-40 flex h-11 shrink-0 items-center gap-2 bg-background px-3"
@@ -1899,7 +1967,7 @@ export default function App() {
                     <PopoverContent
                       aria-label="Choose a pull request"
                       align="start"
-                      className="w-[max(var(--radix-popover-trigger-width),420px)]"
+                      className="w-[min(calc(100vw-24px),max(var(--radix-popover-trigger-width),420px))]"
                     >
                       <Command label="Search pull requests">
                         <CommandInput placeholder="Search by PR number, title, author or branch…" />
@@ -2171,455 +2239,464 @@ export default function App() {
           )}
         >
           <SidebarProfilerBoundary>
-            <Card
-              ref={sidebarRef}
-              tabIndex={-1}
-              aria-label="Changed files sidebar"
-              className={cn(
-                "relative flex min-h-0 flex-col overflow-visible outline-none",
-                activeRegion === "sidebar" &&
-                  keyboardOverlay &&
-                  "ring-2 ring-primary ring-offset-2",
-              )}
-            >
-              {pullRequest && (
-                <CommentsPanel
-                  key={pullRequest.url}
-                  revision={commentsRevision}
-                  prUrl={pullRequest.url}
-                />
-              )}
-              <CardHeader className="gap-3 rounded-t-lg bg-card p-3">
-                {stack && (
-                  <StackRail
-                    stack={stack}
-                    busy={stackLoading}
-                    disabled={loading}
-                    onSelect={(number) => void selectStack(number, stack.mode)}
-                    onStep={stepStack}
-                    onStart={reviewFromBottom}
-                  >
-                    <Segmented
-                      value={finalReview ? "final" : stack.mode}
-                      options={STACK_MODES}
-                      onChange={(mode) => {
-                        if (mode === "final") void showFinalStack()
-                        else if (finalReview || mode !== stack.mode)
-                          void selectStack(stack.current, mode)
-                      }}
-                      label="Stack scope"
-                      testId="stack-scope"
-                    />
-                    <label className="grid gap-1 text-xs">
-                      Stack lane tip
-                      <select
-                        data-testid="stack-tip"
-                        className="min-w-0 rounded border bg-background p-1.5"
-                        value={laneTip ?? ""}
-                        onChange={(event) => {
-                          const tip = Number(event.target.value)
-                          if (!tip) return
-                          if (finalReview) void showFinalStack(tip)
-                          else updateCoordinates({ ...coordinates, tip })
-                        }}
-                      >
-                        {(laneTip === null || laneTips.length !== 1) && (
-                          <option value="">Choose a descendant tip</option>
-                        )}
-                        {laneTips.map((number) => (
-                          <option key={number} value={number}>
-                            #{number} ·{" "}
-                            {
-                              stack.members.find((member) => member.pull.number === number)?.pull
-                                .headRefName
-                            }
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <div role="group" aria-label="Review layout" className="flex gap-1">
-                      <Button
-                        data-testid="layout-pr"
-                        size="sm"
-                        variant={coordinates.layout === "pr" ? "secondary" : "ghost"}
-                        onClick={() => updateCoordinates({ ...coordinates, layout: "pr" })}
-                      >
-                        PR by PR
-                      </Button>
-                      <Button
-                        data-testid="layout-files"
-                        size="sm"
-                        variant={coordinates.layout === "files" ? "secondary" : "ghost"}
-                        onClick={() =>
-                          updateCoordinates({
-                            ...coordinates,
-                            layout: "files",
-                            path: coordinates.path ?? selectedFile?.display_path ?? null,
-                          })
-                        }
-                      >
-                        Files across stack
-                      </Button>
-                    </div>
-                  </StackRail>
+            <MobileReviewDrawer enabled={mobileReview} open={sidebarPeek} onClose={closeSidebar}>
+              <Card
+                id="review-sidebar"
+                ref={sidebarRef}
+                tabIndex={-1}
+                aria-label="Changed files sidebar"
+                className={cn(
+                  "relative flex min-h-0 flex-col overflow-visible outline-none",
+                  activeRegion === "sidebar" &&
+                    keyboardOverlay &&
+                    "ring-2 ring-primary ring-offset-2",
                 )}
-                {stack && workspaceRoot && coordinates.layout === "files" && (
-                  <StackHistoryPanel
-                    root={workspaceRoot}
-                    coordinates={coordinates}
-                    tip={laneTip}
-                    history={historyState.history}
-                    error={historyState.error}
-                    records={records}
-                    canReviewSymbols={
-                      !finalReview &&
-                      session?.id === rootSession?.id &&
-                      rootSession?.stack?.mode === "pr"
-                    }
-                    onRetry={historyState.retry}
-                    onCoordinates={updateCoordinates}
-                    onOpen={(number, file) =>
-                      void selectStack(number, "pr", file.display_path, !file.renderable)
-                    }
-                    onPrLayout={() =>
-                      void selectStack(
-                        stack.current,
-                        "pr",
-                        coordinates.path ?? undefined,
-                        false,
-                        "pr",
-                      )
-                    }
-                    onSymbolReview={(file, key, hash) => {
-                      if (
-                        !rootSession ||
-                        finalReview ||
-                        session?.id !== rootSession.id ||
-                        rootSession.stack?.mode !== "pr"
-                      ) {
-                        setStatus(
-                          "Open this declaration's own PR comparison before recording a function review.",
-                        )
-                        return
-                      }
-                      const index = rootSession.files.findIndex(
-                        (entry) => entry.display_path === file.display_path,
-                      )
-                      if (index >= 0)
-                        toggleEvidence(rootSession.files[index], rootSession.id, index, {
-                          key,
-                          hash,
-                        })
-                    }}
+              >
+                {pullRequest && (
+                  <CommentsPanel
+                    key={pullRequest.url}
+                    revision={commentsRevision}
+                    prUrl={pullRequest.url}
                   />
                 )}
-                <div className="flex items-center justify-between gap-2">
-                  <CardTitle className="text-sm">
-                    Changed files{" "}
-                    {session && (
-                      <span className="font-normal text-muted-foreground">
-                        ({session.comparison?.changed_paths ?? session.files.length})
-                      </span>
-                    )}
-                  </CardTitle>
-                  <div className="flex items-center gap-0.5">
-                    <Button
-                      type="button"
-                      size="icon"
-                      variant="ghost"
-                      className="size-7"
-                      title="Smaller file text"
-                      onClick={() => setSidebarFontSize((size) => Math.max(10, size - 1))}
+                <CardHeader className="gap-3 rounded-t-lg bg-card p-3">
+                  {stack && (
+                    <StackRail
+                      stack={stack}
+                      busy={stackLoading}
+                      disabled={loading}
+                      onSelect={(number) => void selectStack(number, stack.mode)}
+                      onStep={stepStack}
+                      onStart={reviewFromBottom}
                     >
-                      <Minus className="size-3.5" />
-                    </Button>
-                    <span
-                      className="w-7 text-center text-[10px] text-muted-foreground"
-                      title="File sidebar font size"
-                    >
-                      {sidebarFontSize}px
-                    </span>
-                    <Button
-                      type="button"
-                      size="icon"
-                      variant="ghost"
-                      className="size-7"
-                      title="Larger file text"
-                      onClick={() => setSidebarFontSize((size) => Math.min(18, size + 1))}
-                    >
-                      <Plus className="size-3.5" />
-                    </Button>
-                    <span className="mx-1 h-4 border-l" />
-                    <Button
-                      type="button"
-                      size="icon"
-                      variant="ghost"
-                      className="size-7"
-                      title="Make file sidebar narrower"
-                      onClick={() => setSidebarWidth((width) => Math.max(220, width - 40))}
-                    >
-                      <Minus className="size-3.5" />
-                    </Button>
-                    <Button
-                      type="button"
-                      size="icon"
-                      variant="ghost"
-                      className="size-7"
-                      title="Make file sidebar wider"
-                      onClick={() => setSidebarWidth((width) => Math.min(760, width + 40))}
-                    >
-                      <Plus className="size-3.5" />
-                    </Button>
-                  </div>
-                </div>
-                {commits.length > 0 && (
-                  <div data-testid="commit-rail" className="grid grid-cols-[minmax(0,1fr)] gap-1.5">
-                    <div className="flex items-center gap-1">
+                      <Segmented
+                        value={finalReview ? "final" : stack.mode}
+                        options={STACK_MODES}
+                        onChange={(mode) => {
+                          if (mode === "final") void showFinalStack()
+                          else if (finalReview || mode !== stack.mode)
+                            void selectStack(stack.current, mode)
+                        }}
+                        label="Stack scope"
+                        testId="stack-scope"
+                      />
+                      <label className="grid gap-1 text-xs">
+                        Stack lane tip
+                        <select
+                          data-testid="stack-tip"
+                          className="min-w-0 rounded border bg-background p-1.5"
+                          value={laneTip ?? ""}
+                          onChange={(event) => {
+                            const tip = Number(event.target.value)
+                            if (!tip) return
+                            if (finalReview) void showFinalStack(tip)
+                            else updateCoordinates({ ...coordinates, tip })
+                          }}
+                        >
+                          {(laneTip === null || laneTips.length !== 1) && (
+                            <option value="">Choose a descendant tip</option>
+                          )}
+                          {laneTips.map((number) => (
+                            <option key={number} value={number}>
+                              #{number} ·{" "}
+                              {
+                                stack.members.find((member) => member.pull.number === number)?.pull
+                                  .headRefName
+                              }
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <div role="group" aria-label="Review layout" className="flex gap-1">
+                        <Button
+                          data-testid="layout-pr"
+                          size="sm"
+                          variant={coordinates.layout === "pr" ? "secondary" : "ghost"}
+                          onClick={() => updateCoordinates({ ...coordinates, layout: "pr" })}
+                        >
+                          PR by PR
+                        </Button>
+                        <Button
+                          data-testid="layout-files"
+                          size="sm"
+                          variant={coordinates.layout === "files" ? "secondary" : "ghost"}
+                          onClick={() =>
+                            updateCoordinates({
+                              ...coordinates,
+                              layout: "files",
+                              path: coordinates.path ?? selectedFile?.display_path ?? null,
+                            })
+                          }
+                        >
+                          Files across stack
+                        </Button>
+                      </div>
+                    </StackRail>
+                  )}
+                  {stack && workspaceRoot && coordinates.layout === "files" && (
+                    <StackHistoryPanel
+                      root={workspaceRoot}
+                      coordinates={coordinates}
+                      tip={laneTip}
+                      history={historyState.history}
+                      error={historyState.error}
+                      records={records}
+                      canReviewSymbols={
+                        !finalReview &&
+                        session?.id === rootSession?.id &&
+                        rootSession?.stack?.mode === "pr"
+                      }
+                      onRetry={historyState.retry}
+                      onCoordinates={updateCoordinates}
+                      onOpen={(number, file) =>
+                        void selectStack(number, "pr", file.display_path, !file.renderable)
+                      }
+                      onPrLayout={() =>
+                        void selectStack(
+                          stack.current,
+                          "pr",
+                          coordinates.path ?? undefined,
+                          false,
+                          "pr",
+                        )
+                      }
+                      onSymbolReview={(file, key, hash) => {
+                        if (
+                          !rootSession ||
+                          finalReview ||
+                          session?.id !== rootSession.id ||
+                          rootSession.stack?.mode !== "pr"
+                        ) {
+                          setStatus(
+                            "Open this declaration's own PR comparison before recording a function review.",
+                          )
+                          return
+                        }
+                        const index = rootSession.files.findIndex(
+                          (entry) => entry.display_path === file.display_path,
+                        )
+                        if (index >= 0)
+                          toggleEvidence(rootSession.files[index], rootSession.id, index, {
+                            key,
+                            hash,
+                          })
+                      }}
+                    />
+                  )}
+                  <div className="flex items-center justify-between gap-2">
+                    <CardTitle className="text-sm">
+                      Changed files{" "}
+                      {session && (
+                        <span className="font-normal text-muted-foreground">
+                          ({session.comparison?.changed_paths ?? session.files.length})
+                        </span>
+                      )}
+                    </CardTitle>
+                    <div className="sidebar-display-settings flex items-center gap-0.5">
                       <Button
                         type="button"
-                        data-testid="previous-commit"
                         size="icon"
-                        variant="outline"
-                        className="size-8 shrink-0"
-                        title="Previous commit ([)"
-                        disabled={commitIndex === null}
-                        onClick={() => stepCommit(-1)}
+                        variant="ghost"
+                        className="size-7"
+                        title="Smaller file text"
+                        onClick={() => setSidebarFontSize((size) => Math.max(10, size - 1))}
                       >
-                        <ChevronLeft className="size-4" />
+                        <Minus className="size-3.5" />
                       </Button>
-                      <Popover open={commitPickerOpen} onOpenChange={setCommitPickerOpen}>
-                        <PopoverTrigger asChild>
-                          <Button
-                            type="button"
-                            data-testid="commit-select"
-                            variant="outline"
-                            aria-label="Commit to review"
-                            aria-expanded={commitPickerOpen}
-                            className="h-8 min-w-0 flex-1 justify-between px-2 font-normal"
-                          >
-                            <span className="flex min-w-0 items-center gap-1.5 text-xs">
-                              {scopeLoading ? (
-                                <LoaderCircle className="size-3.5 shrink-0 animate-spin text-primary" />
-                              ) : (
-                                <GitCommitHorizontal className="size-3.5 shrink-0 text-muted-foreground" />
-                              )}
-                              <span className="min-w-0 truncate">
-                                {commitIndex === null ? (
-                                  `All changes · ${commits.length} ${commits.length === 1 ? "commit" : "commits"}`
-                                ) : (
-                                  <>
-                                    <span className="tabular-nums text-muted-foreground">
-                                      {commitIndex + 1}/{commits.length}
-                                    </span>{" "}
-                                    <span className="font-mono">{commits[commitIndex].short}</span>{" "}
-                                    {commits[commitIndex].subject}
-                                  </>
-                                )}
-                              </span>
-                            </span>
-                            <ChevronsUpDown className="ml-1 size-3.5 shrink-0 opacity-50" />
-                          </Button>
-                        </PopoverTrigger>
-                        <PopoverContent
-                          aria-label="Choose a commit"
-                          align="start"
-                          className="w-[min(480px,calc(100vw-2rem))]"
+                      <span
+                        className="w-7 text-center text-[10px] text-muted-foreground"
+                        title="File sidebar font size"
+                      >
+                        {sidebarFontSize}px
+                      </span>
+                      <Button
+                        type="button"
+                        size="icon"
+                        variant="ghost"
+                        className="size-7"
+                        title="Larger file text"
+                        onClick={() => setSidebarFontSize((size) => Math.min(18, size + 1))}
+                      >
+                        <Plus className="size-3.5" />
+                      </Button>
+                      <span className="mx-1 h-4 border-l" />
+                      <Button
+                        type="button"
+                        size="icon"
+                        variant="ghost"
+                        className="size-7"
+                        title="Make file sidebar narrower"
+                        onClick={() => setSidebarWidth((width) => Math.max(220, width - 40))}
+                      >
+                        <Minus className="size-3.5" />
+                      </Button>
+                      <Button
+                        type="button"
+                        size="icon"
+                        variant="ghost"
+                        className="size-7"
+                        title="Make file sidebar wider"
+                        onClick={() => setSidebarWidth((width) => Math.min(760, width + 40))}
+                      >
+                        <Plus className="size-3.5" />
+                      </Button>
+                    </div>
+                  </div>
+                  {commits.length > 0 && (
+                    <div
+                      data-testid="commit-rail"
+                      className="grid grid-cols-[minmax(0,1fr)] gap-1.5"
+                    >
+                      <div className="flex items-center gap-1">
+                        <Button
+                          type="button"
+                          data-testid="previous-commit"
+                          size="icon"
+                          variant="outline"
+                          className="size-8 shrink-0"
+                          title="Previous commit ([)"
+                          disabled={commitIndex === null}
+                          onClick={() => stepCommit(-1)}
                         >
-                          <Command label="Search commits">
-                            <CommandInput placeholder="Search commits by subject, SHA or author…" />
-                            <CommandList className="max-h-80">
-                              <CommandEmpty>No matching commit.</CommandEmpty>
-                              <CommandGroup>
-                                <CommandItem
-                                  value="all changes"
-                                  onSelect={() => {
-                                    setCommitPickerOpen(false)
-                                    void selectScope(null, scopeMode)
-                                  }}
-                                >
-                                  <Check
-                                    className={cn(
-                                      "mr-2 size-4 shrink-0",
-                                      commitIndex === null ? "opacity-100" : "opacity-0",
-                                    )}
-                                  />
-                                  <span className="font-medium">All changes</span>
-                                  <span className="ml-auto pl-3 text-xs text-muted-foreground">
-                                    {rootSession?.comparison?.changed_paths ??
-                                      rootSession?.files.length}{" "}
-                                    files
-                                  </span>
-                                </CommandItem>
-                              </CommandGroup>
-                              <CommandGroup
-                                heading={
-                                  rootSession?.commits_truncated
-                                    ? `Newest ${commits.length} commits`
-                                    : `${commits.length} ${commits.length === 1 ? "commit" : "commits"}, oldest first`
-                                }
-                              >
-                                {commits.map((commit, index) => (
+                          <ChevronLeft className="size-4" />
+                        </Button>
+                        <Popover open={commitPickerOpen} onOpenChange={setCommitPickerOpen}>
+                          <PopoverTrigger asChild>
+                            <Button
+                              type="button"
+                              data-testid="commit-select"
+                              variant="outline"
+                              aria-label="Commit to review"
+                              aria-expanded={commitPickerOpen}
+                              className="h-8 min-w-0 flex-1 justify-between px-2 font-normal"
+                            >
+                              <span className="flex min-w-0 items-center gap-1.5 text-xs">
+                                {scopeLoading ? (
+                                  <LoaderCircle className="size-3.5 shrink-0 animate-spin text-primary" />
+                                ) : (
+                                  <GitCommitHorizontal className="size-3.5 shrink-0 text-muted-foreground" />
+                                )}
+                                <span className="min-w-0 truncate">
+                                  {commitIndex === null ? (
+                                    `All changes · ${commits.length} ${commits.length === 1 ? "commit" : "commits"}`
+                                  ) : (
+                                    <>
+                                      <span className="tabular-nums text-muted-foreground">
+                                        {commitIndex + 1}/{commits.length}
+                                      </span>{" "}
+                                      <span className="font-mono">
+                                        {commits[commitIndex].short}
+                                      </span>{" "}
+                                      {commits[commitIndex].subject}
+                                    </>
+                                  )}
+                                </span>
+                              </span>
+                              <ChevronsUpDown className="ml-1 size-3.5 shrink-0 opacity-50" />
+                            </Button>
+                          </PopoverTrigger>
+                          <PopoverContent
+                            aria-label="Choose a commit"
+                            align="start"
+                            className="w-[min(480px,calc(100vw-2rem))]"
+                          >
+                            <Command label="Search commits">
+                              <CommandInput placeholder="Search commits by subject, SHA or author…" />
+                              <CommandList className="max-h-80">
+                                <CommandEmpty>No matching commit.</CommandEmpty>
+                                <CommandGroup>
                                   <CommandItem
-                                    key={commit.sha}
-                                    value={`${commit.sha} ${commit.subject} ${commit.author}`}
+                                    value="all changes"
                                     onSelect={() => {
                                       setCommitPickerOpen(false)
-                                      void selectScope(index, scopeMode)
+                                      void selectScope(null, scopeMode)
                                     }}
                                   >
                                     <Check
                                       className={cn(
                                         "mr-2 size-4 shrink-0",
-                                        commitIndex === index ? "opacity-100" : "opacity-0",
+                                        commitIndex === null ? "opacity-100" : "opacity-0",
                                       )}
                                     />
-                                    <span className="mr-2 w-6 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
-                                      {index + 1}
-                                    </span>
-                                    <span className="min-w-0 flex-1">
-                                      <span className="block truncate">
-                                        {commit.subject || "(no message)"}
-                                      </span>
-                                      <span className="block truncate text-[11px] text-muted-foreground">
-                                        <span className="font-mono">{commit.short}</span> ·{" "}
-                                        {commit.author} · {formatCommitDate(commit.date)} ·{" "}
-                                        {commit.files_changed
-                                          ? `${commit.files_changed} ${commit.files_changed === 1 ? "file" : "files"}`
-                                          : "no file changes"}
-                                        {commit.parents.length > 1 ? " · merge" : ""}
-                                      </span>
+                                    <span className="font-medium">All changes</span>
+                                    <span className="ml-auto pl-3 text-xs text-muted-foreground">
+                                      {rootSession?.comparison?.changed_paths ??
+                                        rootSession?.files.length}{" "}
+                                      files
                                     </span>
                                   </CommandItem>
-                                ))}
-                              </CommandGroup>
-                            </CommandList>
-                          </Command>
-                        </PopoverContent>
-                      </Popover>
-                      <Button
-                        type="button"
-                        data-testid="next-commit"
-                        size="icon"
-                        variant="outline"
-                        className="size-8 shrink-0"
-                        title="Next commit (])"
-                        disabled={commitIndex === commits.length - 1}
-                        onClick={() => stepCommit(1)}
-                      >
-                        <ChevronRight className="size-4" />
-                      </Button>
+                                </CommandGroup>
+                                <CommandGroup
+                                  heading={
+                                    rootSession?.commits_truncated
+                                      ? `Newest ${commits.length} commits`
+                                      : `${commits.length} ${commits.length === 1 ? "commit" : "commits"}, oldest first`
+                                  }
+                                >
+                                  {commits.map((commit, index) => (
+                                    <CommandItem
+                                      key={commit.sha}
+                                      value={`${commit.sha} ${commit.subject} ${commit.author}`}
+                                      onSelect={() => {
+                                        setCommitPickerOpen(false)
+                                        void selectScope(index, scopeMode)
+                                      }}
+                                    >
+                                      <Check
+                                        className={cn(
+                                          "mr-2 size-4 shrink-0",
+                                          commitIndex === index ? "opacity-100" : "opacity-0",
+                                        )}
+                                      />
+                                      <span className="mr-2 w-6 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
+                                        {index + 1}
+                                      </span>
+                                      <span className="min-w-0 flex-1">
+                                        <span className="block truncate">
+                                          {commit.subject || "(no message)"}
+                                        </span>
+                                        <span className="block truncate text-[11px] text-muted-foreground">
+                                          <span className="font-mono">{commit.short}</span> ·{" "}
+                                          {commit.author} · {formatCommitDate(commit.date)} ·{" "}
+                                          {commit.files_changed
+                                            ? `${commit.files_changed} ${commit.files_changed === 1 ? "file" : "files"}`
+                                            : "no file changes"}
+                                          {commit.parents.length > 1 ? " · merge" : ""}
+                                        </span>
+                                      </span>
+                                    </CommandItem>
+                                  ))}
+                                </CommandGroup>
+                              </CommandList>
+                            </Command>
+                          </PopoverContent>
+                        </Popover>
+                        <Button
+                          type="button"
+                          data-testid="next-commit"
+                          size="icon"
+                          variant="outline"
+                          className="size-8 shrink-0"
+                          title="Next commit (])"
+                          disabled={commitIndex === commits.length - 1}
+                          onClick={() => stepCommit(1)}
+                        >
+                          <ChevronRight className="size-4" />
+                        </Button>
+                      </div>
+                      {commitIndex !== null && (
+                        <Segmented
+                          value={scopeMode}
+                          options={COMMIT_MODES}
+                          onChange={changeScopeMode}
+                          label="Commit scope"
+                          testId="scope"
+                        />
+                      )}
                     </div>
-                    {commitIndex !== null && (
-                      <Segmented
-                        value={scopeMode}
-                        options={COMMIT_MODES}
-                        onChange={changeScopeMode}
-                        label="Commit scope"
-                        testId="scope"
-                      />
-                    )}
-                  </div>
-                )}
-                <div className="relative">
-                  <Search className="pointer-events-none absolute left-2 top-2 size-3.5 text-muted-foreground" />
-                  <Input
-                    ref={searchInputRef}
-                    data-testid="file-filter"
-                    value={search}
-                    onChange={(event) => setSearch(event.target.value)}
-                    placeholder="Filter files"
-                    title="Filter files (/ )"
-                    className="h-8 pl-7 text-xs"
-                  />
-                </div>
-              </CardHeader>
-              <CardContent
-                ref={sidebarContentRef}
-                style={{ contain: "size" }}
-                className="min-h-[240px] flex-1 overflow-hidden lg:min-h-0 rounded-b-2xl bg-card p-2"
-              >
-                {tree.length ? (
-                  <SidebarTree
-                    tree={tree}
-                    treeHeight={treeHeight}
-                    rowHeight={sidebarRowHeight}
-                    indent={Math.max(9, Math.round(14 * sidebarScale))}
-                    searchTerm={deferredSearch}
-                    selected={selected}
-                    viewedFiles={viewedFiles}
-                    sidebarScale={sidebarScale}
-                    sidebarFontSize={sidebarFontSize}
-                    sidebarIconSize={sidebarIconSize}
-                    sidebarGap={sidebarGap}
-                    sidebarPadding={sidebarPadding}
-                    onSelectFile={selectFile}
-                    treeRef={treeRef}
-                  />
-                ) : loading ? (
-                  <div className="grid h-full place-items-center p-6 text-center text-sm text-muted-foreground">
-                    <div>
-                      <LoaderCircle className="mx-auto mb-3 size-6 animate-spin text-primary" />
-                      <p>
-                        Preparing changed files
-                        <span className="loading-dots text-primary" aria-hidden="true">
-                          •••
-                        </span>
-                      </p>
-                      <p className="mt-1 text-xs">
-                        Large pull requests can take a moment to index.
-                      </p>
-                    </div>
-                  </div>
-                ) : session ? (
-                  <p className="p-3 text-xs text-muted-foreground">
-                    {commitIndex !== null
-                      ? "No file changes in this commit."
-                      : "No file changes in this view."}
-                  </p>
-                ) : (
-                  <p className="p-3 text-xs text-muted-foreground">
-                    Open a pull request, compare branches, or upload a patch to populate the file
-                    tree.
-                  </p>
-                )}
-              </CardContent>
-              <div className="grid gap-1.5 px-4 pb-4 pt-2 text-[11px] text-muted-foreground">
-                <div className="flex items-center justify-between gap-3">
-                  <span>
-                    {session
-                      ? `${session.files.length} ${session.files.length === 1 ? "file" : "files"}`
-                      : "No comparison loaded"}
-                  </span>
-                  {session && (
-                    <span className="tabular-nums">
-                      {viewedCount} of {reviewable} viewed
-                    </span>
                   )}
-                </div>
-                {session && (
-                  <div className="h-1 overflow-hidden rounded-full bg-muted">
-                    <div
-                      className="h-full rounded-full bg-emerald-500 transition-[width] duration-300"
-                      style={{ width: `${reviewable ? (viewedCount / reviewable) * 100 : 0}%` }}
+                  <div className="relative">
+                    <Search className="pointer-events-none absolute left-2 top-2 size-3.5 text-muted-foreground" />
+                    <Input
+                      ref={searchInputRef}
+                      data-testid="file-filter"
+                      value={search}
+                      onChange={(event) => setSearch(event.target.value)}
+                      placeholder="Filter files"
+                      title="Filter files (/ )"
+                      className="h-8 pl-7 text-xs"
                     />
                   </div>
-                )}
-              </div>
-              <button
-                type="button"
-                aria-label="Resize file sidebar"
-                title="Drag to resize the file sidebar"
-                onPointerDown={startSidebarResize}
-                className={cn(
-                  "absolute -right-3 top-0 z-10 hidden h-full w-6 cursor-col-resize touch-none items-center justify-center lg:flex",
-                  resizingSidebar && "bg-primary/5",
-                )}
-              >
-                <span className="grid h-12 w-3 place-items-center rounded-full border bg-background text-muted-foreground shadow-sm">
-                  <GripVertical className="size-3" />
-                </span>
-              </button>
-            </Card>
+                </CardHeader>
+                <CardContent
+                  data-testid="file-tree-container"
+                  ref={sidebarContentRef}
+                  style={{ contain: "size" }}
+                  className="min-h-[240px] flex-1 overflow-hidden lg:min-h-0 rounded-b-2xl bg-card p-2"
+                >
+                  {tree.length ? (
+                    <SidebarTree
+                      tree={tree}
+                      treeHeight={treeHeight}
+                      rowHeight={sidebarRowHeight}
+                      indent={Math.max(9, Math.round(14 * sidebarScale))}
+                      searchTerm={deferredSearch}
+                      selected={selected}
+                      viewedFiles={viewedFiles}
+                      sidebarScale={sidebarScale}
+                      sidebarFontSize={fileTextSize}
+                      sidebarIconSize={sidebarIconSize}
+                      sidebarGap={sidebarGap}
+                      sidebarPadding={sidebarPadding}
+                      onSelectFile={selectFile}
+                      treeRef={treeRef}
+                    />
+                  ) : loading ? (
+                    <div className="grid h-full place-items-center p-6 text-center text-sm text-muted-foreground">
+                      <div>
+                        <LoaderCircle className="mx-auto mb-3 size-6 animate-spin text-primary" />
+                        <p>
+                          Preparing changed files
+                          <span className="loading-dots text-primary" aria-hidden="true">
+                            •••
+                          </span>
+                        </p>
+                        <p className="mt-1 text-xs">
+                          Large pull requests can take a moment to index.
+                        </p>
+                      </div>
+                    </div>
+                  ) : session ? (
+                    <p className="p-3 text-xs text-muted-foreground">
+                      {commitIndex !== null
+                        ? "No file changes in this commit."
+                        : "No file changes in this view."}
+                    </p>
+                  ) : (
+                    <p className="p-3 text-xs text-muted-foreground">
+                      Open a pull request, compare branches, or upload a patch to populate the file
+                      tree.
+                    </p>
+                  )}
+                </CardContent>
+                <div className="grid gap-1.5 px-4 pb-4 pt-2 text-[11px] text-muted-foreground">
+                  <div className="flex items-center justify-between gap-3">
+                    <span>
+                      {session
+                        ? `${session.files.length} ${session.files.length === 1 ? "file" : "files"}`
+                        : "No comparison loaded"}
+                    </span>
+                    {session && (
+                      <span className="tabular-nums">
+                        {viewedCount} of {reviewable} viewed
+                      </span>
+                    )}
+                  </div>
+                  {session && (
+                    <div className="h-1 overflow-hidden rounded-full bg-muted">
+                      <div
+                        className="h-full rounded-full bg-emerald-500 transition-[width] duration-300"
+                        style={{ width: `${reviewable ? (viewedCount / reviewable) * 100 : 0}%` }}
+                      />
+                    </div>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  aria-label="Resize file sidebar"
+                  title="Drag to resize the file sidebar"
+                  onPointerDown={startSidebarResize}
+                  className={cn(
+                    "absolute -right-3 top-0 z-10 hidden h-full w-6 cursor-col-resize touch-none items-center justify-center lg:flex",
+                    resizingSidebar && "bg-primary/5",
+                  )}
+                >
+                  <span className="grid h-12 w-3 place-items-center rounded-full border bg-background text-muted-foreground shadow-sm">
+                    <GripVertical className="size-3" />
+                  </span>
+                </button>
+              </Card>
+            </MobileReviewDrawer>
           </SidebarProfilerBoundary>
 
           <Card
@@ -2884,6 +2961,19 @@ export default function App() {
             </CardContent>
           </Card>
         </div>
+        {mobileReview && session && (
+          <MobileReviewFooter
+            position={selectedPosition == null ? null : selectedPosition + 1}
+            total={reviewable}
+            complete={reviewable > 0 && viewedCount === reviewable}
+            selectedViewed={selectedViewed}
+            disabled={loading || scopeLoading || stackLoading || sinceReview}
+            onPrevious={() => moveFile(-1)}
+            onNext={() => moveFile(1)}
+            onViewedAndNext={viewedAndNext}
+            sidebarOpen={sidebarPeek}
+          />
+        )}
       </main>
       {keyboardOverlay && (
         <aside
